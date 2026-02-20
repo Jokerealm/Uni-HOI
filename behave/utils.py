@@ -22,6 +22,17 @@ def rotate_yaxis(R, t):
     return rotated[:3, :3], rotated[:3, 3]
 
 
+def inverse_Rt(R, t):
+    """
+    Inverse a rotation and translation transformation
+    """
+    trans = np.eye(4)
+    trans[:3, :3] = R
+    trans[:3, 3] = t
+    trans_inv = np.linalg.inv(trans)
+    return trans_inv[:3, :3], trans_inv[:3, 3]
+
+
 def load_intrinsics(intrinsic_folder, kids):
     """
     kids: list of kinect id that should be loaded

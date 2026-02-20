@@ -70,8 +70,8 @@ class RunConfig:
 
 @dataclass
 class LoggingConfig:
-    wandb: bool = True
-    wandb_project: str = 'pc2'
+    wandb: bool = True  # 启用wandb
+    wandb_project: str = 'hdm-training'  # 可以自定义项目名称
 
 
 
@@ -206,9 +206,9 @@ class BehaveDatasetConfig(PointCloudDatasetConfig):
     type: str = 'behave'
 
     fix_sample: bool = True
-    behave_dir: str = "/BS/xxie-5/static00/behave_release/sequences/" # TODO: change to your local BEHAVE path
-    procigen_dir: str = '/BS/xxie-6/static00/synthesize' # TODO: change to your local ProciGen path
-    split_file: str = "" # TODO: specify you dataset split file here, one such example can be downloaded from https://edmond.mpg.de/file.xhtml?fileId=251365&version=4.0
+    behave_dir: str = "/data4/guanz/data/Behave/sequences" # BEHAVE sequences path
+    procigen_dir: str = '/data4/guanz/data/ProciGen' # ProciGen path (no trailing slash)
+    split_file: str = "/data4/guanz/data/train-procigen-test-behave.pkl" # dataset split file
     scale_factor: float = 7.0  # use the same as shapenet
     sample_ratio_hum: float = 0.5
     image_size: int = 224

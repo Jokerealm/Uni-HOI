@@ -26,8 +26,6 @@ def main(args):
             if osp.isfile(newfile):
                 continue
             os.system(f'cp {file} {newfile}')
-            break
-        break
     print('All done')
 
 

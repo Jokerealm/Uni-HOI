@@ -109,6 +109,29 @@ class Trainer(object):
         return training_utils.resume_from_checkpoint(cfg, model, optimizer, scheduler,
                                                      model_ema)
 
+    def cleanup_gpu_memory(self):
+        """清理GPU显存"""
+        import gc
+        
+        print("Clearing GPU cache...")
+        
+        # 清空CUDA缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+        # 强制垃圾回收
+        gc.collect()
+        
+        # 打印显存使用情况
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                allocated = torch.cuda.memory_allocated(i) / 1024**3
+                reserved = torch.cuda.memory_reserved(i) / 1024**3
+                print(f"GPU {i}: Allocated {allocated:.2f}GB, Reserved {reserved:.2f}GB")
+        
+        print("GPU memory cleanup completed")
+
     def train(self, cfg:ProjectConfig):
         fscore_last, chamf_last = 0, 0.
         # Visualize before training
@@ -226,6 +249,10 @@ class Trainer(object):
                     if train_state.step >= cfg.run.max_steps or optimizer.param_groups[0]['lr'] < 1e-8:
                         print(f'Ending training at: {datetime.datetime.now()}')
                         print(f'Final train state: {train_state}')
+
+                        # 清理显存
+                        print('Cleaning up GPU memory...')
+                        self.cleanup_gpu_memory()
 
                         wandb.finish()
                         time.sleep(5)
@@ -439,13 +466,26 @@ class Trainer(object):
                                                                                        category=sequence_category,
                                                                                        name=sequence_name,
                                                                                        ext='ply'))
-        # Save generation
-        io.save_pointcloud(data=output[i], path=filestr.format(dir='pred',
-                                                               category=sequence_category,
-                                                               name=sequence_name, ext='ply'))
+        
+        # Save generation with colors
+        pc: Pointclouds = output[i]
+        pred_path = filestr.format(dir='pred', category=sequence_category, name=sequence_name, ext='ply')
+        
+        # Ensure colors are saved correctly
+        if pc.features_packed() is not None:
+            # Save with explicit color handling using trimesh
+            import trimesh
+            points = pc.points_packed().cpu().numpy()
+            colors = pc.features_packed().cpu().numpy()
+            # Convert from [0, 1] to [0, 255] for trimesh
+            colors_255 = (colors * 255).astype(np.uint8)
+            pc_trimesh = trimesh.PointCloud(vertices=points, colors=colors_255)
+            pc_trimesh.export(pred_path)
+        else:
+            # Fallback to pytorch3d IO if no colors
+            io.save_pointcloud(data=pc, path=pred_path)
 
         # save binary segmentation if presented
-        pc: Pointclouds = output[i]
         if pc.features_packed() is not None:
             # with segmentation color, save segmentation results
             assert len(pc.features_list()) == 1
@@ -623,14 +663,14 @@ class Trainer(object):
                                                                          output_file_video=filename_video,
                                                                          num_frames=30,
                                                                          scale_factor=cfg.model.scale_factor)
-                    wandb_log_dict[filename_video_wandb] = wandb.Video(filename_video)
+                    wandb_log_dict[filename_video_wandb] = wandb.Video(filename_video, format="mp4")
 
                 # Render point cloud diffusion evolution
                 filename_evo = filestr.format(dir='evolutions', name='evolutions', i=i, ext='mp4')
                 filename_evo_wandb = filestr.format(dir='evolutions', name='evolutions', i=i, ext='mp4')
                 diffusion_utils.visualize_pointcloud_evolution_pytorch3d(
                     pointclouds=pred_all_pointclouds, output_file_video=filename_evo, camera=camera)
-                wandb_log_dict[filename_evo_wandb] = wandb.Video(filename_evo)
+                wandb_log_dict[filename_evo_wandb] = wandb.Video(filename_evo, format="mp4")
 
         # Save to W&B
         if cfg.logging.wandb and accelerator.is_local_main_process:

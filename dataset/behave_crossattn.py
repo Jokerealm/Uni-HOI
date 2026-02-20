@@ -141,11 +141,9 @@ class BehaveCrossAttnDataset(BehaveDataset):
                                                                       rgb_full.copy(),
                                                                       [mask_obj, mask_obj], 1.5)
             except Exception as e:
-                print(f"Failed on {rgb_file} due to {e}")
+                # Silently handle empty object masks by using full crop
                 if np.sum(mask_obj > 127) < 10:
-                    # TODO: understand how will this affect small objects
-                    print("Using full crop to replace object only crop for", rgb_file)
-                    # use full crop
+                    # use full crop for samples with very small/empty object masks
                     Kroi_o, obj_mask, person_mask, rgb = Kroi.copy(), objmask_fullcrop.copy(), psmask_fullcrop.copy(), rgb_fullcrop.copy()
                 else:
                     Kroi_o, obj_mask, person_mask, rgb = self.crop_full_image(mask_hum.copy(),

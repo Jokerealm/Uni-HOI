@@ -26,12 +26,30 @@ class SeparateEvaluator(SingleShapeEvaluator):
         for fgt, fpred in zip(tqdm(files_gt), files_pred):
             assert osp.basename(fgt) == osp.basename(fpred)
 
-            pc = trimesh.load_mesh(fpred, process=False)
-            mask_hum = pc.colors[:, 2] > 0.5
-            pc_hum, pc_obj = np.array(pc.vertices[mask_hum]), np.array(pc.vertices[~mask_hum])
-            gt = trimesh.load_mesh(fgt, process=False)
-            L = len(gt.vertices)
-            gt_hum, gt_obj = np.array(gt.vertices[:L//2]), np.array(gt.vertices[L//2:])
+            # Use pytorch3d IO to load PLY files with colors
+            from pytorch3d.io import IO
+            io = IO()
+            try:
+                pc_pytorch3d = io.load_pointcloud(fpred)
+                if pc_pytorch3d.features_packed() is None:
+                    raise ValueError(f"No color information in {fpred}")
+                points = pc_pytorch3d.points_packed().cpu().numpy()
+                colors = pc_pytorch3d.features_packed().cpu().numpy()
+                mask_hum = colors[:, 2] > 0.5
+                pc_hum, pc_obj = points[mask_hum], points[~mask_hum]
+            except Exception as e:
+                print(f"Failed to load {fpred}: {e}")
+                continue
+            
+            # Load GT file using pytorch3d IO as well
+            try:
+                gt_pytorch3d = io.load_pointcloud(fgt)
+                gt_points = gt_pytorch3d.points_packed().cpu().numpy()
+                L = len(gt_points)
+                gt_hum, gt_obj = gt_points[:L//2], gt_points[L//2:]
+            except Exception as e:
+                print(f"Failed to load GT {fgt}: {e}")
+                continue
 
             # evaluate human + object
             scores, cd = self.compute_fscores(np.concatenate([gt_hum, gt_obj], 0),

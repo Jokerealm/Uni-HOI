@@ -14,16 +14,38 @@ from psbody.mesh import Mesh
 class KinectTransform:
     "transform between different kinect cameras, sequence specific"
     def __init__(self, seq, kinect_count=4, no_intrinsic=False):
+        """
+        not loading camera intrinsics anymore
+        :param seq:
+        :param kinect_count:
+        :param no_intrinsic:
+        """
         self.seq_info = SeqInfo(seq)
         self.kids = [x for x in range(self.seq_info.kinect_count())]
         if no_intrinsic:
             self.intrinsics = None
         else:
             self.intrinsics = load_intrinsics(self.seq_info.get_intrinsic(), self.kids)
-        rot, trans = load_kinect_poses(self.seq_info.get_config(), self.kids)
+        rot, trans = self.load_local2world()
         self.local2world_R, self.local2world_t = rot, trans
-        rot, trans = load_kinect_poses_back(self.seq_info.get_config(), self.kids)
+        # Compute world to local camera transformation
+        from behave.utils import inverse_Rt
+        Rt = [inverse_Rt(r, t) for r, t in zip(rot, trans)]
+        rot, trans = [x[0] for x in Rt], [x[1] for x in Rt]
         self.world2local_R, self.world2local_t = rot, trans
+
+    def load_local2world(self):
+        """
+        For ProciGen sequences, the camera intrinsic and extrinsics are packed inside info.json file
+        :return:
+        """
+        if 'extrinsic_params' in self.seq_info.info:
+            pose_calibs = self.seq_info.info['extrinsic_params']
+            rot = [np.array(pose_calibs[x]['rotation']).reshape((3, 3)) for x in self.seq_info.kids]
+            trans = [np.array(pose_calibs[x]['translation']) for x in self.seq_info.kids]
+        else:
+            rot, trans = load_kinect_poses(self.seq_info.get_config(), self.kids)
+        return rot, trans
 
     def world2color_mesh(self, mesh:Mesh, kid):
         "world coordinate to local color coordinate, assume mesh world coordinate is in k1 color camera coordinate"

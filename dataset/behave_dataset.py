@@ -12,6 +12,8 @@ import cv2, trimesh
 import torch
 import igl
 import pickle as pkl
+import hashlib
+import gc
 from sklearn.neighbors import KDTree
 from torch.utils.data import Dataset
 from sklearn.neighbors import NearestNeighbors
@@ -24,6 +26,37 @@ from .behave_paths import DataPaths, date_seqs
 from behave.kinect_transform import KinectTransform
 from .img_utils import compute_translation, crop, masks2bbox, resize
 from .utils import create_grid_points
+
+
+class PathCache:
+    """
+    简单的路径缓存
+    只缓存文件路径和元数据，不缓存实际数据
+    """
+    
+    def __init__(self):
+        """初始化路径缓存（字典）"""
+        self.cache = {}  # key -> (file_paths, metadata)
+    
+    def __contains__(self, key):
+        """支持 'key in cache' 语法"""
+        return key in self.cache
+    
+    def __getitem__(self, key):
+        """支持 cache[key] 语法"""
+        return self.cache[key]
+    
+    def __setitem__(self, key, value):
+        """支持 cache[key] = value 语法"""
+        self.cache[key] = value
+    
+    def clear(self):
+        """清空缓存"""
+        self.cache.clear()
+    
+    def __len__(self):
+        """返回缓存大小"""
+        return len(self.cache)
 
 
 class BehaveDataset(Dataset):
@@ -51,16 +84,25 @@ class BehaveDataset(Dataset):
         self.sample_ratio_hum = sample_ratio_hum
         self.split = split
         self.input_size = input_size
-        self.samples_cache = {}
-        self.meshes_cache = {}
+        
+        # 使用简单的路径缓存（只缓存文件路径，不缓存数据）
+        self.samples_cache = PathCache()  # 缓存 mesh 文件路径
+        self.meshes_cache = PathCache()   # 缓存 npz 文件路径
 
+        # Store paths for later use
+        self.behave_path = behave_path
+        self.procigen_path = procigen_path
+
+        # Initialize kinect transforms for BEHAVE sequences (Date01-Date07)
         self.kin_transforms = {
-            f"Date{d:02d}": KinectTransform(date_seqs[f'Date{d:02d}'](behave_path), no_intrinsic=True) for d in range(1,8)
+            f"Date{d:02d}": KinectTransform(date_seqs[f'Date{d:02d}'](behave_path), no_intrinsic=True) 
+            for d in range(1, 8)
         }
-        self.kin_transforms = {
-            **self.kin_transforms,
-            **{"Date09": KinectTransform(date_seqs['Date09'](procigen_path), no_intrinsic=True)}
-        }
+        
+        # For ProciGen sequences, we'll create transforms on-demand since each sequence
+        # has its own calibration stored in info.json
+        # Cache for ProciGen transforms
+        self.procigen_transforms_cache = {}
 
         # some constants
         # camera transform from opencv to pytorch3d
@@ -113,18 +155,86 @@ class BehaveDataset(Dataset):
         # print(f"Aug_blur value={aug_blur}...")
 
         self.DEBUG = debug
+        
+        # Filter out samples without occupancy files
+        if self.predict_binary and self.split == 'train':
+            # Create a cache key based on the data paths
+            paths_hash = hashlib.md5(str(self.data_paths[:100]).encode()).hexdigest()
+            cache_file = f'/tmp/hdm_occupancy_filter_cache_{paths_hash}.pkl'
+            
+            if os.path.exists(cache_file):
+                print(f"Loading filtered paths from cache: {cache_file}")
+                with open(cache_file, 'rb') as f:
+                    cache_data = pkl.load(f)
+                    if cache_data['total_samples'] == len(self.data_paths):
+                        self.data_paths = cache_data['valid_paths']
+                        print(f"Loaded {len(self.data_paths)} valid samples from cache")
+                    else:
+                        print("Cache invalid (sample count mismatch), regenerating...")
+                        os.remove(cache_file)
+                        cache_data = None
+            else:
+                cache_data = None
+            
+            if cache_data is None:
+                print("Filtering samples without occupancy files and checking image files...")
+                print(f"Total samples to check: {len(self.data_paths)}")
+                valid_paths = []
+                for i, rgb_file in enumerate(self.data_paths):
+                    if i % 1000 == 0:
+                        print(f"Checking sample {i}/{len(self.data_paths)}...")
+                    npz_file = rgb_file.replace(".color.jpg", ".grid_df_res128_b0.5.npz")
+                    # Check in both behave and procigen paths
+                    npz_exists = False
+                    # Check if it's BEHAVE data (Date01-Date08)
+                    first_part = rgb_file.split('/')[0]
+                    is_behave = False
+                    if 'Date' in first_part:
+                        try:
+                            date_num = int(first_part.replace('Date', ''))
+                            is_behave = date_num < 9
+                        except (ValueError, IndexError):
+                            is_behave = False
+                    
+                    if is_behave:
+                        # BEHAVE data
+                        npz_full_path = os.path.join(behave_path, npz_file)
+                        rgb_full_path = os.path.join(behave_path, rgb_file)
+                    else:
+                        # ProciGen data
+                        npz_full_path = os.path.join(procigen_path, npz_file)
+                        rgb_full_path = os.path.join(procigen_path, rgb_file)
+                    
+                    # Check both occupancy file and image file exist
+                    if os.path.exists(npz_full_path) and os.path.exists(rgb_full_path):
+                        valid_paths.append(rgb_file)
+                        npz_exists = True
+                
+                filtered_count = len(self.data_paths) - len(valid_paths)
+                print(f"Filtered {filtered_count} samples without occupancy/image files ({filtered_count/len(self.data_paths)*100:.2f}%)")
+                print(f"Valid samples: {len(valid_paths)} / {len(self.data_paths)}")
+                self.data_paths = valid_paths
+                
+                # Save to cache
+                print(f"Saving filtered paths to cache: {cache_file}")
+                with open(cache_file, 'wb') as f:
+                    pkl.dump({
+                        'total_samples': len(self.data_paths) + filtered_count,
+                        'valid_paths': valid_paths
+                    }, f)
+                print("Cache saved successfully")
 
     def __getitem__(self, idx):
-        # ret = self.get_item(idx)
-        # return ret
-        try:
-            ret = self.get_item(idx)
-            return ret
-        except Exception as e:
-            print(e)
-            ridx = np.random.randint(0, len(self.data_paths))
-            print(f"failed on {self.data_paths[idx]}, retrying {self.data_paths[ridx]}")
-            return self[ridx]
+        max_retries = 10
+        for attempt in range(max_retries):
+            try:
+                return self.get_item(idx)
+            except Exception as e:
+                print(f"Error loading sample {idx} (attempt {attempt + 1}): {str(e)}")
+                if attempt == max_retries - 1:
+                    raise RuntimeError(f"Failed to load sample {self.data_paths[idx]} after {max_retries} attempts. Last error: {str(e)}")
+                ridx = np.random.randint(0, len(self.data_paths))
+                idx = ridx
 
     def __len__(self):
         return len(self.data_paths)
@@ -246,18 +356,56 @@ class BehaveDataset(Dataset):
         if self.predict_binary and self.split=='train':
             assert self.fix_sample
             img_key = self.get_cache_key(rgb_file)
-            smpl, obj, grid_df = self.meshes_cache[img_key]
-            if grid_df is None:
-                # Load the precomputed human/object occupancy
+            
+            if img_key in self.meshes_cache:
+                # 从缓存获取npz文件路径
+                npz_full_path = self.meshes_cache[img_key]
+                # 动态加载grid_df
+                occupancies = np.unpackbits(np.load(npz_full_path)['compressed_occ'])
+                grid_df = np.reshape(occupancies, (128,) * 3).astype(np.float32)
+            else:
+                # 缓存未命中，加载数据
                 res = 128
                 npz_file = rgb_file.replace(".color.jpg", f".grid_df_res{res}_b0.5.npz")
-                occupancies = np.unpackbits(np.load(npz_file)['compressed_occ'])
-                grid_df = np.reshape(occupancies, (res,) * 3).astype(float)  # human-1, obj-0
-                self.meshes_cache[img_key] = None, None, grid_df
+                
+                # 确定完整路径
+                first_part = rgb_file.split('/')[0]
+                is_behave = False
+                if 'Date' in first_part:
+                    try:
+                        date_num = int(first_part.replace('Date', ''))
+                        is_behave = date_num < 9
+                    except (ValueError, IndexError):
+                        is_behave = False
+                
+                if is_behave:
+                    npz_full_path = os.path.join(self.behave_path, npz_file)
+                else:
+                    npz_full_path = os.path.join(self.procigen_path, npz_file)
+                
+                # 加载数据
+                occupancies = np.unpackbits(np.load(npz_full_path)['compressed_occ'])
+                grid_df = np.reshape(occupancies, (res,) * 3).astype(np.float32)
+                
+                # 保存到缓存（只保存文件路径）
+                self.meshes_cache[img_key] = npz_full_path
 
             data_dict['grid_df'] = torch.from_numpy(grid_df).float()
+            
             # for debug
             if self.DEBUG:
+                # 如果需要debug信息，临时加载mesh
+                smpl_name, obj_name = self.get_gt_fit_names(rgb_file)
+                smpl_path = self.get_smpl_filepath(rgb_file, smpl_name, obj_name)
+                obj_path = self.get_obj_filepath(rgb_file, smpl_name, obj_name)
+                smpl = trimesh.load_mesh(smpl_path, process=False)
+                obj = self.load_obj_gtmesh(obj_path)
+                
+                kin_transform = self.get_kinect_transform(rgb_file)
+                kid = DataPaths.get_kinect_id(rgb_file)
+                smpl.vertices = kin_transform.world2local(smpl.vertices, kid)
+                obj.vertices = kin_transform.world2local(obj.vertices, kid)
+                
                 data_dict['verts_obj'] = (np.array(obj.vertices) - cent) / (2 * radius)
                 data_dict['verts_smpl'] = (np.array(smpl.vertices) - cent)/(2*radius)
                 data_dict['faces_obj'] = np.array(obj.faces)
@@ -297,10 +445,30 @@ class BehaveDataset(Dataset):
             cent_hum, cent_obj = pred_trans[:3], pred_trans[3:]
             scale_hum, scale_obj = pred_scale[0], pred_scale[1]
         else:
-            pc = trimesh.load_mesh(pred_file, process=False)
-            mask_hum = pc.colors[:, 2] > 0.5
+            try:
+                # Use pytorch3d IO instead of trimesh for better compatibility
+                from pytorch3d.io import IO
+                io = IO()
+                pc_pytorch3d = io.load_pointcloud(pred_file)
+                
+                if pc_pytorch3d.features_packed() is None or len(pc_pytorch3d.features_packed()) == 0:
+                    raise RuntimeError(f"PLY file {pred_file} has no color information")
+                
+                points = pc_pytorch3d.points_packed().cpu().numpy()
+                colors = pc_pytorch3d.features_packed().cpu().numpy()
+                
+                # Use blue channel to distinguish human (>0.5) from object
+                mask_hum = colors[:, 2] > 0.5
+                
+            except Exception as e:
+                raise RuntimeError(f"Failed to load PLY file {pred_file}: {str(e)}")
+            
             # print(f'{np.sum(mask_hum)}/{len(mask_hum)} human points')
-            pc_hum, pc_obj = np.array(pc.vertices[mask_hum]), np.array(pc.vertices[~mask_hum])
+            pc_hum, pc_obj = points[mask_hum], points[~mask_hum]
+            
+            if len(pc_hum) == 0 or len(pc_obj) == 0:
+                raise RuntimeError(f"PLY file {pred_file} has empty human ({len(pc_hum)}) or object ({len(pc_obj)}) points")
+            
             # compute t of human and object and then do normalization
             cent_hum, cent_obj = np.mean(pc_hum, 0), np.mean(pc_obj, 0)
             scale_hum = np.sqrt(np.max(np.sum((pc_hum - cent_hum) ** 2, -1)))
@@ -387,39 +555,84 @@ class BehaveDataset(Dataset):
             crop_size += 1  # make sure it is an even number
         return bmax, bmin, crop_center, crop_size
 
+    def is_procigen_sequence(self, rgb_file):
+        """Check if this is a ProciGen synthetic sequence"""
+        seq_name = DataPaths.get_seq_name(rgb_file)
+        # ProciGen sequences have pattern: Date04_Subxx_* or Date09_Subxx_*
+        return 'Subxx' in seq_name
+    
+    def get_kinect_transform(self, rgb_file):
+        """
+        Get the appropriate KinectTransform for the given rgb_file.
+        For BEHAVE sequences, use pre-loaded transforms.
+        For ProciGen sequences, load from the sequence's info.json file.
+        """
+        if self.is_procigen_sequence(rgb_file):
+            # ProciGen sequence - each has its own calibration
+            seq_name = DataPaths.get_seq_name(rgb_file)
+            if seq_name not in self.procigen_transforms_cache:
+                # Get the sequence directory
+                seq_dir = osp.dirname(osp.dirname(rgb_file))
+                # Create transform from this specific sequence
+                self.procigen_transforms_cache[seq_name] = KinectTransform(seq_dir, no_intrinsic=True)
+            return self.procigen_transforms_cache[seq_name]
+        else:
+            # BEHAVE sequence - use date-based transform
+            date = DataPaths.get_seq_date(rgb_file)
+            return self.kin_transforms[date]
+
     def get_samples(self, rgb_file):
         """
         sample SMPL and object surface
-        Parameters
-        ----------
-        rgb_file
-
-        Returns
-        -------
-
+        使用路径缓存：只缓存文件路径，需要时动态加载和采样
         """
         img_key = self.get_cache_key(rgb_file)
+        
         if self.fix_sample and img_key in self.samples_cache:
-            # do not do re-sample, use the last samples
-            samples_smpl, samples_obj = self.samples_cache[img_key]
+            # 从缓存获取文件路径和元数据
+            smpl_path, obj_path, num_smpl, num_obj = self.samples_cache[img_key]
+            
+            # 动态加载mesh并采样
+            smpl = trimesh.load_mesh(smpl_path, process=False)
+            obj = trimesh.load_mesh(obj_path, process=False)
+            
+            # Get the appropriate kinect transform
+            kin_transform = self.get_kinect_transform(rgb_file)
+            kid = DataPaths.get_kinect_id(rgb_file)
+            
+            # transform to local
+            smpl.vertices = kin_transform.world2local(smpl.vertices, kid)
+            obj.vertices = kin_transform.world2local(obj.vertices, kid)
+            
+            # 采样
+            samples_smpl = smpl.sample(num_smpl)
+            samples_obj = obj.sample(num_obj)
         else:
-            # do sample
+            # 缓存未命中，加载数据
             smpl_name, obj_name = self.get_gt_fit_names(rgb_file)
             smpl_path = self.get_smpl_filepath(rgb_file, smpl_name, obj_name)
             obj_path = self.get_obj_filepath(rgb_file, smpl_name, obj_name)
+            
             smpl = trimesh.load_mesh(smpl_path, process=False)
             obj = self.load_obj_gtmesh(obj_path)
-            date, kid = DataPaths.get_seq_date(rgb_file), DataPaths.get_kinect_id(rgb_file)
+            
+            # Get the appropriate kinect transform (BEHAVE or ProciGen)
+            kin_transform = self.get_kinect_transform(rgb_file)
+            kid = DataPaths.get_kinect_id(rgb_file)
+            
             # transform to local
-            smpl.vertices = self.kin_transforms[date].world2local(smpl.vertices, kid)
-            obj.vertices = self.kin_transforms[date].world2local(obj.vertices, kid)
+            smpl.vertices = kin_transform.world2local(smpl.vertices, kid)
+            obj.vertices = kin_transform.world2local(obj.vertices, kid)
+            
             num_smpl = int(self.sample_ratio_hum * self.num_samples)
             num_obj = self.num_samples - num_smpl
             samples_smpl = smpl.sample(num_smpl)
             samples_obj = obj.sample(num_obj)
 
-            # Save samples to cache for fast access next time
-            self.samples_cache[img_key] = (samples_smpl, samples_obj)
+            # 保存到缓存（只保存文件路径和采样参数）
+            if self.fix_sample:
+                self.samples_cache[img_key] = (smpl_path, obj_path, num_smpl, num_obj)
+        
         return samples_obj, samples_smpl
 
     def get_cache_key(self, rgb_file):
