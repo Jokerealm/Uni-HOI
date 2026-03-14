@@ -78,39 +78,55 @@ class ConditionalPointCloudDiffusionModel(PointCloudProjectionModel):
         return_intermediate_steps: bool = False,
         **kwargs
     ):
+        """
+        扩散模型训练前向传播
+        
+        Parameters
+        ----------
+        pc        : Pointclouds — GT 点云, 每个 (N, 3) 或 (N, 3+C_color)
+        camera    : CamerasBase — 相机参数
+        image_rgb : (B, 3, H, W) — 输入 RGB 图像, 例如 (B, 3, 224, 224)
+        mask      : (B, C_mask, H, W) — 分割掩码, C_mask=1 或 2
+        
+        Returns
+        -------
+        loss : scalar — MSE 损失 (预测噪声 vs 真实噪声)
+        """
 
         # Normalize colors and convert to tensor
-        x_0 = self.point_cloud_to_tensor(pc, normalize=True, scale=True) # this will not pack the point colors
-        B, N, D = x_0.shape
+        x_0 = self.point_cloud_to_tensor(pc, normalize=True, scale=True)  # (B, N, D), D=3 或 3+C_color
+        B, N, D = x_0.shape  # 例如 B=batch_size, N=4096, D=3
 
         # Sample random noise
-        noise = torch.randn_like(x_0)
+        noise = torch.randn_like(x_0)  # (B, N, D)
         if self.consistent_center:
             # modification suggested by https://arxiv.org/pdf/2308.07837.pdf
-            noise = noise - torch.mean(noise, dim=1, keepdim=True)
+            noise = noise - torch.mean(noise, dim=1, keepdim=True)  # 零均值噪声
 
         # Sample random timesteps for each point_cloud
         timestep = torch.randint(0, self.scheduler.num_train_timesteps, (B,), 
-            device=self.device, dtype=torch.long)
+            device=self.device, dtype=torch.long)  # (B,), 例如 [0, 1000)
 
         # Add noise to points
-        x_t = self.scheduler.add_noise(x_0, noise, timestep) # diffusion noisy adding, only add to the coordinate, not features
+        x_t = self.scheduler.add_noise(x_0, noise, timestep)  # (B, N, D), 加噪后的点云
 
         # add noise to the camera pose, based on timestamps
         if self.cam_noise_std > 0.000001:
             # the noise is very different
             camera = camera.clone()
-            camT = camera.T # (B, 3)
-            dist = torch.sqrt(torch.sum(camT**2, -1, keepdim=True))
-            nratio = timestep[:, None] / self.scheduler.num_train_timesteps # time-dependent noise
-            tnoise = torch.randn(B, 3).to(dist.device)/3. * dist * self.cam_noise_std * nratio
-            camera.T = camera.T + tnoise
+            camT = camera.T  # (B, 3)
+            dist = torch.sqrt(torch.sum(camT**2, -1, keepdim=True))  # (B, 1)
+            nratio = timestep[:, None] / self.scheduler.num_train_timesteps  # (B, 1), 时间相关噪声比例
+            tnoise = torch.randn(B, 3).to(dist.device)/3. * dist * self.cam_noise_std * nratio  # (B, 3)
+            camera.T = camera.T + tnoise  # (B, 3)
 
         # Conditioning, the pixel-aligned feature is based on points with noise (new points)
         x_t_input = self.get_diffu_input(camera, image_rgb, mask, timestep, x_t, **kwargs)
+        # x_t_input: (B, N, D_total), D_total = 3 + D_cond (例如 392)
 
         # Forward
         loss, noise_pred = self.compute_loss(noise, timestep, x_0, x_t_input)
+        # noise_pred: (B, N, D_out), D_out = 3 (predict_shape) 或 3+C_color
 
         # Whether to return intermediate steps
         if return_intermediate_steps:
@@ -119,32 +135,59 @@ class ConditionalPointCloudDiffusionModel(PointCloudProjectionModel):
         return loss
 
     def compute_loss(self, noise, timestep, x_0, x_t_input):
-        x_pred = torch.zeros_like(x_0)
+        """
+        计算扩散模型的训练损失
+        
+        Parameters
+        ----------
+        noise     : (B, N, D_out) — 真实噪声, D_out=3 或 3+C_color
+        timestep  : (B,) — 扩散时间步
+        x_0       : (B, N, D_out) — 原始干净点云
+        x_t_input : (B, N, D_total) — 带条件特征的输入, D_total >> D_out
+        
+        Returns
+        -------
+        loss       : scalar — MSE 损失
+        noise_pred : (B, N, D_out) — 预测的噪声 (或样本)
+        """
+        x_pred = torch.zeros_like(x_0)  # (B, N, D_out), 用于 self-conditioning
         if self.self_conditioning:
             # self conditioning, from https://openreview.net/pdf?id=3itjR9QxFw
             if random.uniform(0, 1.) > 0.5:
                 with torch.no_grad():
                     x_pred = self.point_cloud_model(torch.cat([x_t_input, x_pred], -1), timestep)
+                    # 输入: (B, N, D_total + D_out), 输出: (B, N, D_out)
             noise_pred = self.point_cloud_model(torch.cat([x_t_input, x_pred], -1), timestep)
+            # 输入: (B, N, D_total + D_out), 输出: (B, N, D_out)
         else:
             noise_pred = self.point_cloud_model(x_t_input, timestep)
+            # 输入: (B, N, D_total), 输出: (B, N, D_out)
+            # PointCloudModel 内部: (B, N, D_total) → transpose → (B, D_total, N) → PVCNN → (B, D_out, N) → transpose → (B, N, D_out)
         # Check
         if not noise_pred.shape == noise.shape:
             raise ValueError(f'{noise_pred.shape=} and {noise.shape=}')
         # Loss
         if self.dm_pred_type == 'epsilon':
-            loss = F.mse_loss(noise_pred, noise)
+            loss = F.mse_loss(noise_pred, noise)  # 预测噪声 vs 真实噪声
         elif self.dm_pred_type == 'sample':
-            loss = F.mse_loss(noise_pred, x_0)  # predicting sample
+            loss = F.mse_loss(noise_pred, x_0)  # 预测样本 vs 原始样本
         else:
             raise NotImplementedError
         return loss, noise_pred
 
     def get_diffu_input(self, camera, image_rgb, mask, timestep, x_t, **kwargs):
-        "return: (B, N, D), the exact input to the diffusion model, x_t: (B, N, 3)"
+        """
+        构建扩散模型的完整输入 (坐标 + 条件特征)
+        
+        Returns
+        -------
+        x_t_input : (B, N, D_total)
+            D_total = 3(坐标) + D_cond(局部特征)
+            典型值: 3 + 389 = 392 (单mask), 3 + 391 = 394 (h+o mask)
+        """
         x_t_input = self.get_input_with_conditioning(x_t, camera=camera,
                                                      image_rgb=image_rgb, mask=mask, t=timestep)
-        return x_t_input
+        return x_t_input  # (B, N, D_total)
 
     @torch.no_grad()
     def forward_sample(
@@ -240,27 +283,31 @@ class ConditionalPointCloudDiffusionModel(PointCloudProjectionModel):
 
     def reverse_step(self, extra_step_kwargs, scheduler, t, x_t, x_t_input, **kwargs):
         """
-        run one reverse step to compute x_t
-        :param extra_step_kwargs: 
-        :param scheduler: 
-        :param t: [1], diffusion time step
-        :param x_t: (B, N, 3)
-        :param x_t_input: conditional features (B, N, F)
-        :param kwargs: other configurations to run diffusion step
-        :return: denoised x_t
+        执行一步反向扩散
+        
+        Parameters
+        ----------
+        t         : scalar tensor — 当前扩散时间步
+        x_t       : (B, N, D) — 当前噪声点云, D=3 或 3+C_color
+        x_t_input : (B, N, D_total) — 带条件特征的输入
+        
+        Returns
+        -------
+        x_t : (B, N, D) — 去噪一步后的点云
         """
         B = x_t.shape[0]
-        # Forward
+        # Forward: 预测噪声
         noise_pred = self.point_cloud_model(x_t_input, t.reshape(1).expand(B))
+        # noise_pred: (B, N, D_out), D_out = 3 或 3+C_color
         if self.consistent_center:
             assert self.dm_pred_type != 'sample', 'incompatible dm predition type for CCD!'
             # suggested by the CCD-3DR paper
-            noise_pred = noise_pred - torch.mean(noise_pred, dim=1, keepdim=True)
-        # Step
-        x_t = scheduler.step(noise_pred, t, x_t, **extra_step_kwargs).prev_sample
+            noise_pred = noise_pred - torch.mean(noise_pred, dim=1, keepdim=True)  # 零均值约束
+        # Step: 调度器执行一步去噪
+        x_t = scheduler.step(noise_pred, t, x_t, **extra_step_kwargs).prev_sample  # (B, N, D)
         if self.consistent_center:
-            x_t = x_t - torch.mean(x_t, dim=1, keepdim=True)
-        return x_t
+            x_t = x_t - torch.mean(x_t, dim=1, keepdim=True)  # 保持零均值
+        return x_t  # (B, N, D)
 
     def setup_reverse_process(self, eta, num_inference_steps, scheduler):
         """

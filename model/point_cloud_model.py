@@ -57,11 +57,26 @@ class PointCloudModel(ModelMixin, ConfigMixin):
             raise NotImplementedError()
 
     def forward(self, inputs: Tensor, t: Tensor, ret_feats=False) -> Tensor:
-        """ Receives input of shape (B, N, in_channels) and returns output
-            of shape (B, N, out_channels) """
+        """
+        点云去噪网络前向传播
+        
+        Parameters
+        ----------
+        inputs : (B, N, in_channels) — 带条件特征的点云输入
+        t      : (B,) — 扩散时间步
+        
+        Returns
+        -------
+        output : (B, N, out_channels) — 预测的噪声或样本
+        
+        内部维度变换:
+            (B, N, in_channels) → transpose → (B, in_channels, N) → PVCNN → (B, out_channels, N) → transpose → (B, N, out_channels)
+        """
         with self.autocast_context:
             if not ret_feats:
                 return self.model(inputs.transpose(1, 2), t, ret_feats=False).transpose(1, 2)
+                # inputs.transpose: (B, in_channels, N) → PVCNN → (B, out_channels, N) → transpose → (B, N, out_channels)
             else:
                 pred, feats = self.model(inputs.transpose(1, 2), t, ret_feats=True)
                 return pred.transpose(1, 2), feats
+                # pred: (B, N, out_channels), feats: PVCNN 中间特征列表

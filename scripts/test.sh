@@ -1,25 +1,37 @@
 #!/bin/bash
+# test.sh — Launch evaluation & metrics (Step 5)
+# Usage:
+#   bash scripts/test.sh                                    # sample_data, latest checkpoint
+#   bash scripts/test.sh --gpu 1 --dataset behave           # 完整数据集
+#   bash scripts/test.sh --checkpoint outputs/runs/xxx/checkpoint_latest.pt
+set -e
 
-# Example command to run test on BEHAVE dataset
-# Tip: You can speed up inference by appending `run.diffusion_scheduler=ddim run.num_inference_steps=100` to the end of the command,
-# same for both stage 1 and stage 2 inference.
+GPU_ID=0
+DATASET="sample"
+VIDEO_NAME="test_video"
+CHECKPOINT=""
+RUN_ID="latest"
+EXTRA_ARGS=""
 
-# Stage 1: reconstruct H+O and segment, results will be saved to outputs/run.name/single/sample
-python main.py \
-run.name=stage1 model.consistent_center=True \
-model.image_feature_model=vit_base_patch16_224_mae dataloader.batch_size=16 \
-model.model_name=pc2-diff-ho-sepsegm model.predict_binary=True model.lw_binary=3.0 \
-dataset=behave dataset.max_points=16384 \
-scheduler=linear optimizer.lr=3e-4 \
-dataset.split_file=/data4/guanz/data/train-procigen-test-behave.pkl run.job=sample
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --gpu)         GPU_ID="$2";      shift 2 ;;
+        --dataset)     DATASET="$2";     shift 2 ;;
+        --video)       VIDEO_NAME="$2";  shift 2 ;;
+        --checkpoint)  CHECKPOINT="$2";  shift 2 ;;
+        --run-id)      RUN_ID="$2";      shift 2 ;;
+        -h|--help)
+            sed -n '2,6p' "$0"; exit 0 ;;
+        *)  EXTRA_ARGS="${EXTRA_ARGS} $1"; shift ;;
+    esac
+done
 
+CMD="python test.py dataset=${DATASET} data_prep.video_name=${VIDEO_NAME}"
+if [ -n "$CHECKPOINT" ]; then
+    CMD="${CMD} checkpoint.path=${CHECKPOINT}"
+else
+    CMD="${CMD} checkpoint.run_id=${RUN_ID}"
+fi
+CMD="${CMD} ${EXTRA_ARGS}"
 
-# Stage 2: load stage 1 results and refine human and object
-python main.py \
-run.name=stage2 model.consistent_center=True \
-model.image_feature_model=vit_base_patch16_224_mae dataloader.batch_size=16 \
-model=ho-attn model.attn_weight=1.0 model.attn_type=coord3d+posenc-learnable \
-dataset=behave dataset.type=behave-attn model.point_visible_test=combine \
-dataset.split_file=your_split_file run.job=sample \
-run.save_name=stage1-500step run.sample_noise_step=500 run.sample_mode=interm-pred \
-dataset.ho_segm_pred_path=$PWD/outputs/stage1/single/sample/pred # path to the first stage predictions
+CUDA_VISIBLE_DEVICES=${GPU_ID} ${CMD}

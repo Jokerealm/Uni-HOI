@@ -46,38 +46,59 @@ class CrossAttenHODiffusionModel(ConditionalPCDiffusionBehave):
         return_intermediate_steps: bool = False,
         **kwargs
     ):
+        """
+        双分支 (人+物) 交叉注意力扩散模型训练前向传播
+        
+        Parameters
+        ----------
+        pc        : Pointclouds — 人体 GT 点云, 每个 (N, 3)
+        camera    : CamerasBase — 人体视角相机
+        image_rgb : (B, 3, H, W) — 人体 RGB 图像, 例如 (B, 3, 224, 224)
+        mask      : (B, C_mask, H, W) — 人体分割掩码
+        kwargs 包含:
+            pc_obj     : Pointclouds — 物体 GT 点云
+            camera_obj : CamerasBase — 物体视角相机
+            rgb_obj    : (B, 3, H, W) — 物体 RGB 图像
+            mask_obj   : (B, C_mask, H, W) — 物体分割掩码
+            cent_hum/cent_obj   : (B, 3) — 归一化中心
+            radius_hum/radius_obj : (B, 1) — 归一化半径
+        
+        Returns
+        -------
+        loss     : scalar — 人体 + 物体 MSE 损失之和
+        loss_sep : (2,) tensor — [loss_human, loss_object]
+        """
         "additional input (RGB, mask, camera, and pc) for object is read from kwargs"
         # assert not self.consistent_center
         assert not self.self_conditioning
 
         # Normalize colors and convert to tensor
-        x0_h = self.point_cloud_to_tensor(pc, normalize=True, scale=True)  # this will not pack the point colors
-        x0_o = self.point_cloud_to_tensor(kwargs.get('pc_obj'), normalize=True, scale=True)
-        B, N, D = x0_h.shape
+        x0_h = self.point_cloud_to_tensor(pc, normalize=True, scale=True)  # (B, N, D), D=3
+        x0_o = self.point_cloud_to_tensor(kwargs.get('pc_obj'), normalize=True, scale=True)  # (B, N, D)
+        B, N, D = x0_h.shape  # 例如 B=batch, N=4096, D=3
 
         # Sample random noise
-        noise = torch.randn_like(x0_h)
+        noise = torch.randn_like(x0_h)  # (B, N, D), 人和物共享同一噪声
         if self.consistent_center:
-            # modification suggested by https://arxiv.org/pdf/2308.07837.pdf
             noise = noise - torch.mean(noise, dim=1, keepdim=True)
 
         # Sample random timesteps for each point_cloud
         timestep = torch.randint(0, self.scheduler.num_train_timesteps, (B,),
-                                 device=self.device, dtype=torch.long)
-        # timestep = torch.randint(0, 1, (B,),
-        #                          device=self.device, dtype=torch.long)
+                                 device=self.device, dtype=torch.long)  # (B,)
 
         # Add noise to points
-        xt_h = self.scheduler.add_noise(x0_h, noise, timestep)
-        xt_o = self.scheduler.add_noise(x0_o, noise, timestep)
-        norm_parms = self.pack_norm_params(kwargs) # (2, B, 4)
+        xt_h = self.scheduler.add_noise(x0_h, noise, timestep)  # (B, N, D) 加噪人体点云
+        xt_o = self.scheduler.add_noise(x0_o, noise, timestep)  # (B, N, D) 加噪物体点云
+        norm_parms = self.pack_norm_params(kwargs)  # (2, B, 4), [0]=人体, [1]=物体, 每个=(cent_xyz, radius)
 
-        # get input conditioning
+        # get input conditioning: 提取像素对齐特征
         x_t_input_h, x_t_input_o = self.get_image_conditioning(camera, image_rgb, kwargs, mask, norm_parms, timestep,
                                                                xt_h, xt_o)
+        # x_t_input_h: (B, N, D_total), x_t_input_o: (B, N, D_total)
 
-        # Diffusion prediction
+        # Diffusion prediction: PVCNN2HumObj 交叉注意力模型
         noise_pred_h, noise_pred_o = self.point_cloud_model(x_t_input_h, x_t_input_o, timestep, norm_parms)
+        # noise_pred_h: (B, N, D_out), noise_pred_o: (B, N, D_out), D_out=3
 
         # Check
         if not noise_pred_h.shape == noise.shape:
@@ -86,8 +107,8 @@ class CrossAttenHODiffusionModel(ConditionalPCDiffusionBehave):
             raise ValueError(f'{noise_pred_o.shape=} and {noise.shape=}')
 
         # Loss
-        loss_h = F.mse_loss(noise_pred_h, noise)
-        loss_o = F.mse_loss(noise_pred_o, noise)
+        loss_h = F.mse_loss(noise_pred_h, noise)  # 人体噪声预测损失
+        loss_o = F.mse_loss(noise_pred_o, noise)  # 物体噪声预测损失
 
         loss = loss_h + loss_o
 
@@ -99,40 +120,59 @@ class CrossAttenHODiffusionModel(ConditionalPCDiffusionBehave):
 
     def get_image_conditioning(self, camera, image_rgb, kwargs, mask, norm_parms, timestep, xt_h, xt_o):
         """
-        compute image features for each point
-        :param camera:
-        :param image_rgb:
-        :param kwargs:
-        :param mask:
-        :param norm_parms:
-        :param timestep:
-        :param xt_h:
-        :param xt_o:
-        :return:
+        为人体和物体分别计算像素对齐的图像条件特征
+        
+        Parameters
+        ----------
+        camera    : CamerasBase — 人体视角相机
+        image_rgb : (B, 3, H, W) — 人体 RGB 图像
+        mask      : (B, C_mask, H, W) — 人体掩码
+        norm_parms: (2, B, 4) — 归一化参数, [center_xyz(3), radius(1)]
+        timestep  : (B,) — 扩散时间步
+        xt_h      : (B, N, 3) — 加噪人体点云
+        xt_o      : (B, N, 3) — 加噪物体点云
+        
+        Returns
+        -------
+        x_t_input_h : (B, N, D_total) — 人体条件输入
+        x_t_input_o : (B, N, D_total) — 物体条件输入
+        
+        'single' 模式: 人和物独立做可见性测试
+        'combine' 模式: 合并人+物点云做可见性测试, 需要坐标空间变换
         """
         if self.point_visible_test == 'single':
             # Visibility test is down independently for human and object
             x_t_input_h = self.get_input_with_conditioning(xt_h, camera=camera,
                                                            image_rgb=image_rgb, mask=mask, t=timestep)
+            # x_t_input_h: (B, N, D_total)
             x_t_input_o = self.get_input_with_conditioning(xt_o, camera=kwargs.get('camera_obj'),
                                                            image_rgb=kwargs.get('rgb_obj'),
                                                            mask=kwargs.get('mask_obj'), t=timestep)
+            # x_t_input_o: (B, N, D_total)
         elif self.point_visible_test == 'combine':
             # Combine human + object points to do visibility test and obtain features
             B, N = xt_h.shape[:2]  # (B, N, 3)
             # for human: transform object points first to H+O space, then to human space
+            # norm_parms[1]: 物体的 (B, 4) = (cent_xyz, radius)
             xt_o_in_ho = xt_o * 2 * norm_parms[1, :, 3:].unsqueeze(1) + norm_parms[1, :, :3].unsqueeze(1)
+            # xt_o_in_ho: (B, N, 3) — 物体点变换到 H+O 联合坐标系
             xt_o_in_hum = (xt_o_in_ho - norm_parms[0, :, :3].unsqueeze(1)) / (2 * norm_parms[0, :, 3:].unsqueeze(1))
+            # xt_o_in_hum: (B, N, 3) — 物体点变换到人体归一化坐标系
             # compute features for all points, take only first half feature for human
             x_t_input_h = self.get_input_with_conditioning(torch.cat([xt_h, xt_o_in_hum], 1), camera=camera,
                                                            image_rgb=image_rgb, mask=mask, t=timestep)[:,:N]
+            # 合并: (B, 2N, 3) → 特征: (B, 2N, D_total) → 取前 N 个: (B, N, D_total)
+            
             # for object: transform human points to H+O space, then to object space
             xt_h_in_ho = xt_h * 2 * norm_parms[0, :, 3:].unsqueeze(1) + norm_parms[0, :, :3].unsqueeze(1)
+            # xt_h_in_ho: (B, N, 3) — 人体点变换到 H+O 联合坐标系
             xt_h_in_obj = (xt_h_in_ho - norm_parms[1, :, :3].unsqueeze(1)) / (2 * norm_parms[1, :, 3:].unsqueeze(1))
+            # xt_h_in_obj: (B, N, 3) — 人体点变换到物体归一化坐标系
             x_t_input_o = self.get_input_with_conditioning(torch.cat([xt_o, xt_h_in_obj], 1),
                                                            camera=kwargs.get('camera_obj'),
                                                            image_rgb=kwargs.get('rgb_obj'),
                                                            mask=kwargs.get('mask_obj'), t=timestep)[:, :N]
+            # 合并: (B, 2N, 3) → 特征: (B, 2N, D_total) → 取前 N 个: (B, N, D_total)
         else:
             raise NotImplementedError
         return x_t_input_h, x_t_input_o

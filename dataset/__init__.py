@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -225,6 +226,41 @@ def get_dataset(cfg: ProjectConfig):
         dataloader_vis = DataLoader(dataset_val, batch_size=cfg.dataloader.batch_size,
                                     collate_fn=collate_batched_meshes,
                                     num_workers=cfg.dataloader.num_workers, shuffle=shuffle)
+    elif cfg.dataset.type == 'preprocessed':
+        # ---------------------------------------------------------------
+        # Pure file-read DataLoader for preprocess.py outputs.
+        # No model inference in __getitem__ — only reads .png / .npz.
+        # ---------------------------------------------------------------
+        from .preprocessed_dataset import PreprocessedDataset
+
+        root_dir = os.path.join(
+            cfg.data_prep.input_dir, cfg.data_prep.video_name
+        ) if hasattr(cfg, 'data_prep') else os.path.join(
+            cfg.dataset.behave_dir  # fallback
+        )
+        processed_subdir = cfg.data_prep.output_subdir if hasattr(cfg, 'data_prep') else 'processed'
+        img_size = (cfg.dataset.image_size, cfg.dataset.image_size) if hasattr(cfg.dataset, 'image_size') else (256, 256)
+
+        dataset = PreprocessedDataset(
+            root_dir=root_dir,
+            processed_subdir=processed_subdir,
+            image_size=img_size,
+        )
+        # Use same dataset for train / val / vis (single-video scenario)
+        dataloader_train = DataLoader(
+            dataset,
+            batch_size=cfg.dataloader.batch_size,
+            num_workers=cfg.dataloader.num_workers,
+            shuffle=True,
+        )
+        dataloader_val = DataLoader(
+            dataset,
+            batch_size=cfg.dataloader.batch_size,
+            num_workers=cfg.dataloader.num_workers,
+            shuffle=False,
+        )
+        dataloader_vis = dataloader_val
+
     else:
         raise NotImplementedError(cfg.dataset.type)
     

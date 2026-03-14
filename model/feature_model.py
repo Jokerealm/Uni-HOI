@@ -124,37 +124,46 @@ class FeatureModel(ModelMixin, ConfigMixin):
         return_upscaled_features: bool = True,
         return_projection_head_output: bool = False,
     ):
-        """Normalizes the input `x` and runs it through `model` to obtain features"""
+        """Normalizes the input `x` and runs it through `model` to obtain features.
+        
+        Dimension flow (以 vit_small_patch16_224_msn 为例, image_size=224):
+            输入 x: (B, 3, 224, 224)
+            ViT 输出 feats: (B, 197, 384)  -- 197 = 1(CLS) + 14*14(patches), D=embed_dim=384
+            output_feats: (B, 384, 14, 14) → 上采样 → (B, 384, 224, 224)
+            output_cls: (B, 384)
+        """
         assert return_type in {'cls_token', 'features', 'all'}
 
         # Identity
         if self.model_name == 'identity':
-            return x
+            return x  # (B, C, H, W) 直接返回
         
         # Normalize and forward
-        B, C, H, W = x.shape
-        x = self.normalize(x)
-        feats = self.model(x)
+        B, C, H, W = x.shape  # x: (B, 3, H, W), 例如 (B, 3, 224, 224)
+        x = self.normalize(x)  # (B, 3, H, W) ImageNet 标准化
+        feats = self.model(x)  # (B, T, D), T = 1 + (H/P)*(W/P), D = embed_dim
+                                # 例如 (B, 197, 384) for patch_size=16, H=W=224
 
         # Reshape to image-like size
         if return_type in {'features', 'all'}:
-            B, T, D = feats.shape
+            B, T, D = feats.shape  # T = 1(CLS) + HW_down^2, D = embed_dim
             assert math.sqrt(T - 1).is_integer()
-            HW_down = int(math.sqrt(T - 1))  # subtract one for CLS token
-            output_feats: Tensor = feats[:, 1:, :].reshape(B, HW_down, HW_down, D).permute(0, 3, 1, 2)  # (B, D, H_down, W_down)
+            HW_down = int(math.sqrt(T - 1))  # 例如 14 for 224/16
+            # 去掉 CLS token, reshape 为空间特征图
+            output_feats: Tensor = feats[:, 1:, :].reshape(B, HW_down, HW_down, D).permute(0, 3, 1, 2)  # (B, D, HW_down, HW_down), 例如 (B, 384, 14, 14)
             if return_upscaled_features:
                 output_feats = F.interpolate(output_feats, size=(H, W), mode='bilinear',
-                    align_corners=False)  # (B, D, H_orig, W_orig)
+                    align_corners=False)  # (B, D, H, W), 例如 (B, 384, 224, 224)
 
         # Head for MSN
-        output_cls = feats[:, 0]
+        output_cls = feats[:, 0]  # (B, D), CLS token, 例如 (B, 384)
         if return_projection_head_output and return_type in {'cls_token', 'all'}:
-            output_cls = self.fc(output_cls)
+            output_cls = self.fc(output_cls)  # (B, D) 经过投影头
         
         # Return
         if return_type == 'cls_token':
-            return output_cls
+            return output_cls  # (B, D)
         elif return_type == 'features':
-            return output_feats
+            return output_feats  # (B, D, H, W)
         else:
-            return output_cls, output_feats
+            return output_cls, output_feats  # (B, D), (B, D, H, W)

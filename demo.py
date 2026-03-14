@@ -71,7 +71,7 @@ class DemoRunner:
         self.device = 'cuda'
 
     def load_checkpoint(self, ckpt_file1, model_stage1, device='cpu'):
-        checkpoint = torch.load(ckpt_file1, map_location=device)
+        checkpoint = torch.load(ckpt_file1, map_location=device, weights_only=False)
         state_dict, key = checkpoint['model'], 'model'
         if any(k.startswith('module.') for k in state_dict.keys()):
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}

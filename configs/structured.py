@@ -347,6 +347,108 @@ class CosineSchedulerConfig(SchedulerConfig):
     ))
 
 
+###############################################################################
+# Phase 2: Dual-Branch Flow Matching model config
+###############################################################################
+@dataclass
+class FlowMatchingModelConfig:
+    model_name: str = 'flow-matching'
+    # Issue 6: video_channels is RGB-only output (3), input is 4 (RGB+mask per stream)
+    video_channels: int = 3            # output channels (RGB only)
+    video_input_channels: int = 4      # input channels per stream (RGB + individual mask)
+    video_patch_size: int = 2
+    point_channels: int = 14           # xyz(3)+rot(4)+scale(3)+opacity(1)+SH(3)
+    mask_channels: int = 2             # human mask + object mask (Issue 5: cross-attn condition)
+    # Issue 7: smaller model — dim=384, depth=8 → ~60-65M with temporal attn
+    dim: int = 384
+    depth: int = 8
+    num_heads: int = 6
+    mlp_ratio: float = 4.0
+    cond_dim: int = 192
+    attn_drop: float = 0.0
+    proj_drop: float = 0.0
+    lambda_video: float = 1.0
+    lambda_3d: float = 1.0
+    # Data shape
+    num_frames: int = 4
+    video_h: int = 32
+    video_w: int = 32
+    num_points: int = 256
+    # Real dataset (preprocessed Phase 1 outputs)
+    preprocessed_dir: str = 'preprocessed/phase1'
+    consolidated_dir: str = 'preprocessed/phase1_consolidated'
+    cache_file: str = 'preprocessed/phase1_cache.pt'
+    use_real_data: bool = True
+
+
+###############################################################################
+# Phase 3: Joint 3DGS Optimization config
+###############################################################################
+@dataclass
+class Joint3DGSModelConfig:
+    model_name: str = 'joint-3dgs'
+    # Data (either preprocessed .pt or raw image dirs)
+    preprocessed_pt: str = ''          # path to .pt from preprocess_phase1.py
+    phase2_output: str = ''            # path to Phase 2 output .pt for initialization
+    frames_dir: str = ''
+    masks_human_dir: str = ''
+    masks_object_dir: str = ''
+    image_height: int = 256
+    image_width: int = 256
+    # Model
+    num_points_human: int = 4096
+    num_points_object: int = 2048
+    focal: float = 500.0
+    # Training
+    num_iters: int = 5000
+    save_every: int = 1000
+    # Learning rates
+    lr_xyz: float = 1.6e-4
+    lr_opacity: float = 5e-2
+    lr_scaling: float = 5e-3
+    lr_rotation: float = 1e-3
+    lr_color: float = 2.5e-3
+    # SE(3) registration learning rates
+    lr_se3_translation: float = 1e-3
+    lr_se3_rotation: float = 1e-4
+    # Multi-region rendering loss weights
+    w_visible: float = 1.0
+    w_primary_occ: float = 0.3
+    w_secondary_occ: float = 0.05
+    lambda_ssim: float = 0.2
+    # Contact loss
+    lambda_contact: float = 0.5
+    enable_contact: bool = True
+    # 2D projection loss
+    lambda_j2d: float = 0.1
+    enable_j2d: bool = True
+    j2d_conf_threshold: float = 0.3
+    # Penetration loss (volumetric SMPL SDF)
+    lambda_pen: float = 1.0
+    enable_penetration: bool = True
+    sdf_resolution: int = 64
+    sdf_padding: float = 0.1
+    # Temporal smoothness loss
+    lambda_acc: float = 0.5
+    enable_temporal: bool = True
+    # Legacy basic loss weights (kept for backward compat)
+    lambda_occ: float = 0.01
+    epsilon: float = 0.005
+    # Step 1 processed data directory (soft masks, SMPL-H, keypoints)
+    processed_dir: str = ''
+
+
+###############################################################################
+# Preprocessed dataset config (pure file-read after preprocess.py)
+###############################################################################
+@dataclass
+class PreprocessedDatasetConfig(PointCloudDatasetConfig):
+    type: str = 'preprocessed'
+    root_dir: str = './sample_data/test_video'
+    processed_subdir: str = 'processed'
+    image_size: int = 256
+
+
 @dataclass
 class ProjectConfig:
     run: RunConfig
@@ -374,8 +476,7 @@ class ProjectConfig:
         {'loss': 'default'},
         {'checkpoint': 'default'},
         {'optimizer': 'adam'}, # default adamw
-        {'scheduler': 'linear'},
-        # {'scheduler': 'cosine'},
+        {'scheduler': 'cosine'},
     ])
 
 
@@ -387,10 +488,13 @@ cs.store(group='model', name='diffrec', node=PointCloudDiffusionModelConfig)
 cs.store(group='model', name='coloring_model', node=PointCloudColoringModelConfig)
 cs.store(group='model', name='ho-attn', node=CrossAttnHOModelConfig)
 cs.store(group='model', name='pvcnn-ae', node=PVCNNAEModelConfig)
+cs.store(group='model', name='flow-matching', node=FlowMatchingModelConfig)
+cs.store(group='model', name='joint-3dgs', node=Joint3DGSModelConfig)
 cs.store(group='dataset', name='co3d', node=CO3DConfig)
 # TODO
 cs.store(group='dataset', name='shapenet_r2n2', node=ShapeNetR2N2Config)
 cs.store(group='dataset', name='behave', node=BehaveDatasetConfig)
+cs.store(group='dataset', name='preprocessed', node=PreprocessedDatasetConfig)
 cs.store(group='dataset', name='shape', node=ShapeDatasetConfig)
 # cs.store(group='dataset', name='shapenet_nmr', node=ShapeNetNMRConfig)
 cs.store(group='augmentations', name='default', node=AugmentationConfig)
@@ -403,3 +507,7 @@ cs.store(group='optimizer', name='adam', node=AdamOptimizerConfig)
 cs.store(group='scheduler', name='linear', node=LinearSchedulerConfig)
 cs.store(group='scheduler', name='cosine', node=CosineSchedulerConfig)
 cs.store(name='configs', node=ProjectConfig)
+
+# Step 3.5: Metric Alignment Bridge
+from configs.alignment_config import MetricAlignmentConfig, AlignmentPipelineConfig
+cs.store(group='alignment', name='default', node=MetricAlignmentConfig)

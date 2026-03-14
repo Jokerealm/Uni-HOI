@@ -26,6 +26,9 @@ from configs.structured import ProjectConfig
 from trainer import Trainer
 import training_utils
 
+# Phase 2/3 trainers (imported lazily to avoid pvcnn CUDA JIT when not needed)
+# from trainer import TrainerFlowMatching, TrainerJoint3DGS
+
 
 class TrainerBehave(Trainer):
     def get_gt_pclouds(self, batch, i):
@@ -151,12 +154,22 @@ class TrainerCrossAttnHO(TrainerBinarySegm):
 
 @hydra.main(config_path='configs', config_name='configs', version_base='1.1')
 def main(cfg: ProjectConfig):
-    if cfg.model.model_name == 'diff-ho-attn':
-        # Stage 2 trainner: train model with separate human and object branch
+    model_name = cfg.model.model_name
+
+    if model_name == 'flow-matching':
+        # Phase 2: dual-branch flow matching (avoids pvcnn import)
+        from trainer import TrainerFlowMatching
+        trainer = TrainerFlowMatching(cfg)
+    elif model_name == 'joint-3dgs':
+        # Phase 3: joint 3DGS optimization
+        from trainer import TrainerJoint3DGS
+        trainer = TrainerJoint3DGS(cfg)
+    elif model_name == 'diff-ho-attn':
+        # Stage 2: cross-attention HO diffusion
         trainer = TrainerCrossAttnHO(cfg)
     else:
         if cfg.model.predict_binary:
-            trainer = TrainerBinarySegm(cfg)  # use separate model, or predict binary directly
+            trainer = TrainerBinarySegm(cfg)
         else:
             trainer = TrainerBehave(cfg)
 

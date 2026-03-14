@@ -168,3 +168,13 @@ cython_debug/
 
 outputs/
 results/
+docs/
+logs/
+preprocessed/
+
+# Large model weights (use separate storage/LFS for these)
+*.pth
+*.ckpt
+*.safetensors
+model/sam3/sam3.pt
+model/sam-3d-body/assets/mhr_model.pt
