@@ -37,29 +37,41 @@ def cleanup_gpu():
     gc.collect()
 
 
+
 def print_gpu_status():
-    """Print current GPU memory usage."""
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            alloc = torch.cuda.memory_allocated(i) / 1024**3
-            reserved = torch.cuda.memory_reserved(i) / 1024**3
-            print(f"  GPU {i}: Allocated {alloc:.2f}GB, Reserved {reserved:.2f}GB")
+    """Placeholder — GPU memory logging disabled."""
+    pass
+
+
 
 
 def resolve_paths(cfg: DictConfig) -> dict:
-    """Resolve all data paths from Hydra config."""
+    """Resolve all data paths from Hydra config.
+
+    Supports two layouts:
+      - sample_data:  <input_dir>/<video_name>/frames/*.jpg
+      - BEHAVE:       <input_dir>/sequences/<video_name>/t*.000/k1.color.jpg
+    """
     input_dir = cfg.data_prep.input_dir
     video_name = cfg.data_prep.video_name
+    is_behave = cfg.get("dataset") == "behave"
 
-    base_dir = os.path.join(input_dir, video_name)
+    if is_behave:
+        # BEHAVE dataset lives under sequences/
+        base_dir = os.path.join(input_dir, "sequences", video_name)
+    else:
+        base_dir = os.path.join(input_dir, video_name)
+
     return {
         "base_dir": base_dir,
-        "frames_dir": os.path.join(base_dir, "frames"),
+        "frames_dir": base_dir if is_behave else os.path.join(base_dir, "frames"),
+        "is_behave": is_behave,
         "processed_dir": os.path.join(base_dir, cfg.data_prep.output_subdir),
         "amodal_dir": os.path.join(base_dir, cfg.get("amodal", {}).get("output_subdir", "amodal")),
         "gs_init_dir": os.path.join(base_dir, cfg.get("step3", {}).get("output_subdir", "gs_init")),
         "joint_opt_dir": os.path.join(base_dir, cfg.get("step4", {}).get("output_subdir", "joint_opt")),
     }
+
 
 
 def load_training_data(paths: dict, cfg: DictConfig, device: torch.device) -> dict:
@@ -87,9 +99,25 @@ def load_training_data(paths: dict, cfg: DictConfig, device: torch.device) -> di
 
     # --- Load video frames ---
     frames_dir = paths["frames_dir"]
-    frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
-    if not frame_paths:
-        frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+    is_behave = paths.get("is_behave", False)
+
+    if is_behave:
+        # BEHAVE layout: <seq>/t*.000/k{cam_id}.color.jpg
+        from dataset.behave_paths import DataPaths
+        cam_id = cfg.get("behave_cam_id", 1)
+        frame_paths = DataPaths.get_image_paths_seq(frames_dir, tid=cam_id)
+        if not frame_paths:
+            # fallback: try all cameras
+            for cid in [0, 1, 2, 3]:
+                frame_paths = DataPaths.get_image_paths_seq(frames_dir, tid=cid)
+                if frame_paths:
+                    print(f"[Train] Using BEHAVE camera k{cid}")
+                    break
+    else:
+        frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
+        if not frame_paths:
+            frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+
     assert len(frame_paths) > 0, f"No frames found in {frames_dir}"
 
     for p in frame_paths:
@@ -321,9 +349,9 @@ def run_training(cfg: DictConfig, data: dict, output_dir: str, device: torch.dev
                 if not actual_hand_indices:
                     actual_hand_indices = None
 
-            # Temporal
-            se3_prev = pose_history[-2] if len(pose_history) >= 2 else None
-            se3_curr = pose_history[-1] if len(pose_history) >= 1 else None
+            # Temporal: need prev and next detached poses + live se3 module
+            se3_prev_detached = pose_history[-2] if len(pose_history) >= 2 else None
+            se3_next_detached = pose_history[-1] if len(pose_history) >= 1 else None
 
             log = step4_training_step(
                 human_gs=human_gs,
@@ -341,9 +369,9 @@ def run_training(cfg: DictConfig, data: dict, output_dir: str, device: torch.dev
                 smpl_vertices=smpl_verts,
                 smpl_faces=smpl_faces_t,
                 sdf_module=sdf_module,
-                se3_poses_prev=se3_prev,
-                se3_poses_curr=se3_curr,
-                se3_poses_next=_get_se3_pose(se3_object) if se3_curr is not None else None,
+                se3_pose_prev_detached=se3_prev_detached,
+                se3_pose_next_detached=se3_next_detached,
+                se3_object_module=se3_object if se3_prev_detached is not None else None,
                 w_visible=cfg.step4.region_loss.weight_visible,
                 w_primary=cfg.step4.region_loss.weight_primary_occ,
                 w_secondary=cfg.step4.region_loss.weight_secondary_occ,

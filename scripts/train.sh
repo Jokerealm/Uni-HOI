@@ -1,34 +1,47 @@
 #!/bin/bash
-# train.sh — Launch end-to-end training (Step 5)
-# Usage:
-#   bash scripts/train.sh                          # sample_data 快速验证
-#   bash scripts/train.sh --gpu 1 --dataset behave # 完整数据集
-#   bash scripts/train.sh --gpu 0 --video Date03_Sub03_chairwood --epochs 5
 set -e
+export HYDRA_FULL_ERROR=1
 
-GPU_ID=0
-DATASET="sample"
-VIDEO_NAME="test_video"
-EPOCHS=""
-ITERS=""
-EXTRA_ARGS=""
+# ============================================================
+# Uni-HOI 4.0 — Training Script
+#
+# Pipeline:
+#   Step 1: Preprocess (offline prior extraction)
+#   Step 2: Amodal Video Completion (ProPainter)
+#   Step 3: 3D Lifting & Metric Alignment (zero-shot, no training)
+#   Step 4: Joint 3DGS Optimization (per-video, ONLY gradient step)
+#   Step 5: End-to-End Evaluation
+# ============================================================
 
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --gpu)      GPU_ID="$2";      shift 2 ;;
-        --dataset)  DATASET="$2";     shift 2 ;;
-        --video)    VIDEO_NAME="$2";  shift 2 ;;
-        --epochs)   EPOCHS="$2";      shift 2 ;;
-        --iters)    ITERS="$2";       shift 2 ;;
-        -h|--help)
-            sed -n '2,6p' "$0"; exit 0 ;;
-        *)  EXTRA_ARGS="${EXTRA_ARGS} $1"; shift ;;
-    esac
-done
+# ======== Quick smoke test on sample_data ========
+# Step 4 only (assumes Steps 1-3 outputs exist):
+# CUDA_VISIBLE_DEVICES=0 python main.py \
+#     run.job=train dataset=sample \
+#     step5.num_epochs=2 step5.num_iters_per_epoch=500
 
-CMD="python train.py dataset=${DATASET} data_prep.video_name=${VIDEO_NAME}"
-[ -n "$EPOCHS" ] && CMD="${CMD} step5.num_epochs=${EPOCHS}"
-[ -n "$ITERS" ]  && CMD="${CMD} step5.num_iters_per_epoch=${ITERS}"
-CMD="${CMD} ${EXTRA_ARGS}"
+# ======== Full pipeline on sample_data ========
+# CUDA_VISIBLE_DEVICES=0 python main.py \
+#     run.job=full dataset=sample \
+#     step5.num_epochs=2 step5.num_iters_per_epoch=500
 
-CUDA_VISIBLE_DEVICES=${GPU_ID} ${CMD}
+# ======== Per-video optimization on BEHAVE (default) ========
+CUDA_VISIBLE_DEVICES=0 python main.py \
+    run.job=train \
+    dataset=behave \
+    data_prep.video_name=Date03_Sub03_chairwood_hand \
+    step5.num_epochs=5 \
+    step5.num_iters_per_epoch=1000 \
+    step4.num_iters=5000
+
+# ======== Full pipeline on BEHAVE ========
+# CUDA_VISIBLE_DEVICES=1 python main.py \
+#     run.job=full \
+#     dataset=behave \
+#     data_prep.video_name=Date03_Sub03_chairwood_hand \
+#     step5.num_epochs=5 \
+#     step5.num_iters_per_epoch=1000
+
+# ======== Evaluation only ========
+# CUDA_VISIBLE_DEVICES=1 python main.py \
+#     run.job=eval dataset=behave \
+#     data_prep.video_name=Date03_Sub03_chairwood_hand

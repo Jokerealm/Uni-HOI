@@ -176,5 +176,12 @@ preprocessed/
 *.pth
 *.ckpt
 *.safetensors
+*.pkl
 model/sam3/sam3.pt
 model/sam-3d-body/assets/mhr_model.pt
+model/smpl_models/
+
+# UniDepth build artifacts
+unidepth/ops/*/build/
+unidepth/ops/*/dist/
+unidepth/ops/*/*.egg-info/

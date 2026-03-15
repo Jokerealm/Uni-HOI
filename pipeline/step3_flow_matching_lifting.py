@@ -37,28 +37,21 @@ class Step3Pipeline:
 
     def _load_model(self, fm_cfg: FlowMatchingInferenceConfig):
         """Load the trained flow matching model from checkpoint."""
-        from importlib.util import spec_from_file_location, module_from_spec
+        from model.dual_branch_flow_matching import (
+            DualBranchFlowMatchingTransformer,
+            euler_ode_sample,
+        )
 
-        code_dir = self.cfg.project_root
-
-        # Load dual-branch flow matching module
-        mod_path = os.path.join(code_dir, "model", "dual_branch_flow_matching.py")
-        spec = spec_from_file_location("dual_branch_flow_matching", mod_path)
-        mod = module_from_spec(spec)
-        spec.loader.exec_module(mod)
-
-        # Load PVCNN-based model
-        pvcnn_path = os.path.join(code_dir, "model", "pvcnn_flow_matching.py")
-        pvcnn_spec = spec_from_file_location("pvcnn_flow_matching", pvcnn_path)
-        pvcnn_mod = module_from_spec(pvcnn_spec)
-        pvcnn_spec.loader.exec_module(pvcnn_mod)
-
-        # Instantiate model
-        model = pvcnn_mod.PVCNNFlowMatchingModel(
+        # Instantiate the dual-branch DiT-based flow matching model
+        model = DualBranchFlowMatchingTransformer(
             video_channels=fm_cfg.video_channels,
             video_input_channels=fm_cfg.video_input_channels,
             point_channels=fm_cfg.point_channels,
             mask_channels=fm_cfg.mask_channels,
+            dim=fm_cfg.dim,
+            depth=fm_cfg.depth,
+            num_heads=fm_cfg.num_heads,
+            cond_dim=fm_cfg.cond_dim,
         )
 
         # Load checkpoint if provided
@@ -82,7 +75,7 @@ class Step3Pipeline:
         model = model.to(self.device)
         model.eval()
         self.model = model
-        self._euler_ode_sample = mod.euler_ode_sample
+        self._euler_ode_sample = euler_ode_sample
 
         num_params = sum(p.numel() for p in model.parameters())
         print(f"[Step3] Model loaded: {num_params / 1e6:.2f}M parameters")

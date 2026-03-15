@@ -25,10 +25,10 @@ class UniDepthEstimator:
     def _load(self, model_dir: str, backbone: str):
         try:
             from unidepth.models import UniDepthV2
-            self._model = UniDepthV2.from_pretrained(
-                model_dir
-            ).to(self.device).eval()
-            print("[UniDepth] Loaded model.")
+            # Use HuggingFace model ID (weights auto-downloaded & cached)
+            hf_name = f"lpiccinelli/unidepth-v2-{backbone}"
+            self._model = UniDepthV2.from_pretrained(hf_name).to(self.device).eval()
+            print(f"[UniDepth] Loaded model from {hf_name}")
         except Exception as e:
             print(f"[UniDepth] Could not load: {e}. Using stub.")
 

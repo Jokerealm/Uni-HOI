@@ -1,8 +1,14 @@
 # ============================================================
-# Step 1: Data Preparation & Perception Pipeline Config
+# Uni-HOI 4.0 — Global Configuration
 # ============================================================
 defaults:
   - _self_
+
+# --- Run Config ---
+run:
+  job: train          # full | train | eval | step1 | step2 | step3 | step4 | step5 | preprocess_and_train
+  name: debug
+  seed: 42
 
 # --- Global Paths ---
 base_weights_dir: /data4/guanz/coding/HDM/model
@@ -75,30 +81,26 @@ amodal:
   output_subdir: amodal     # results saved to <input_dir>/<video_name>/<output_subdir>/
 
 # ============================================================
-# Step 3: Flow Matching 3D Lifting
+# Step 3: Zero-shot 3D Lifting via Hunyuan3D-2
 # ============================================================
-fm:
-  # Path to trained FM checkpoint (from Phase 2 training)
-  checkpoint: ""   # e.g. outputs/flow-matching-phase2-real/single/checkpoint-latest.pth
-  # Model architecture (must match training config)
-  video_channels: 3
-  video_input_channels: 4
-  point_channels: 14
-  mask_channels: 2
-  dim: 384
-  depth: 8
-  num_heads: 6
-  cond_dim: 192
-  # ODE sampling
-  num_ode_steps: 50
-  # Data shape
-  num_frames: 4
-  video_h: 32
-  video_w: 32
-  num_points: 256
+hy3d:
+  # HuggingFace model ID or local path to Hunyuan3D-2 weights
+  model_path: /data4/guanz/models/Hunyuan3D-2
+  subfolder: hunyuan3d-dit-v2-0
+  # Inference parameters
+  num_inference_steps: 50
+  guidance_scale: 5.0
+  octree_resolution: 384
+  # 3DGS sampling from generated mesh
+  num_sample_points: 4096
+  init_gaussian_scale: 0.01
+  # Preprocessing
+  remove_background: false
+  dtype: float16
 
 step3:
   output_subdir: gs_init    # results saved to <input_dir>/<video_name>/<output_subdir>/
+  frame_selection: middle   # which amodal frame to use: middle, first, last, or int index
 
 # ============================================================
 # Step 3.5: Metric Alignment Bridge (between Step 3 and Step 4)
@@ -191,3 +193,4 @@ dataset: sample
 # --- Model Overrides (for CLI convenience) ---
 model:
   epochs: null
+

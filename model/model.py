@@ -226,6 +226,10 @@ class ConditionalPointCloudDiffusionModel(PointCloudProjectionModel):
         # Set timesteps
         extra_step_kwargs = self.setup_reverse_process(eta, num_inference_steps, scheduler)
 
+        # Ensure scheduler timesteps are on the correct device
+        if hasattr(scheduler, 'timesteps') and scheduler.timesteps.device != device:
+            scheduler.timesteps = scheduler.timesteps.to(device)
+
         # Loop over timesteps
         all_outputs = []
         return_all_outputs = (return_sample_every_n_steps > 0)

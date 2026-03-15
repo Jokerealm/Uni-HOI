@@ -210,50 +210,66 @@ class MetricLogger(object):
         self.meters[name] = meter
 
     def log_every(self, iterable, print_freq, header=None):
-        i = 0
+        """Iterate with tqdm progress bar, ETA, and periodic metric logging."""
+        from tqdm import tqdm
         if not header:
             header = ''
+        total = len(iterable) if hasattr(iterable, '__len__') else None
+        pbar = tqdm(iterable, total=total, desc=header, dynamic_ncols=True)
         start_time = time.time()
-        end = time.time()
-        iter_time = SmoothedValue(fmt='{avg:.4f}')
-        data_time = SmoothedValue(fmt='{avg:.4f}')
-        space_fmt = ':' + str(len(str(len(iterable)))) + 'd'
-        log_msg = [
-            header,
-            '[{0' + space_fmt + '}/{1}]',
-            'eta: {eta}',
-            '{meters}',
-            'time: {time}',
-            'data: {data}'
-        ]
-        if torch.cuda.is_available():
-            log_msg.append('max mem: {memory:.0f}')
-        log_msg = self.delimiter.join(log_msg)
-        MB = 1024.0 * 1024.0
-        for obj in iterable:
-            data_time.update(time.time() - end)
+        pending_print = False
+        for i, obj in enumerate(pbar):
+            if pending_print:
+                self._tqdm_print(pbar, header)
+                pending_print = False
             yield obj
-            iter_time.update(time.time() - end)
-            if i % print_freq == 0 or i == len(iterable) - 1:
-                eta_seconds = iter_time.global_avg * (len(iterable) - i)
-                eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
-                if torch.cuda.is_available():
-                    print(log_msg.format(
-                        i, len(iterable), eta=eta_string,
-                        meters=str(self),
-                        time=str(iter_time), data=str(data_time),
-                        memory=torch.cuda.max_memory_allocated() / MB))
-                else:
-                    print(log_msg.format(
-                        i, len(iterable), eta=eta_string,
-                        meters=str(self),
-                        time=str(iter_time), data=str(data_time)))
-            i += 1
-            end = time.time()
+            if i % print_freq == 0 or (total is not None and i == total - 1):
+                pending_print = True
+        if pending_print:
+            self._tqdm_print(pbar, header)
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print('{}  Total time: {} ({:.4f} s / it)'.format(
-            header, total_time_str, total_time / len(iterable)))
+        if total and total > 0:
+            print(f'{header}  Total time: {total_time_str} ({total_time / total:.4f} s / it)')
+
+    def _tqdm_print(self, pbar, header):
+        from tqdm import tqdm
+        import math
+        line1 = {}
+        line2 = {}
+        # 缩短显示名
+        short = {
+            'train_loss': 'loss',
+            'train_loss_noise': 'L_noise',
+            'train_loss_mse': 'L_mse',
+            'train_loss_hum': 'L_hum',
+            'train_loss_obj': 'L_obj',
+            'val_loss_noise': 'vL_noise',
+            'val_loss_mse': 'vL_mse',
+            'val_loss_hum': 'vL_hum',
+            'val_loss_obj': 'vL_obj',
+            'grad_norm_clipped': 'gnorm',
+        }
+        for name, meter in self.meters.items():
+            if name == 'step':
+                continue
+            if name.startswith('val_'):
+                continue
+            val = meter.median
+            if not math.isfinite(val):
+                continue
+            display = short.get(name, name)
+            fmt = f'{val:.4g}' if name in ('lr', 'fscore', 'chamf') else f'{val:.4f}'
+            if name in ('lr', 'fscore', 'chamf'):
+                line1[display] = fmt
+            else:
+                line2[display] = fmt
+        pbar.set_postfix(line1, refresh=True)
+        if line2:
+            metrics_str = '  '.join(f'{k}={v}' for k, v in line2.items())
+            tqdm.write(f'  [{header}] {metrics_str}')
+
+
 
 
 class NormalizeInverse(torchvision.transforms.Normalize):

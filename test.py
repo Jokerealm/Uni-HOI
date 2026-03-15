@@ -321,7 +321,7 @@ def main(cfg: DictConfig):
 
     if ckpt_path and os.path.isfile(ckpt_path):
         print(f"[Test] Loading checkpoint: {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
         n_h = ckpt["human_gs"]["xyz"].shape[0]
         n_o = ckpt["object_gs"]["xyz"].shape[0]
@@ -343,12 +343,12 @@ def main(cfg: DictConfig):
         g_o_path = os.path.join(gs_init_dir, "G_o.pt")
 
         if os.path.isfile(combined_path):
-            init = torch.load(combined_path, map_location="cpu")
+            init = torch.load(combined_path, map_location="cpu", weights_only=False)
             human_gs = GaussianModel.from_phase2(init["G_h"].get("raw", torch.randn(256, 14)))
             object_gs = GaussianModel.from_phase2(init["G_o"].get("raw", torch.randn(128, 14)))
         elif os.path.isfile(g_h_path):
-            g_h = torch.load(g_h_path, map_location="cpu")
-            g_o = torch.load(g_o_path, map_location="cpu")
+            g_h = torch.load(g_h_path, map_location="cpu", weights_only=False)
+            g_o = torch.load(g_o_path, map_location="cpu", weights_only=False)
             human_gs = GaussianModel.from_phase2(g_h.get("raw", torch.randn(256, 14)))
             object_gs = GaussianModel.from_phase2(g_o.get("raw", torch.randn(128, 14)))
         else:

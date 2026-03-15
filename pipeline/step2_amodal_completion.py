@@ -106,14 +106,22 @@ class Step2Pipeline:
         return flow_masks, masks_dilated
 
     @staticmethod
-    def _resize_frames(frames, size=None):
-        """Resize to multiples of 8 (ProPainter requirement)."""
+    def _resize_frames(frames, size=None, max_side=960):
+        """Resize to multiples of 8 (ProPainter requirement).
+        Also caps resolution to max_side to avoid CUDA OOM on large frames.
+        """
         if size is not None:
             out_size = size
         else:
-            out_size = frames[0].size
+            out_size = frames[0].size  # (W, H)
+        # Cap resolution: scale down if either dimension exceeds max_side
+        w, h = out_size
+        if max(w, h) > max_side:
+            ratio = max_side / max(w, h)
+            w, h = int(w * ratio), int(h * ratio)
+            out_size = (w, h)
         process_size = (out_size[0] - out_size[0] % 8, out_size[1] - out_size[1] % 8)
-        if out_size != process_size:
+        if frames[0].size != process_size:
             frames = [f.resize(process_size) for f in frames]
         return frames, process_size, out_size
 

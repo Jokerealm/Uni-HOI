@@ -253,7 +253,7 @@ class SimpleProjectionRenderer(nn.Module):
         accum = torch.zeros(1, self.H, self.W, device=device)  # (1, H, W)
 
         # Process in chunks to limit memory
-        CHUNK = min(N, 2048)
+        CHUNK = min(N, 512)
         for i in range(0, N, CHUNK):
             j = min(i + CHUNK, N)
 
