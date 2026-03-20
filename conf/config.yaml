@@ -16,7 +16,7 @@ project_root: /data4/guanz/coding/HDM
 
 # --- Data Prep Config ---
 data_prep:
-  input_dir: ./sample_data  # switch to /data4/guanz/data/Behave for full dataset
+  input_dir: ./sample_data  # switch to /data4/guanz/data/Behave/sequences for full dataset
   video_name: test_video     # sub-folder under input_dir
   output_subdir: processed   # results saved to <input_dir>/<video_name>/<output_subdir>/
   max_frames: null            # null = process all frames
@@ -78,7 +78,40 @@ propainter:
   save_fps: 24
 
 amodal:
+  method: propainter      # propainter | joint_flow_matching | dual_branch_flow_matching
   output_subdir: amodal     # results saved to <input_dir>/<video_name>/<output_subdir>/
+
+fm:
+  checkpoint: ""
+  model_type: hunyuan_controlnet
+  video_channels: 3
+  video_input_channels: 4
+  point_channels: 14
+  mask_channels: 2
+  dim: 384
+  depth: 8
+  num_heads: 6
+  cond_dim: 192
+  num_ode_steps: 50
+  num_frames: 12
+  video_h: 256
+  video_w: 256
+  num_points: 4096
+  prior_noise_std: 1.0
+  clamp_visible_rgb: true
+  save_frames: true
+  save_fps: 24
+  precision: float32
+  background_value: 1.0
+  human_branch_mode: segmented_visible
+  seed: 42
+  patch_size: 16
+  hidden_dim: 512
+  fusion_depth: 8
+  num_human_gaussians: 1024
+  num_object_gaussians: 1024
+  num_joints: 22
+  contact_dim: 4
 
 # ============================================================
 # Step 3: Zero-shot 3D Lifting via Hunyuan3D-2
@@ -124,9 +157,10 @@ step4:
   output_subdir: joint_opt
   image_height: 256
   image_width: 256
+  batch_size: 8
   num_points_human: 4096
   num_points_object: 2048
-  focal: 500.0
+  focal: 490.0   # BEHAVE Kinect focal / scale_ratio ≈ 979.78 / 2
   num_iters: 5000
   save_every: 1000
   # Per-parameter learning rates
@@ -160,7 +194,7 @@ step4:
     lambda_pen: 1.0
     sdf_grid_resolution: 64
     sdf_padding: 0.1
-  # Temporal smoothness (acceleration)
+  # Temporal smoothness on framewise SE(3) trajectories
   temporal:
     enabled: true
     lambda_acc: 0.5
@@ -169,8 +203,6 @@ step4:
 # Step 5: End-to-End Pipeline Integration & Validation
 # ============================================================
 step5:
-  num_epochs: 2
-  num_iters_per_epoch: 500
   eval:
     cd_thresholds: [0.005, 0.01, 0.02, 0.05]
     num_eval_points: 4096
@@ -187,10 +219,26 @@ checkpoint:
   run_id: latest    # "latest" or specific run timestamp
 
 # --- Dataset Shorthand ---
-# Use "sample" for ./sample_data, "behave" for /data4/guanz/data/Behave
+# Use "sample" for ./sample_data, "behave" for /data4/guanz/data/Behave/sequences
 dataset: sample
 
-# --- Model Overrides (for CLI convenience) ---
-model:
-  epochs: null
+# --- BEHAVE Multi-Camera Selection ---
+# Use camera k1 by default unless explicitly overridden.
+behave_cam_id: 1
 
+# --- CARI4D-style Spatial Downsampling ---
+# Downsample raw 2K BEHAVE images by this factor before crop.
+# 2 = 2048×1536 → 1024×768 (like CARI4D's scale_ratio=2)
+# Camera intrinsics are scaled accordingly.
+scale_ratio: 2
+# Expand the human+object bounding box by this factor before crop (CARI4D uses 1.1)
+bbox_expand: 1.1
+
+# --- WandB Config ---
+wandb:
+  enabled: true
+  project: uni-hoi-4d
+  vis_interval: 500       # export 3D + 2D vis every N steps
+
+# --- Model Overrides (for CLI convenience) ---
+model: {}

@@ -1,8 +1,4 @@
-"""
-SAM 3D Body wrapper: robust SMPL-H mesh recovery from single images.
-
-Falls back to stub T-pose parameters if the model is unavailable.
-"""
+"""SAM 3D Body wrapper: robust SMPL-H mesh recovery from single images."""
 from __future__ import annotations
 
 import os
@@ -33,7 +29,10 @@ class SAM3DBodyEstimator:
             )
             print("[SAM3D-Body] Loaded estimator.")
         except Exception as e:
-            print(f"[SAM3D-Body] Could not load: {e}. Using stub.")
+            raise RuntimeError(
+                "[SAM3D-Body] Failed to load the estimator. "
+                "Step 1 cannot continue without SMPL-H recovery."
+            ) from e
 
     def predict(self, frame_bgr: np.ndarray) -> Dict[str, np.ndarray]:
         """
@@ -45,19 +44,21 @@ class SAM3DBodyEstimator:
           - shape: (1, 10) shape betas
           - cam_t: (1, 3) camera translation
           - keypoints_3d: (J, 3) 3D joint positions
-          - keypoints_2d: (J, 2) projected 2D joints
+          - keypoints_2d: (J, 2) projected 2D joints in input-image pixels
           - vertices: (V, 3) mesh vertices
           - focal_length: float
         """
         if self._estimator is None:
-            return self._predict_stub(frame_bgr)
+            raise RuntimeError("SAM3D-Body estimator is unavailable.")
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         outputs = self._estimator.process_one_image(rgb)
 
         # Take the first detected person
         if isinstance(outputs, list):
-            out = outputs[0] if len(outputs) > 0 else self._predict_stub(frame_bgr)
+            if len(outputs) == 0:
+                raise RuntimeError("SAM3D-Body returned no detections for the input frame.")
+            out = outputs[0]
         else:
             out = outputs
 
@@ -71,15 +72,29 @@ class SAM3DBodyEstimator:
                     val = val.cpu().numpy()
                 result[key] = np.asarray(val)
 
-        # Normalize key names
+        required = (
+            "body_pose_params",
+            "hand_pose_params",
+            "shape_params",
+            "pred_cam_t",
+            "pred_keypoints_3d",
+            "pred_keypoints_2d",
+            "pred_vertices",
+        )
+        missing = [key for key in required if key not in result]
+        if missing:
+            raise KeyError(
+                f"SAM3D-Body output is missing required fields: {missing}."
+            )
+
         return {
-            "body_pose": result.get("body_pose_params", np.zeros((1, 63))),
-            "hand_pose": result.get("hand_pose_params", np.zeros((1, 90))),
-            "shape": result.get("shape_params", np.zeros((1, 10))),
-            "cam_t": result.get("pred_cam_t", np.zeros((1, 3))),
-            "keypoints_3d": result.get("pred_keypoints_3d", np.zeros((22, 3))),
-            "keypoints_2d": result.get("pred_keypoints_2d", np.zeros((22, 2))),
-            "vertices": result.get("pred_vertices", np.zeros((6890, 3))),
+            "body_pose": result["body_pose_params"],
+            "hand_pose": result["hand_pose_params"],
+            "shape": result["shape_params"],
+            "cam_t": result["pred_cam_t"],
+            "keypoints_3d": result["pred_keypoints_3d"],
+            "keypoints_2d": result["pred_keypoints_2d"],
+            "vertices": result["pred_vertices"],
             "focal_length": result.get("focal_length", np.array([1000.0])),
         }
 
@@ -87,18 +102,3 @@ class SAM3DBodyEstimator:
         """Predict SMPL-H for all frames."""
         from tqdm import tqdm
         return [self.predict(f) for f in tqdm(frames, desc="SAM3D-Body")]
-
-    @staticmethod
-    def _predict_stub(frame_bgr: np.ndarray) -> Dict[str, np.ndarray]:
-        """Return T-pose stub parameters."""
-        H, W = frame_bgr.shape[:2]
-        return {
-            "body_pose": np.zeros((1, 63), dtype=np.float32),
-            "hand_pose": np.zeros((1, 90), dtype=np.float32),
-            "shape": np.zeros((1, 10), dtype=np.float32),
-            "cam_t": np.array([[0.0, 0.0, 3.0]], dtype=np.float32),
-            "keypoints_3d": np.zeros((22, 3), dtype=np.float32),
-            "keypoints_2d": np.zeros((22, 2), dtype=np.float32),
-            "vertices": np.zeros((6890, 3), dtype=np.float32),
-            "focal_length": np.array([1000.0], dtype=np.float32),
-        }

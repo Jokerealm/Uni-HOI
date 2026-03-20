@@ -314,6 +314,7 @@ class MetricAlignmentBridge:
 
         self.base_dir = os.path.join(cfg.input_dir, cfg.video_name)
         self.processed_dir = os.path.join(self.base_dir, cfg.processed_subdir)
+        self.cropped_dir = os.path.join(self.processed_dir, "cropped")
         self.gs_init_dir = os.path.join(self.base_dir, cfg.gs_init_subdir)
         self.output_dir = os.path.join(self.base_dir, cfg.output_subdir)
 
@@ -334,16 +335,49 @@ class MetricAlignmentBridge:
         data = torch.load(path, map_location="cpu", weights_only=False)
         return data["raw"].numpy().astype(np.float64)
 
-    def _load_depth_frame(self, frame_idx: int = 0) -> Optional[np.ndarray]:
+    def _resolve_frame_index(self, num_frames: int, frame_idx: Optional[int] = None) -> int:
+        """Resolve a frame index using config.frame_selection when not explicit."""
+        if num_frames <= 0:
+            return 0
+        if frame_idx is not None:
+            return max(0, min(frame_idx, num_frames - 1))
+
+        sel = getattr(self.cfg, "frame_selection", "middle")
+        if sel == "middle":
+            idx = num_frames // 2
+        elif sel == "first":
+            idx = 0
+        elif sel == "last":
+            idx = num_frames - 1
+        else:
+            try:
+                idx = int(sel)
+            except (TypeError, ValueError):
+                idx = num_frames // 2
+        return max(0, min(idx, num_frames - 1))
+
+    def _load_depth_frame(self, frame_idx: Optional[int] = None) -> Optional[np.ndarray]:
         """
         Load a single aligned depth frame.
 
         Supports multiple layouts:
+          0. processed/cropped/depth_aligned.npz with key 'depth' shape (T,H,W)
           1. Per-frame files in processed/depth/*.npz
           2. Consolidated processed/depth_aligned.npz with key 'depth' shape (T,H,W)
           3. Per-frame .npy files in processed/depth/
         """
         import glob
+
+        # Layout 0: cropped consolidated depth (preferred for cropped training data)
+        cropped_depth = os.path.join(self.cropped_dir, "depth_aligned.npz")
+        if os.path.isfile(cropped_depth):
+            d = np.load(cropped_depth)
+            key = "depth" if "depth" in d else list(d.keys())[0]
+            arr = d[key]
+            if arr.ndim == 3:
+                idx = self._resolve_frame_index(arr.shape[0], frame_idx)
+                return arr[idx]
+            return arr
 
         # Layout 1: per-frame directory
         depth_dir = os.path.join(self.processed_dir, "depth")
@@ -353,7 +387,7 @@ class MetricAlignmentBridge:
                 + glob.glob(os.path.join(depth_dir, "*.npy"))
             )
             if paths:
-                idx = min(frame_idx, len(paths) - 1)
+                idx = self._resolve_frame_index(len(paths), frame_idx)
                 p = paths[idx]
                 if p.endswith(".npz"):
                     d = np.load(p)
@@ -367,7 +401,7 @@ class MetricAlignmentBridge:
             key = "depth" if "depth" in d else list(d.keys())[0]
             arr = d[key]
             if arr.ndim == 3:  # (T, H, W)
-                idx = min(frame_idx, arr.shape[0] - 1)
+                idx = self._resolve_frame_index(arr.shape[0], frame_idx)
                 return arr[idx]
             return arr  # (H, W)
 
@@ -376,22 +410,34 @@ class MetricAlignmentBridge:
         if os.path.isfile(single_npy):
             arr = np.load(single_npy)
             if arr.ndim == 3:
-                idx = min(frame_idx, arr.shape[0] - 1)
+                idx = self._resolve_frame_index(arr.shape[0], frame_idx)
                 return arr[idx]
             return arr
 
         return None
 
-    def _load_mask(self, subdir: str, frame_idx: int = 0) -> Optional[np.ndarray]:
+    def _load_mask(self, subdir: str, frame_idx: Optional[int] = None) -> Optional[np.ndarray]:
         """
         Load a binary mask (.png or .npy).
 
         Supports multiple layouts:
+          0. processed/cropped/masks_raw.npz    (keys: human, object)
           1. processed/masks/<subdir>/  (design-doc layout)
           2. processed/masks_<subdir>/  (sample_data actual layout)
           3. processed/<subdir>/        (flat layout)
         """
         import glob
+
+        # Layout 0: cropped consolidated mask arrays
+        cropped_masks = os.path.join(self.cropped_dir, "masks_raw.npz")
+        if os.path.isfile(cropped_masks):
+            data = np.load(cropped_masks)
+            if subdir in data:
+                arr = data[subdir]
+                if arr.ndim == 3:
+                    idx = self._resolve_frame_index(arr.shape[0], frame_idx)
+                    return arr[idx]
+                return arr
 
         candidates = [
             os.path.join(self.processed_dir, "masks", subdir),
@@ -412,7 +458,7 @@ class MetricAlignmentBridge:
         )
         if not paths:
             return None
-        idx = min(frame_idx, len(paths) - 1)
+        idx = self._resolve_frame_index(len(paths), frame_idx)
         p = paths[idx]
         if p.endswith(".npy"):
             return np.load(p)
@@ -420,15 +466,28 @@ class MetricAlignmentBridge:
         m = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
         return (m > 127).astype(np.uint8) if m is not None else None
 
-    def _load_camera_intrinsics(self) -> Tuple[float, float, float, float]:
+    def _load_camera_intrinsics(self, frame_idx: Optional[int] = None) -> Tuple[float, float, float, float]:
         """
         Load camera K matrix or construct from available data.
 
         Search order:
+          0. processed/cropped/meta.npz  (fx, fy, cx, cy per frame)
           1. processed/camera_intrinsics.npy  (3x3 matrix)
           2. focal_length from smpl_params.npz + image dimensions
           3. Fallback to config defaults
         """
+        meta_path = os.path.join(self.cropped_dir, "meta.npz")
+        if os.path.isfile(meta_path):
+            meta = np.load(meta_path)
+            if all(k in meta for k in ("fx", "fy", "cx", "cy")):
+                idx = self._resolve_frame_index(len(meta["fx"]), frame_idx)
+                return (
+                    float(meta["fx"][idx]),
+                    float(meta["fy"][idx]),
+                    float(meta["cx"][idx]),
+                    float(meta["cy"][idx]),
+                )
+
         # Option 1: explicit K matrix
         K_path = os.path.join(self.processed_dir, "camera_intrinsics.npy")
         if os.path.isfile(K_path):
@@ -474,7 +533,7 @@ class MetricAlignmentBridge:
             self.cfg.image_height / 2.0,
         )
 
-    def _load_smplh_translation(self) -> Optional[np.ndarray]:
+    def _load_smplh_translation(self, frame_idx: Optional[int] = None) -> Optional[np.ndarray]:
         """
         Load SMPL-H translation from processed poses.
 
@@ -493,7 +552,8 @@ class MetricAlignmentBridge:
                     if arr.ndim == 1 and arr.shape[0] >= 3:
                         return arr[:3].astype(np.float64)
                     if arr.ndim == 2:
-                        return arr[0, :3].astype(np.float64)
+                        idx = self._resolve_frame_index(arr.shape[0], frame_idx)
+                        return arr[idx, :3].astype(np.float64)
             return None
 
         # Layout 1: consolidated poses file
@@ -602,9 +662,9 @@ class MetricAlignmentBridge:
         raw_hum = self._load_gs("G_h")
         print(f"[Alignment] Loaded G_o: {raw_obj.shape}, G_h: {raw_hum.shape}")
 
-        depth = self._load_depth_frame(frame_idx=0)
-        mask_obj = self._load_mask("object", frame_idx=0)
-        mask_hum = self._load_mask("human", frame_idx=0)
+        depth = self._load_depth_frame()
+        mask_obj = self._load_mask("object")
+        mask_hum = self._load_mask("human")
         fx, fy, cx, cy = self._load_camera_intrinsics()
         smplh_transl = self._load_smplh_translation()
 

@@ -34,6 +34,7 @@ from scripts.joint_3dgs_optimization import (
     ssim,
     photometric_loss,
 )
+from dataset.video_transforms import validate_pixel_keypoints
 
 
 # ============================================================
@@ -42,34 +43,78 @@ from scripts.joint_3dgs_optimization import (
 
 class SE3Transform(nn.Module):
     """
-    Learnable SE(3) rigid-body transform: rotation (axis-angle) + translation.
-    Maps points from canonical normalised space to world coordinates.
+    Learnable SE(3) transform, optionally parameterised per frame.
 
-    Parameters:
-        translation : (3,)  learnable translation vector
-        axis_angle  : (3,)  learnable axis-angle rotation (Rodrigues)
+    When `num_frames == 1`, this behaves like the original global rigid transform.
+    When `num_frames > 1`, each frame owns its own axis-angle + translation pair.
     """
 
-    def __init__(self, init_translation: Tuple[float, float, float] = (0., 0., 2.)):
+    def __init__(
+        self,
+        init_translation: Tuple[float, float, float] = (0., 0., 2.),
+        num_frames: int = 1,
+    ):
         super().__init__()
-        self.translation = nn.Parameter(
-            torch.tensor(init_translation, dtype=torch.float32)
-        )  # (3,)
-        self.axis_angle = nn.Parameter(
-            torch.zeros(3, dtype=torch.float32)
-        )  # (3,) — identity rotation
+        self.num_frames = max(int(num_frames), 1)
 
-    def rotation_matrix(self) -> Tensor:
-        """Convert axis-angle to 3×3 rotation matrix via Rodrigues formula."""
-        return _axis_angle_to_matrix(self.axis_angle)  # (3, 3)
+        init_t = torch.tensor(init_translation, dtype=torch.float32)
+        if self.num_frames == 1:
+            translation = init_t.clone()
+            axis_angle = torch.zeros(3, dtype=torch.float32)
+        else:
+            translation = init_t.unsqueeze(0).repeat(self.num_frames, 1)
+            axis_angle = torch.zeros(self.num_frames, 3, dtype=torch.float32)
 
-    def forward(self, xyz: Tensor) -> Tensor:
+        self.translation = nn.Parameter(translation)
+        self.axis_angle = nn.Parameter(axis_angle)
+
+    @property
+    def is_sequence(self) -> bool:
+        return self.translation.ndim == 2
+
+    def _resolve_frame_index(self, frame_idx: Optional[int]) -> int:
+        if frame_idx is None:
+            raise ValueError("Per-frame SE(3) requires an explicit `frame_idx`.")
+        if torch.is_tensor(frame_idx):
+            if frame_idx.numel() != 1:
+                raise ValueError(f"`frame_idx` must be scalar, got shape {tuple(frame_idx.shape)}.")
+            frame_idx = int(frame_idx.item())
+        frame_idx = int(frame_idx)
+        if frame_idx < 0 or frame_idx >= self.num_frames:
+            raise IndexError(f"`frame_idx={frame_idx}` is out of range for {self.num_frames} frames.")
+        return frame_idx
+
+    def _select_param(self, param: Tensor, frame_idx: Optional[int]) -> Tensor:
+        if param.ndim == 1:
+            return param
+        return param[self._resolve_frame_index(frame_idx)]
+
+    def rotation_matrix(self, frame_idx: Optional[int] = None) -> Tensor:
+        """Convert axis-angle to 3x3 rotation matrix via Rodrigues formula."""
+        axis_angle = self._select_param(self.axis_angle, frame_idx)
+        return _axis_angle_to_matrix(axis_angle)
+
+    def pose_vector(self, frame_idx: Optional[int] = None) -> Tensor:
+        axis_angle = self._select_param(self.axis_angle, frame_idx)
+        translation = self._select_param(self.translation, frame_idx)
+        return torch.cat([axis_angle, translation], dim=-1)
+
+    def pose_sequence(self) -> Tensor:
+        if self.axis_angle.ndim == 1:
+            return torch.cat(
+                [self.axis_angle.unsqueeze(0), self.translation.unsqueeze(0)],
+                dim=-1,
+            )
+        return torch.cat([self.axis_angle, self.translation], dim=-1)
+
+    def forward(self, xyz: Tensor, frame_idx: Optional[int] = None) -> Tensor:
         """
         xyz : (N, 3) points in canonical space
-        returns : (N, 3) points in world space
+        returns : (N, 3) points in world space for the selected frame
         """
-        R = self.rotation_matrix()                     # (3, 3)
-        return xyz @ R.T + self.translation.unsqueeze(0)  # (N, 3)
+        R = self.rotation_matrix(frame_idx)
+        translation = self._select_param(self.translation, frame_idx)
+        return xyz @ R.T + translation.unsqueeze(0)
 
 
 def _axis_angle_to_matrix(axis_angle: Tensor) -> Tensor:
@@ -171,61 +216,29 @@ def projection_2d_loss(
     joints_3d: Tensor,
     keypoints_2d: Tensor,
     confidence: Tensor,
-    focal: float,
-    cx: float,
-    cy: float,
+    focal: Optional[float] = None,
+    fx: Optional[float] = None,
+    fy: Optional[float] = None,
+    cx: float = 0.0,
+    cy: float = 0.0,
     conf_threshold: float = 0.3,
 ) -> Tensor:
     """
-    Project 3D joints to 2D via pinhole model, compare with OpenPose detections.
+    Project 3D joints to 2D via pinhole model, compare with 2D detections.
 
-    joints_3d    : (J_3d, 3) 3D joint positions in world/camera space
-    keypoints_2d : (J_2d, 2) OpenPose 2D detections (x, y) in pixels
-    confidence   : (J_2d,) OpenPose confidence scores
-    focal        : focal length in pixels
-    cx, cy       : principal point
-    conf_threshold: ignore joints below this confidence
-    returns      : scalar L2 loss (confidence-weighted)
-
-    SMPL-H has 52+ joints, OpenPose body_25 has 25 joints.
-    We use a mapping from OpenPose indices to SMPL-H joint indices
-    to ensure semantic correspondence (e.g. OpenPose "right_hip" maps
-    to SMPL-H "right_hip", not just index truncation).
+    joints_3d    : (J_3d, 3)
+    keypoints_2d : (J_2d, 2) in pixel coordinates
+    confidence   : (J_2d,)
     """
-    # OpenPose body_25 → SMPL-H joint index mapping
-    # OpenPose: 0=Nose, 1=Neck, 2=RShoulder, 3=RElbow, 4=RWrist,
-    #           5=LShoulder, 6=LElbow, 7=LWrist, 8=MidHip,
-    #           9=RHip, 10=RKnee, 11=RAnkle, 12=LHip, 13=LKnee, 14=LAnkle,
-    #           15=REye, 16=LEye, 17=REar, 18=LEar,
-    #           19=LBigToe, 20=LSmallToe, 21=LHeel,
-    #           22=RBigToe, 23=RSmallToe, 24=RHeel
-    # SMPL-H (first 22 body joints):
-    #   0=Pelvis, 1=L_Hip, 2=R_Hip, 3=Spine1, 4=L_Knee, 5=R_Knee,
-    #   6=Spine2, 7=L_Ankle, 8=R_Ankle, 9=Spine3, 10=L_Foot, 11=R_Foot,
-    #   12=Neck, 13=L_Collar, 14=R_Collar, 15=Head, 16=L_Shoulder,
-    #   17=R_Shoulder, 18=L_Elbow, 19=R_Elbow, 20=L_Wrist, 21=R_Wrist
     OPENPOSE_TO_SMPLH = {
-        0: 15,   # Nose → Head (approximate)
-        1: 12,   # Neck → Neck
-        2: 17,   # RShoulder → R_Shoulder
-        3: 19,   # RElbow → R_Elbow
-        4: 21,   # RWrist → R_Wrist
-        5: 16,   # LShoulder → L_Shoulder
-        6: 18,   # LElbow → L_Elbow
-        7: 20,   # LWrist → L_Wrist
-        8: 0,    # MidHip → Pelvis
-        9: 2,    # RHip → R_Hip
-        10: 5,   # RKnee → R_Knee
-        11: 8,   # RAnkle → R_Ankle
-        12: 1,   # LHip → L_Hip
-        13: 4,   # LKnee → L_Knee
-        14: 7,   # LAnkle → L_Ankle
+        0: 15, 1: 12, 2: 17, 3: 19, 4: 21,
+        5: 16, 6: 18, 7: 20, 8: 0,
+        9: 2, 10: 5, 11: 8, 12: 1, 13: 4, 14: 7,
     }
 
     J_3d = joints_3d.shape[0]
     J_2d = keypoints_2d.shape[0]
 
-    # Build matched pairs using the mapping
     op_indices = []
     smplh_indices = []
     for op_idx, smplh_idx in OPENPOSE_TO_SMPLH.items():
@@ -236,27 +249,35 @@ def projection_2d_loss(
     if len(op_indices) == 0:
         return torch.tensor(0.0, device=joints_3d.device)
 
-    op_indices = torch.tensor(op_indices, device=joints_3d.device)
-    smplh_indices = torch.tensor(smplh_indices, device=joints_3d.device)
+    op_indices_t = torch.tensor(op_indices, device=joints_3d.device)
+    smplh_indices_t = torch.tensor(smplh_indices, device=joints_3d.device)
 
-    matched_3d = joints_3d[smplh_indices]          # (J_matched, 3)
-    matched_2d = keypoints_2d[op_indices]          # (J_matched, 2)
-    matched_conf = confidence[op_indices]           # (J_matched,)
+    matched_3d = joints_3d[smplh_indices_t]
+    matched_2d = keypoints_2d[op_indices_t]
+    matched_conf = confidence[op_indices_t]
 
-    # Pinhole projection
-    z = matched_3d[:, 2].clamp(min=0.1)
-    proj_x = (matched_3d[:, 0] / z) * focal + cx
-    proj_y = (matched_3d[:, 1] / z) * focal + cy
-    proj_2d = torch.stack([proj_x, proj_y], dim=-1)  # (J_matched, 2)
-
-    # Confidence mask
     valid = matched_conf > conf_threshold
     if valid.sum() == 0:
         return torch.tensor(0.0, device=joints_3d.device)
 
-    # Weighted L2
-    diff = (proj_2d - matched_2d) ** 2              # (J_matched, 2)
-    diff_sum = diff.sum(dim=-1)                     # (J_matched,)
+    valid_2d = matched_2d[valid]
+    if valid_2d.shape[0] >= 3 and valid_2d.abs().max() <= 4.0:
+        raise ValueError(
+            "projection_2d_loss received keypoints_2d that look normalized. "
+            "The maintained pipeline requires pixel coordinates consistent with fx/fy/cx/cy."
+        )
+
+    if fx is None:
+        fx = 500.0 if focal is None else focal
+    if fy is None:
+        fy = fx
+    z = matched_3d[:, 2].clamp(min=0.1)
+    proj_x = (matched_3d[:, 0] / z) * fx + cx
+    proj_y = (matched_3d[:, 1] / z) * fy + cy
+    proj_2d = torch.stack([proj_x, proj_y], dim=-1)
+
+    diff = (proj_2d - matched_2d) ** 2
+    diff_sum = diff.sum(dim=-1)
     weighted = (diff_sum * matched_conf * valid.float()).sum()
     return weighted / (valid.float().sum() + 1e-8)
 
@@ -279,6 +300,43 @@ class VolumetricSMPLSDF(nn.Module):
         super().__init__()
         self.resolution = resolution
         self.padding = padding
+        self.distance_chunk_size = 4096
+        self.sign_chunk_size = 2048
+        self._grid_cache = {}
+
+    def clear_cache(self) -> None:
+        self._grid_cache.clear()
+
+    def get_sdf_grid(
+        self,
+        vertices: Tensor,
+        faces: Tensor,
+        cache_key: Optional[int] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        if cache_key is not None and cache_key in self._grid_cache:
+            return self._grid_cache[cache_key]
+
+        with torch.no_grad():
+            sdf_grid, vmin, vmax = self.compute_sdf_grid(vertices, faces)
+            cached = (sdf_grid.detach(), vmin.detach(), vmax.detach())
+
+        if cache_key is not None:
+            self._grid_cache[cache_key] = cached
+        return cached
+
+    @staticmethod
+    def _chunked_nearest_distance(
+        query: Tensor,
+        ref: Tensor,
+        chunk_size: int,
+    ) -> Tensor:
+        mins = []
+        for start in range(0, query.shape[0], chunk_size):
+            end = min(start + chunk_size, query.shape[0])
+            dists = torch.cdist(query[start:end], ref)
+            mins.append(dists.min(dim=1).values)
+            del dists
+        return torch.cat(mins, dim=0)
 
     def compute_sdf_grid(
         self, vertices: Tensor, faces: Tensor
@@ -307,10 +365,13 @@ class VolumetricSMPLSDF(nn.Module):
         gx, gy, gz = torch.meshgrid(lin[0], lin[1], lin[2], indexing='ij')
         grid_pts = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3)  # (R^3, 3)
 
-        # Unsigned distance to nearest vertex (approximation — no face query)
-        # (R^3, V) pairwise distances
-        dists = torch.cdist(grid_pts, vertices)                # (R^3, V)
-        unsigned_dist = dists.min(dim=1).values                # (R^3,)
+        # Unsigned distance to nearest vertex (approximation — no face query).
+        # Chunked to avoid materialising the full (R^3, V) distance matrix.
+        unsigned_dist = self._chunked_nearest_distance(
+            grid_pts,
+            vertices,
+            chunk_size=self.distance_chunk_size,
+        )
 
         # Sign estimation: use winding number approximation
         # Simple heuristic — points whose nearest vertex normal points away
@@ -340,18 +401,25 @@ class VolumetricSMPLSDF(nn.Module):
         face_normals = F.normalize(face_normals, dim=-1)
         face_centres = (v0 + v1 + v2) / 3.0                   # (F, 3)
 
-        # For each query, find nearest face centre
-        dists = torch.cdist(query, face_centres)               # (Q, F)
-        nearest_face = dists.argmin(dim=1)                     # (Q,)
+        sign_chunks = []
+        for start in range(0, query.shape[0], self.sign_chunk_size):
+            end = min(start + self.sign_chunk_size, query.shape[0])
+            query_chunk = query[start:end]
+            dists = torch.cdist(query_chunk, face_centres)     # (chunk, F)
+            nearest_face = dists.argmin(dim=1)                 # (chunk,)
+            del dists
 
-        # Direction from face centre to query
-        direction = query - face_centres[nearest_face]         # (Q, 3)
-        normal = face_normals[nearest_face]                    # (Q, 3)
+            # Direction from face centre to query
+            direction = query_chunk - face_centres[nearest_face]
+            normal = face_normals[nearest_face]
 
-        # Dot product: positive = outside, negative = inside
-        dot = (direction * normal).sum(dim=-1)                 # (Q,)
-        sign = torch.where(dot >= 0, torch.ones_like(dot), -torch.ones_like(dot))
-        return sign
+            # Dot product: positive = outside, negative = inside
+            dot = (direction * normal).sum(dim=-1)
+            sign_chunks.append(
+                torch.where(dot >= 0, torch.ones_like(dot), -torch.ones_like(dot))
+            )
+
+        return torch.cat(sign_chunks, dim=0)
 
     def query_sdf(
         self,
@@ -384,6 +452,7 @@ def penetration_loss(
     smpl_vertices: Tensor,
     smpl_faces: Tensor,
     sdf_module: VolumetricSMPLSDF,
+    cache_key: Optional[int] = None,
 ) -> Tensor:
     """
     Penalise object Gaussians that penetrate the SMPL body mesh.
@@ -394,7 +463,11 @@ def penetration_loss(
     sdf_module     : VolumetricSMPLSDF instance
     returns        : scalar penetration penalty
     """
-    sdf_grid, vmin, vmax = sdf_module.compute_sdf_grid(smpl_vertices, smpl_faces)
+    sdf_grid, vmin, vmax = sdf_module.get_sdf_grid(
+        smpl_vertices,
+        smpl_faces,
+        cache_key=cache_key,
+    )
     sdf_vals = sdf_module.query_sdf(object_xyz, sdf_grid, vmin, vmax)  # (N_o,)
 
     # Only penalise negative SDF (inside body)
@@ -408,20 +481,29 @@ def penetration_loss(
 
 def temporal_smoothness_loss(
     poses_prev: Tensor,
-    poses_curr: Tensor,
-    poses_next: Tensor,
+    poses_curr: Optional[Tensor] = None,
+    poses_next: Optional[Tensor] = None,
 ) -> Tensor:
     """
-    Acceleration-based smoothness: penalise second-order finite differences
-    of the SE(3) object pose across three consecutive frames.
+    Acceleration-based smoothness on an actual frame-ordered pose sequence.
 
-    poses_* : (6,) — concatenation of [axis_angle(3), translation(3)]
-              At least poses_curr should carry gradients; prev/next may be
-              detached snapshots.
-    returns : scalar acceleration penalty
+    Accepts either:
+      - `poses_prev` as `(T, 6)` pose sequence
+      - `poses_prev`, `poses_curr`, `poses_next` as three `(6,)` poses
     """
-    # Second-order finite difference: acc = p_{t-1} - 2*p_t + p_{t+1}
-    acc = poses_prev - 2.0 * poses_curr + poses_next           # (6,)
+    if poses_curr is None and poses_next is None:
+        poses = poses_prev
+        if poses.ndim != 2 or poses.shape[-1] != 6:
+            raise ValueError(f"`poses` must have shape [T, 6], got {tuple(poses.shape)}.")
+        if poses.shape[0] < 3:
+            return poses.new_zeros(())
+        acc = poses[:-2] - 2.0 * poses[1:-1] + poses[2:]
+        return (acc ** 2).sum(dim=-1).mean()
+
+    if poses_curr is None or poses_next is None:
+        raise ValueError("Provide either a single pose sequence or all three adjacent poses.")
+
+    acc = poses_prev - 2.0 * poses_curr + poses_next
     return (acc ** 2).sum()
 
 
@@ -439,10 +521,8 @@ def temporal_smoothness_loss_live(
     pose_next_detached  : (6,) detached pose from frame t+1
     returns             : scalar acceleration penalty
     """
-    pose_curr = torch.cat([se3_transform.axis_angle,
-                           se3_transform.translation])         # (6,) with grad
-    acc = pose_prev_detached - 2.0 * pose_curr + pose_next_detached
-    return (acc ** 2).sum()
+    pose_curr = se3_transform.pose_vector()
+    return temporal_smoothness_loss(pose_prev_detached, pose_curr, pose_next_detached)
 
 
 # ============================================================
@@ -470,6 +550,7 @@ class JointRenderer(nn.Module):
         self,
         human_gs: GaussianModel,
         object_gs: GaussianModel,
+        frame_idx: Optional[int] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         returns:
@@ -478,8 +559,8 @@ class JointRenderer(nn.Module):
             xyz_o_world : (N_o, 3) object centres in world space
         """
         # Transform to world coordinates
-        xyz_h_world = self.se3_human(human_gs.get_xyz)         # (N_h, 3)
-        xyz_o_world = self.se3_object(object_gs.get_xyz)       # (N_o, 3)
+        xyz_h_world = self.se3_human(human_gs.get_xyz, frame_idx=frame_idx)
+        xyz_o_world = self.se3_object(object_gs.get_xyz, frame_idx=frame_idx)
 
         # Gather appearance attributes
         col_all = torch.cat([human_gs.get_colors, object_gs.get_colors], 0)
@@ -512,9 +593,11 @@ def step4_training_step(
     smpl_vertices: Optional[Tensor] = None,
     smpl_faces: Optional[Tensor] = None,
     sdf_module: Optional[VolumetricSMPLSDF] = None,
+    frame_indices: Optional[List[int]] = None,
     # Temporal: detached pose snapshots from adjacent frames
     se3_pose_prev_detached: Optional[Tensor] = None,
     se3_pose_next_detached: Optional[Tensor] = None,
+    se3_human_module: Optional[SE3Transform] = None,
     se3_object_module: Optional[SE3Transform] = None,
     # Loss weights
     w_visible: float = 1.0,
@@ -526,6 +609,8 @@ def step4_training_step(
     lambda_pen: float = 1.0,
     lambda_acc: float = 0.5,
     focal: float = 500.0,
+    fx: Optional[Tensor] = None,
+    fy: Optional[Tensor] = None,
     cx: Optional[float] = None,
     cy: Optional[float] = None,
     conf_threshold: float = 0.3,
@@ -533,85 +618,167 @@ def step4_training_step(
     """
     One gradient step of the full Step 4 joint optimization.
 
-    Temporal smoothness now flows gradients through the *current* SE(3)
-    parameters via ``temporal_smoothness_loss_live``.
+    Supports batched frames via gradient accumulation: if gt_image is
+    (B, 3, H, W), each frame is forward+backward'd separately so peak
+    VRAM stays constant regardless of batch size. Gradients are accumulated
+    and averaged before optimizer.step().
 
     Returns dict of scalar loss values for logging.
     """
     optimizer.zero_grad()
 
-    H = mask_visible.shape[0]
-    W = mask_visible.shape[1]
+    # --- Detect batch vs single ---
+    if gt_image.ndim == 4:
+        B = gt_image.shape[0]
+    else:
+        B = 1
+        gt_image = gt_image.unsqueeze(0)
+        mask_visible = mask_visible.unsqueeze(0)
+        mask_primary_occ = mask_primary_occ.unsqueeze(0)
+        mask_secondary_occ = mask_secondary_occ.unsqueeze(0)
+
+    H = mask_visible.shape[-2]
+    W = mask_visible.shape[-1]
+    requires_frame_indices = (
+        getattr(joint_renderer.se3_human, "num_frames", 1) > 1
+        or getattr(joint_renderer.se3_object, "num_frames", 1) > 1
+    )
+    if frame_indices is None:
+        if requires_frame_indices:
+            raise ValueError("`frame_indices` is required when using per-frame SE(3) trajectories.")
+        frame_indices = [0] * B
+    elif len(frame_indices) != B:
+        raise ValueError(f"`frame_indices` must have length {B}, got {len(frame_indices)}.")
+
     if cx is None:
         cx = W / 2.0
     if cy is None:
         cy = H / 2.0
 
-    # ---- Forward render ----
-    rendered, xyz_h_world, xyz_o_world = joint_renderer(human_gs, object_gs)
+    def _select_scalar(value, index: int, default: float) -> float:
+        if value is None:
+            return float(default)
+        if torch.is_tensor(value):
+            if value.ndim == 0:
+                return float(value.item())
+            return float(value[index].item())
+        if isinstance(value, (list, tuple)):
+            return float(value[index])
+        return float(value)
 
-    # ---- Loss 1: Multi-region rendering loss ----
-    loss_render = multi_region_rendering_loss(
-        rendered, gt_image,
-        mask_visible, mask_primary_occ, mask_secondary_occ,
-        w_visible=w_visible, w_primary=w_primary, w_secondary=w_secondary,
-        lambda_ssim=lambda_ssim,
-    )
+    sum_render = 0.0
+    sum_contact = 0.0
+    sum_j2d = 0.0
+    sum_pen = 0.0
 
-    loss_contact = torch.tensor(0.0, device=gt_image.device)
-    loss_j2d = torch.tensor(0.0, device=gt_image.device)
-    loss_pen_val = torch.tensor(0.0, device=gt_image.device)
+    for b in range(B):
+        frame_idx_b = int(frame_indices[b])
+        fx_b = _select_scalar(fx, b, focal)
+        fy_b = _select_scalar(fy, b, fx_b)
+        cx_b = _select_scalar(cx, b, W / 2.0)
+        cy_b = _select_scalar(cy, b, H / 2.0)
+        if hasattr(joint_renderer.renderer, "set_camera"):
+            joint_renderer.renderer.set_camera(fx=fx_b, fy=fy_b, cx=cx_b, cy=cy_b)
+
+        # ---- Forward render ----
+        rendered, xyz_h_world, xyz_o_world = joint_renderer(
+            human_gs,
+            object_gs,
+            frame_idx=frame_idx_b,
+        )
+
+        # ---- Loss 1: Multi-region rendering loss ----
+        loss_render = multi_region_rendering_loss(
+            rendered, gt_image[b],
+            mask_visible[b], mask_primary_occ[b], mask_secondary_occ[b],
+            w_visible=w_visible, w_primary=w_primary, w_secondary=w_secondary,
+            lambda_ssim=lambda_ssim,
+        )
+
+        loss_contact_b = torch.tensor(0.0, device=gt_image.device)
+        loss_j2d_b = torch.tensor(0.0, device=gt_image.device)
+        loss_pen_b = torch.tensor(0.0, device=gt_image.device)
+
+        # ---- Loss 2: Contact loss ----
+        if smpl_joints_3d is not None and hand_joint_indices is not None:
+            joints = smpl_joints_3d[b] if smpl_joints_3d.ndim == 3 else smpl_joints_3d
+            hand_joints = joints[hand_joint_indices]
+            loss_contact_b = contact_loss(hand_joints, xyz_o_world)
+
+        # ---- Loss 3: 2D projection loss ----
+        if (smpl_joints_3d is not None and keypoints_2d is not None
+                and kp_confidence is not None):
+            joints = smpl_joints_3d[b] if smpl_joints_3d.ndim == 3 else smpl_joints_3d
+            kp = keypoints_2d[b] if keypoints_2d.ndim == 3 else keypoints_2d
+            kpc = kp_confidence[b] if kp_confidence.ndim == 2 else kp_confidence
+            loss_j2d_b = projection_2d_loss(
+                joints, kp, kpc,
+                focal=focal, fx=fx_b, fy=fy_b, cx=cx_b, cy=cy_b,
+                conf_threshold=conf_threshold,
+            )
+
+        # ---- Loss 4: Penetration loss ----
+        if (smpl_vertices is not None and smpl_faces is not None
+                and sdf_module is not None):
+            verts = smpl_vertices[b] if smpl_vertices.ndim == 3 else smpl_vertices
+            loss_pen_b = penetration_loss(
+                xyz_o_world, verts, smpl_faces, sdf_module,
+                cache_key=frame_idx_b,
+            )
+
+        # Per-frame loss (scaled by 1/B for gradient accumulation)
+        frame_loss = (
+            loss_render
+            + lambda_contact * loss_contact_b
+            + lambda_j2d * loss_j2d_b
+            + lambda_pen * loss_pen_b
+        ) / B
+
+        # Backward per frame — accumulates gradients, frees render graph
+        frame_loss.backward()
+
+        # Track scalars (unscaled)
+        sum_render += loss_render.item()
+        sum_contact += loss_contact_b.item()
+        sum_j2d += loss_j2d_b.item()
+        sum_pen += loss_pen_b.item()
+
+    # ---- Loss 5: Temporal smoothness (shared, not per-frame) ----
     loss_acc = torch.tensor(0.0, device=gt_image.device)
-
-    # ---- Loss 2: Contact loss ----
-    if smpl_joints_3d is not None and hand_joint_indices is not None:
-        hand_joints = smpl_joints_3d[hand_joint_indices]       # (J_hand, 3)
-        loss_contact = contact_loss(hand_joints, xyz_o_world)
-
-    # ---- Loss 3: 2D projection loss ----
-    if (smpl_joints_3d is not None and keypoints_2d is not None
-            and kp_confidence is not None):
-        loss_j2d = projection_2d_loss(
-            smpl_joints_3d, keypoints_2d, kp_confidence,
-            focal=focal, cx=cx, cy=cy,
-            conf_threshold=conf_threshold,
-        )
-
-    # ---- Loss 4: Penetration loss ----
-    if (smpl_vertices is not None and smpl_faces is not None
-            and sdf_module is not None):
-        loss_pen_val = penetration_loss(
-            xyz_o_world, smpl_vertices, smpl_faces, sdf_module,
-        )
-
-    # ---- Loss 5: Temporal smoothness (with gradient flow) ----
-    if (se3_pose_prev_detached is not None
-            and se3_pose_next_detached is not None
-            and se3_object_module is not None):
+    temporal_terms = []
+    if se3_human_module is not None and getattr(se3_human_module, "num_frames", 1) >= 3:
+        temporal_terms.append(temporal_smoothness_loss(se3_human_module.pose_sequence()))
+    if se3_object_module is not None and getattr(se3_object_module, "num_frames", 1) >= 3:
+        temporal_terms.append(temporal_smoothness_loss(se3_object_module.pose_sequence()))
+    if temporal_terms:
+        loss_acc = torch.stack(temporal_terms).mean()
+        (lambda_acc * loss_acc).backward()
+    elif (
+        se3_pose_prev_detached is not None
+        and se3_pose_next_detached is not None
+        and se3_object_module is not None
+    ):
         loss_acc = temporal_smoothness_loss_live(
             se3_object_module,
             se3_pose_prev_detached,
             se3_pose_next_detached,
         )
+        (lambda_acc * loss_acc).backward()
 
-    # ---- Total loss ----
-    total = (
-        loss_render
-        + lambda_contact * loss_contact
-        + lambda_j2d * loss_j2d
-        + lambda_pen * loss_pen_val
-        + lambda_acc * loss_acc
-    )
-
-    total.backward()
     optimizer.step()
 
+    avg_render = sum_render / B
+    avg_contact = sum_contact / B
+    avg_j2d = sum_j2d / B
+    avg_pen = sum_pen / B
+    total = avg_render + lambda_contact * avg_contact + lambda_j2d * avg_j2d + lambda_pen * avg_pen + lambda_acc * loss_acc.item()
+
     return {
-        "loss_total": total.item(),
-        "loss_render": loss_render.item(),
-        "loss_contact": loss_contact.item(),
-        "loss_j2d": loss_j2d.item(),
-        "loss_penetration": loss_pen_val.item(),
+        "loss_total": total,
+        "loss_render": avg_render,
+        "loss_contact": avg_contact,
+        "loss_j2d": avg_j2d,
+        "loss_penetration": avg_pen,
         "loss_temporal": loss_acc.item(),
     }
 
@@ -624,13 +791,17 @@ def load_step1_outputs(processed_dir: str, device: torch.device) -> dict:
     """
     Load Step 1 outputs: soft masks, SMPL-H params, depth, keypoints.
 
-    Expected files in processed_dir:
-        masks_primary_occ/   — M_p soft masks (.npy per frame)
-        masks_secondary_occ/ — M_s soft masks (.npy per frame)
-        masks_object/        — M_object soft masks (.npy per frame)
-        smplh_params/        — SMPL-H parameters (.npz per frame)
-        keypoints_2d/        — OpenPose 2D keypoints (.npy per frame)
-        camera_intrinsics.npy — (3, 3) camera K matrix
+    Supports two formats:
+      1. Unified Step-1 archives:
+         - region_masks.npz  (M_p, M_s, M_object)
+         - masks_raw.npz     (human, object)
+         - smpl_params.npz   (body_pose, shape, cam_t, optional vertices/faces/joints_3d)
+         - keypoints_2d.npz  (keypoints)
+      2. Legacy per-file directories:
+         - masks_primary_occ/, masks_secondary_occ/, masks_object/
+         - smplh_params/
+         - keypoints_2d/
+         - camera_intrinsics.npy
     """
     import glob
     import numpy as np
@@ -645,6 +816,74 @@ def load_step1_outputs(processed_dir: str, device: torch.device) -> dict:
         'camera_K': None,
     }
 
+    # Unified Step-1 outputs
+    region_masks_path = os.path.join(processed_dir, 'region_masks.npz')
+    raw_masks_path = os.path.join(processed_dir, 'masks_raw.npz')
+    smpl_params_path = os.path.join(processed_dir, 'smpl_params.npz')
+    keypoints_path = os.path.join(processed_dir, 'keypoints_2d.npz')
+
+    if os.path.isfile(region_masks_path):
+        region_masks = np.load(region_masks_path)
+        if 'M_object' in region_masks:
+            data['masks_visible'] = [
+                torch.from_numpy(mask).float().to(device)
+                for mask in region_masks['M_object']
+            ]
+        if 'M_p' in region_masks:
+            data['masks_primary_occ'] = [
+                torch.from_numpy(mask).float().to(device)
+                for mask in region_masks['M_p']
+            ]
+        if 'M_s' in region_masks:
+            data['masks_secondary_occ'] = [
+                torch.from_numpy(mask).float().to(device)
+                for mask in region_masks['M_s']
+            ]
+
+    if not data['masks_visible'] and os.path.isfile(raw_masks_path):
+        raw_masks = np.load(raw_masks_path)
+        if 'object' in raw_masks:
+            data['masks_visible'] = [
+                torch.from_numpy(mask).float().to(device)
+                for mask in raw_masks['object']
+            ]
+
+    if os.path.isfile(smpl_params_path):
+        smpl_npz = np.load(smpl_params_path)
+        time_dim = None
+        for key in ('cam_t', 'body_pose', 'vertices', 'joints_3d'):
+            if key in smpl_npz:
+                time_dim = int(smpl_npz[key].shape[0])
+                break
+        if time_dim is None:
+            raise ValueError(f'Could not infer temporal dimension from {smpl_params_path}')
+
+        for frame_idx in range(time_dim):
+            param_dict = {}
+            for key in smpl_npz.files:
+                value = smpl_npz[key]
+                if key == 'faces':
+                    tensor = torch.from_numpy(value).to(device)
+                    param_dict[key] = tensor.long()
+                elif value.ndim > 0 and value.shape[0] == time_dim:
+                    param_dict[key] = torch.from_numpy(value[frame_idx]).float().to(device)
+                else:
+                    param_dict[key] = torch.from_numpy(value).float().to(device)
+            data['smplh_params'].append(param_dict)
+
+    if os.path.isfile(keypoints_path):
+        keypoints_npz = np.load(keypoints_path)
+        if 'keypoints' in keypoints_npz:
+            for kp in keypoints_npz['keypoints']:
+                kp_tensor = torch.from_numpy(
+                    validate_pixel_keypoints(
+                        kp,
+                        context=f"{keypoints_path} keypoints",
+                    )
+                ).float().to(device)
+                data['keypoints_2d'].append(kp_tensor[:, :2])
+                data['kp_confidence'].append(kp_tensor[:, 2] if kp_tensor.shape[-1] > 2 else torch.ones(kp_tensor.shape[0], device=device))
+
     # Camera intrinsics
     K_path = os.path.join(processed_dir, 'camera_intrinsics.npy')
     if os.path.isfile(K_path):
@@ -657,15 +896,17 @@ def load_step1_outputs(processed_dir: str, device: torch.device) -> dict:
         ('masks_secondary_occ', 'masks_secondary_occ'),
     ]:
         mask_dir = os.path.join(processed_dir, mask_name)
+        if data[key]:
+            continue
         if os.path.isdir(mask_dir):
             paths = sorted(glob.glob(os.path.join(mask_dir, '*.npy')))
             for p in paths:
                 m = torch.from_numpy(np.load(p)).float().to(device)
                 data[key].append(m)
 
-    # SMPL-H parameters
+    # Legacy SMPL-H parameters
     smplh_dir = os.path.join(processed_dir, 'smplh_params')
-    if os.path.isdir(smplh_dir):
+    if not data['smplh_params'] and os.path.isdir(smplh_dir):
         paths = sorted(glob.glob(os.path.join(smplh_dir, '*.npz')))
         for p in paths:
             params = dict(np.load(p, allow_pickle=True))
@@ -675,12 +916,15 @@ def load_step1_outputs(processed_dir: str, device: torch.device) -> dict:
                 param_dict[k] = torch.from_numpy(v).float().to(device)
             data['smplh_params'].append(param_dict)
 
-    # 2D keypoints (OpenPose format: (J, 3) where last col is confidence)
+    # Legacy 2D keypoints (OpenPose format: (J, 3) where last col is confidence)
     kp_dir = os.path.join(processed_dir, 'keypoints_2d')
-    if os.path.isdir(kp_dir):
+    if not data['keypoints_2d'] and os.path.isdir(kp_dir):
         paths = sorted(glob.glob(os.path.join(kp_dir, '*.npy')))
         for p in paths:
-            kp = np.load(p)  # (J, 3) — x, y, confidence
+            kp = validate_pixel_keypoints(
+                np.load(p),
+                context=f"{p} keypoints",
+            )  # (J, 3) — x, y, confidence
             kp_tensor = torch.from_numpy(kp).float().to(device)
             data['keypoints_2d'].append(kp_tensor[:, :2])      # (J, 2)
             data['kp_confidence'].append(kp_tensor[:, 2])       # (J,)
@@ -701,21 +945,27 @@ def load_gs_init(gs_init_dir: str, device: torch.device) -> Tuple[GaussianModel,
     """
     # Format 0: Metric-aligned .npz from Step 3.5 Alignment Bridge
     # These live in a sibling directory gs_aligned/ next to gs_init/
-    aligned_dir = gs_init_dir.rstrip('/').rstrip('\\')
-    if aligned_dir.endswith('gs_init'):
-        aligned_dir = os.path.join(os.path.dirname(aligned_dir), 'gs_aligned')
+    aligned_base = gs_init_dir.rstrip('/').rstrip('\\')
+    candidate_aligned_dirs = []
+    if aligned_base.endswith('gs_init'):
+        parent = os.path.dirname(aligned_base)
+        candidate_aligned_dirs.append(os.path.join(parent, 'gs_aligned'))
+        candidate_aligned_dirs.append(aligned_base + '_aligned')
     else:
-        aligned_dir = aligned_dir + '_aligned'
-    hum_aligned = os.path.join(aligned_dir, 'human_gaussians_metric.npz')
-    obj_aligned = os.path.join(aligned_dir, 'object_gaussians_metric.npz')
-    if os.path.isfile(hum_aligned) and os.path.isfile(obj_aligned):
-        import numpy as _np
-        h_raw = torch.from_numpy(_np.load(hum_aligned)['raw']).float()
-        o_raw = torch.from_numpy(_np.load(obj_aligned)['raw']).float()
-        human_gs = GaussianModel.from_phase2(h_raw)
-        object_gs = GaussianModel.from_phase2(o_raw)
-        print(f'[Step4] Loaded metric-aligned 3DGS from {aligned_dir}')
-        return human_gs.to(device), object_gs.to(device)
+        candidate_aligned_dirs.append(aligned_base + '_aligned')
+        candidate_aligned_dirs.append(os.path.join(os.path.dirname(aligned_base), 'gs_aligned'))
+
+    for aligned_dir in candidate_aligned_dirs:
+        hum_aligned = os.path.join(aligned_dir, 'human_gaussians_metric.npz')
+        obj_aligned = os.path.join(aligned_dir, 'object_gaussians_metric.npz')
+        if os.path.isfile(hum_aligned) and os.path.isfile(obj_aligned):
+            import numpy as _np
+            h_raw = torch.from_numpy(_np.load(hum_aligned)['raw']).float()
+            o_raw = torch.from_numpy(_np.load(obj_aligned)['raw']).float()
+            human_gs = GaussianModel.from_phase2(h_raw)
+            object_gs = GaussianModel.from_phase2(o_raw)
+            print(f'[Step4] Loaded metric-aligned 3DGS from {aligned_dir}')
+            return human_gs.to(device), object_gs.to(device)
 
     # Format 1: GaussianModel state_dicts
     human_path = os.path.join(gs_init_dir, 'human_gs.pt')
@@ -801,8 +1051,9 @@ def _export_final_results(
     import numpy as np
 
     with torch.no_grad():
-        xyz_h = se3_human(human_gs.get_xyz).cpu().numpy()      # (N_h, 3)
-        xyz_o = se3_object(object_gs.get_xyz).cpu().numpy()     # (N_o, 3)
+        frame_idx = 0 if getattr(se3_human, "num_frames", 1) > 1 else None
+        xyz_h = se3_human(human_gs.get_xyz, frame_idx=frame_idx).cpu().numpy()
+        xyz_o = se3_object(object_gs.get_xyz, frame_idx=frame_idx).cpu().numpy()
         col_h = human_gs.get_colors.cpu().numpy()               # (N_h, 3)
         col_o = object_gs.get_colors.cpu().numpy()              # (N_o, 3)
 
@@ -835,7 +1086,7 @@ def _export_final_results(
     import cv2
     with torch.no_grad():
         for i, gt in enumerate(frames):
-            rendered, _, _ = joint_renderer(human_gs, object_gs)
+            rendered, _, _ = joint_renderer(human_gs, object_gs, frame_idx=i)
             rendered_np = rendered.clamp(0, 1).permute(1, 2, 0).cpu().numpy()
             gt_np = gt.clamp(0, 1).permute(1, 2, 0).cpu().numpy()
             # Side-by-side: GT | Rendered
@@ -922,11 +1173,17 @@ def run_step4_pipeline(cfg) -> None:
     # ---- Build SE(3) transforms ----
     if _metric_aligned:
         # Identity init: data is already in metric space, SE(3) learns residual
-        se3_human = SE3Transform(init_translation=(0., 0., 0.)).to(device)
-        se3_object = SE3Transform(init_translation=(0., 0., 0.)).to(device)
+        se3_human = SE3Transform(init_translation=(0., 0., 0.), num_frames=num_frames).to(device)
+        se3_object = SE3Transform(init_translation=(0., 0., 0.), num_frames=num_frames).to(device)
     else:
-        se3_human = SE3Transform(init_translation=cfg.se3.init_translation_human).to(device)
-        se3_object = SE3Transform(init_translation=cfg.se3.init_translation_object).to(device)
+        se3_human = SE3Transform(
+            init_translation=cfg.se3.init_translation_human,
+            num_frames=num_frames,
+        ).to(device)
+        se3_object = SE3Transform(
+            init_translation=cfg.se3.init_translation_object,
+            num_frames=num_frames,
+        ).to(device)
 
     # ---- Build renderer ----
     base_renderer = SimpleProjectionRenderer(H, W, focal=cfg.focal).to(device)
@@ -969,15 +1226,6 @@ def run_step4_pipeline(cfg) -> None:
         focal = K[0, 0].item()
         cx = K[0, 2].item()
         cy = K[1, 2].item()
-
-    # ---- Per-frame SE(3) pose cache (for temporal loss) ----
-    # We maintain a sliding window of 3 detached pose snapshots.
-    # At step t, we use [t-2, t-1, t] to compute temporal loss with
-    # gradient flowing through the *current* SE(3) parameters.
-    def _get_se3_pose(se3: SE3Transform) -> Tensor:
-        return torch.cat([se3.axis_angle, se3.translation]).detach().clone()
-
-    pose_history: List[Tensor] = []
 
     # ---- Training loop ----
     print(f'[Step4] Starting optimization ({cfg.num_iters} iters)...')
@@ -1022,13 +1270,6 @@ def run_step4_pipeline(cfg) -> None:
             kp2d = step1_data['keypoints_2d'][idx]
             kp_conf = step1_data['kp_confidence'][idx]
 
-        # Temporal smoothness: use sliding window [t-2, t-1] as detached
-        # anchors; gradient flows through current SE(3) params.
-        se3_prev_detached = pose_history[-2] if len(pose_history) >= 2 else None
-        se3_next_detached = pose_history[-1] if len(pose_history) >= 1 else None
-        # When we have >=2 history entries, prev=[-2], next=[-1] (the most
-        # recent snapshot), and the live SE(3) params act as "current".
-
         log = step4_training_step(
             human_gs=human_gs,
             object_gs=object_gs,
@@ -1045,8 +1286,8 @@ def run_step4_pipeline(cfg) -> None:
             smpl_vertices=smpl_verts,
             smpl_faces=smpl_faces_t,
             sdf_module=sdf_module,
-            se3_pose_prev_detached=se3_prev_detached,
-            se3_pose_next_detached=se3_next_detached,
+            frame_indices=[idx],
+            se3_human_module=se3_human if cfg.temporal.enabled else None,
             se3_object_module=se3_object if cfg.temporal.enabled else None,
             w_visible=cfg.region_loss.weight_visible,
             w_primary=cfg.region_loss.weight_primary_occ,
@@ -1064,11 +1305,6 @@ def run_step4_pipeline(cfg) -> None:
 
         # Step LR scheduler
         scheduler.step()
-
-        # Cache pose for temporal loss
-        pose_history.append(_get_se3_pose(se3_object))
-        if len(pose_history) > 3:
-            pose_history.pop(0)
 
         # Logging with ETA (Master Guidelines requirement)
         if step % cfg.log_every == 0:

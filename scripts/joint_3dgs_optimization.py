@@ -202,11 +202,40 @@ class SimpleProjectionRenderer(nn.Module):
     tested without the custom CUDA op.
     """
 
-    def __init__(self, H: int, W: int, focal: float = 500.0):
+    def __init__(
+        self,
+        H: int,
+        W: int,
+        focal: float = 500.0,
+        focal_y: float = None,
+        cx: float = None,
+        cy: float = None,
+    ):
         super().__init__()
         self.H, self.W = H, W
-        self.focal = focal
-        self.cx, self.cy = W / 2.0, H / 2.0
+        self.fx = float(focal)
+        self.fy = float(focal if focal_y is None else focal_y)
+        self.focal = self.fx
+        self.cx = float(W / 2.0 if cx is None else cx)
+        self.cy = float(H / 2.0 if cy is None else cy)
+
+    def set_camera(
+        self,
+        fx: float = None,
+        fy: float = None,
+        cx: float = None,
+        cy: float = None,
+    ):
+        """Update pinhole intrinsics for the next render call."""
+        if fx is not None:
+            self.fx = float(fx)
+            self.focal = self.fx
+        if fy is not None:
+            self.fy = float(fy)
+        if cx is not None:
+            self.cx = float(cx)
+        if cy is not None:
+            self.cy = float(cy)
 
     def forward(
         self,
@@ -228,11 +257,12 @@ class SimpleProjectionRenderer(nn.Module):
 
         # ---- Pinhole projection (camera at origin, looking down +Z) ----
         z = xyz[:, 2].clamp(min=0.1)                          # (N,)
-        px = (xyz[:, 0] / z) * self.focal + self.cx            # (N,)
-        py = (xyz[:, 1] / z) * self.focal + self.cy            # (N,)
+        px = (xyz[:, 0] / z) * self.fx + self.cx               # (N,)
+        py = (xyz[:, 1] / z) * self.fy + self.cy               # (N,)
 
         # Approximate splat radius from mean scale
-        radius_px = (scaling.mean(dim=-1) / z) * self.focal    # (N,)
+        focal_avg = 0.5 * (self.fx + self.fy)
+        radius_px = (scaling.mean(dim=-1) / z) * focal_avg     # (N,)
         radius_px = radius_px.clamp(min=0.5, max=50.0)
 
         # ---- Depth-sort (front to back) ----

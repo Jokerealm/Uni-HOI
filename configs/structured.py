@@ -234,6 +234,12 @@ class BehaveDatasetConfig(PointCloudDatasetConfig):
 
     v2v_path: str = '' # object v2v corr path
 
+    # CARI4D-style spatial downsampling: downsample raw 2K images by this factor
+    # before crop. Reduces memory/compute while preserving detail for 224×224 crops.
+    scale_ratio: int = 2
+    # CARI4D-style bbox expansion factor (1.1 = 10% padding around H+O bbox)
+    bbox_expand: float = 1.1
+
 @dataclass
 class ShapeDatasetConfig(BehaveDatasetConfig):
     "the dataset to train AE for aligned shapes"
@@ -428,7 +434,7 @@ class Joint3DGSModelConfig:
     enable_penetration: bool = True
     sdf_resolution: int = 64
     sdf_padding: float = 0.1
-    # Temporal smoothness loss
+    # Temporal smoothness loss on framewise SE(3) trajectories
     lambda_acc: float = 0.5
     enable_temporal: bool = True
     # Legacy basic loss weights (kept for backward compat)
@@ -439,7 +445,7 @@ class Joint3DGSModelConfig:
 
 
 ###############################################################################
-# Preprocessed dataset config (pure file-read after preprocess.py)
+# Preprocessed dataset config (pure file-read after `main.py run.job=step1`)
 ###############################################################################
 @dataclass
 class PreprocessedDatasetConfig(PointCloudDatasetConfig):

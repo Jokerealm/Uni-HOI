@@ -16,10 +16,12 @@ import os
 import time
 from typing import Dict, Optional
 
+import cv2
 import numpy as np
 
 from configs.step1_config import Step1PipelineConfig
 from pipeline.io_utils import load_frames, save_masks_png, save_npz
+from dataset.video_transforms import preprocess_frame_offline, validate_pixel_keypoints
 from pipeline.sam3_segmenter import SAM3Segmenter
 from pipeline.unidepth_estimator import UniDepthEstimator
 from pipeline.sam3d_body import SAM3DBodyEstimator
@@ -53,7 +55,10 @@ class Step1Pipeline:
         elif os.path.isdir(candidate_seq):
             self.input_dir = candidate_seq
         else:
-            self.input_dir = candidate  # fallback, will error at frame loading
+            raise FileNotFoundError(
+                f"Input video directory does not exist: {candidate} "
+                f"(or {candidate_seq})."
+            )
         self.output_dir = os.path.join(
             self.input_dir, cfg.data_prep.output_subdir
         )
@@ -81,6 +86,7 @@ class Step1Pipeline:
 
         gt = load_behave_sequence(
             self.input_dir,
+            cam_id=self.cfg.data_prep.behave_cam_id,
             max_frames=self.cfg.data_prep.max_frames,
         )
         frames = gt["frames"]
@@ -88,6 +94,7 @@ class Step1Pipeline:
         masks_object = gt["masks_object"]
         smpl_params_list = gt["smpl_params"]
         keypoints_3d = gt["keypoints_3d"]
+        keypoints_2d = gt.get("keypoints_2d")
         T = len(frames)
         H, W = frames[0].shape[:2]
         print(f"[Step1-BEHAVE] {T} frames, resolution {W}x{H}")
@@ -97,7 +104,6 @@ class Step1Pipeline:
         save_masks_png(masks_object, os.path.join(self.output_dir, "masks_object"), "object")
 
         # Export frames as flat PNGs for Step 2 (ProPainter expects frames/ dir)
-        import cv2
         frames_dir = os.path.join(self.input_dir, "frames")
         os.makedirs(frames_dir, exist_ok=True)
         for i, f in enumerate(frames):
@@ -116,16 +122,16 @@ class Step1Pipeline:
         del unidepth
         self._cleanup_gpu()
 
-        # Build keypoints_2d with confidence=1.0 from 3D joints (placeholder projection)
-        # Step 4 uses these for L_j2d; actual projection happens there via camera intrinsics
-        kp2d_list = []
-        for i in range(T):
-            j3d = keypoints_3d[i]  # (J, 3)
-            J = j3d.shape[0]
-            conf = np.ones((J, 1), dtype=np.float32)
-            # Store 3D joints; 2D projection will be done in Step 4 with camera params
-            kp2d_list.append(np.concatenate([j3d[:, :2], conf], axis=1))
-        keypoints_2d = np.stack(kp2d_list, axis=0)  # (T, J, 3)
+        if keypoints_2d is None:
+            raise RuntimeError(
+                "[Step1-BEHAVE] Expected GT/OpenPose 2D keypoints from the BEHAVE loader."
+            )
+        keypoints_2d = validate_pixel_keypoints(
+            keypoints_2d,
+            image_size_hw=frames[0].shape[:2],
+            context="Step1 BEHAVE keypoints_2d",
+        )
+        print(f"[Step1-BEHAVE] Loaded GT/OpenPose 2D keypoints: {keypoints_2d.shape}")
 
         # --- Depth scale alignment ---
         print("=" * 60)
@@ -154,6 +160,14 @@ class Step1Pipeline:
             depths_aligned, smpl_aligned, region_masks,
             keypoints_2d, masks_human, masks_object,
         )
+        self._save_cropped_training_data(
+            frames=frames,
+            depths_aligned=depths_aligned,
+            keypoints_2d=keypoints_2d,
+            masks_human=masks_human,
+            masks_object=masks_object,
+            region_masks=region_masks,
+        )
         # Also save 3D joints for Step 4
         save_npz(os.path.join(self.output_dir, "joints_3d.npz"),
                  joints_3d=keypoints_3d)
@@ -172,6 +186,7 @@ class Step1Pipeline:
 
     def _run_wild(self) -> Dict[str, np.ndarray]:
         """Wild video path: run full perception pipeline."""
+        t0 = time.time()
 
         # --- 1. Load frames ---
         print("=" * 60)
@@ -191,12 +206,15 @@ class Step1Pipeline:
             device=self.device,
         )
         tracked = sam3.track_video(frames, self.cfg.sam3.text_prompts)
-        masks_human = tracked.get("human", tracked.get(
-            self.cfg.sam3.text_prompts[0], [np.zeros((H, W), np.uint8)] * T
-        ))
-        masks_object = tracked.get("object", tracked.get(
-            self.cfg.sam3.text_prompts[1], [np.zeros((H, W), np.uint8)] * T
-        ))
+        expected_prompts = list(self.cfg.sam3.text_prompts)
+        missing_prompts = [prompt for prompt in expected_prompts if prompt not in tracked]
+        if missing_prompts:
+            raise KeyError(
+                f"SAM3 tracking result is missing prompts: {missing_prompts}. "
+                f"Available keys: {sorted(tracked.keys())}"
+            )
+        masks_human = tracked[expected_prompts[0]]
+        masks_object = tracked[expected_prompts[1]]
 
         # Save intermediate masks as PNGs
         save_masks_png(masks_human, os.path.join(self.output_dir, "masks_human"), "human")
@@ -233,12 +251,29 @@ class Step1Pipeline:
 
         # Extract 2D keypoints from SAM3D-Body output (replaces OpenPose)
         keypoints_2d_list = []
-        for sp in smpl_params_list:
-            kp2d = sp.get("keypoints_2d", np.zeros((22, 2)))  # (J, 2)
-            J = kp2d.shape[0]
-            # Add confidence=1.0 column to match (J, 3) format
-            conf = np.ones((J, 1), dtype=np.float32)
-            keypoints_2d_list.append(np.concatenate([kp2d, conf], axis=1))
+        for frame_idx, sp in enumerate(smpl_params_list):
+            kp2d = np.asarray(
+                sp.get("keypoints_2d", np.zeros((22, 2), dtype=np.float32)),
+                dtype=np.float32,
+            )
+            if kp2d.ndim != 2 or kp2d.shape[1] not in (2, 3):
+                raise ValueError(
+                    f"SAM3D-Body returned malformed keypoints_2d for frame {frame_idx}: {kp2d.shape}"
+                )
+
+            if kp2d.shape[1] == 2:
+                valid = np.isfinite(kp2d).all(axis=1) & (np.linalg.norm(kp2d, axis=1) > 1e-6)
+                conf = valid.astype(np.float32)[:, None]
+                kp2d = np.concatenate([kp2d, conf], axis=1)
+            else:
+                kp2d[:, 2] = np.clip(np.nan_to_num(kp2d[:, 2], nan=0.0), 0.0, 1.0)
+
+            kp2d = validate_pixel_keypoints(
+                kp2d,
+                image_size_hw=frames[frame_idx].shape[:2],
+                context=f"Step1 SAM3D-Body keypoints frame {frame_idx}",
+            )
+            keypoints_2d_list.append(kp2d)
         keypoints_2d = np.stack(keypoints_2d_list, axis=0)  # (T, J, 3)
         print(f"[Step1] Extracted 2D keypoints from SAM3D-Body: {keypoints_2d.shape}")
 
@@ -269,6 +304,14 @@ class Step1Pipeline:
             depths_aligned, smpl_aligned, region_masks,
             keypoints_2d, masks_human, masks_object,
         )
+        self._save_cropped_training_data(
+            frames=frames,
+            depths_aligned=depths_aligned,
+            keypoints_2d=keypoints_2d,
+            masks_human=masks_human,
+            masks_object=masks_object,
+            region_masks=region_masks,
+        )
 
         elapsed = time.time() - t0
         print(f"[Step1] Done in {elapsed:.1f}s. Outputs: {self.output_dir}")
@@ -298,11 +341,20 @@ class Step1Pipeline:
         save_npz(os.path.join(out, "depth_aligned.npz"),
                  depth=depths_aligned)
 
-        # SMPL-H parameters (per-frame dicts -> stacked arrays)
+        # SMPL-H parameters and geometry in a unified archive.
+        # Topology is constant across frames, so `faces` is stored once.
         smpl_stacked = {}
         keys = smpl_aligned[0].keys()
         for k in keys:
-            smpl_stacked[k] = np.stack([p[k] for p in smpl_aligned], axis=0)
+            values = [p[k] for p in smpl_aligned]
+            if k == "faces":
+                first = values[0].astype(np.int32)
+                for value in values[1:]:
+                    if value.shape != first.shape or not np.array_equal(value, first):
+                        raise ValueError("SMPL `faces` changed across frames; expected a constant topology.")
+                smpl_stacked[k] = first
+            else:
+                smpl_stacked[k] = np.stack(values, axis=0)
         save_npz(os.path.join(out, "smpl_params.npz"), **smpl_stacked)
 
         # Multi-region masks
@@ -311,7 +363,7 @@ class Step1Pipeline:
                  M_s=region_masks["M_s"],
                  M_object=region_masks["M_object"])
 
-        # OpenPose keypoints
+        # 2D keypoints in pixel coordinates
         save_npz(os.path.join(out, "keypoints_2d.npz"),
                  keypoints=keypoints_2d)
 
@@ -319,6 +371,114 @@ class Step1Pipeline:
         save_npz(os.path.join(out, "masks_raw.npz"),
                  human=np.stack(masks_human, axis=0),
                  object=np.stack(masks_object, axis=0))
+
+    def _save_cropped_training_data(
+        self,
+        frames: list,
+        depths_aligned: np.ndarray,
+        keypoints_2d: np.ndarray,
+        masks_human: list,
+        masks_object: list,
+        region_masks: dict,
+    ):
+        """
+        Save CARI4D-style cropped training assets for the frame-based Step 4 model.
+
+        Unlike CARI4D's clip-based video inputs, this project optimizes per-frame
+        RGB targets. We therefore serialize spatially preprocessed frame patches and
+        their ROI intrinsics so Step 4 can train on small, geometry-consistent crops.
+        """
+        crop_root = os.path.join(self.output_dir, "cropped")
+        rgb_dir = os.path.join(crop_root, "rgb")
+        os.makedirs(rgb_dir, exist_ok=True)
+
+        crop_h, crop_w = [int(v) for v in self.cfg.data_prep.crop_size]
+        scale_ratio = int(self.cfg.data_prep.scale_ratio)
+        bbox_expand = float(self.cfg.data_prep.bbox_expand)
+
+        cropped_depth = []
+        cropped_mh = []
+        cropped_mo = []
+        cropped_mp = []
+        cropped_ms = []
+        cropped_mobj = []
+        cropped_kp = []
+        bbox_xywh = []
+        fx_all = []
+        fy_all = []
+        cx_all = []
+        cy_all = []
+        orig_hw = []
+        down_hw = []
+
+        for i, frame in enumerate(frames):
+            kp_frame = keypoints_2d[i] if keypoints_2d is not None else None
+            cropped = preprocess_frame_offline(
+                frame=frame,
+                mask_human=masks_human[i],
+                mask_object=masks_object[i],
+                depth=depths_aligned[i],
+                keypoints_2d=kp_frame,
+                extra_maps={
+                    "M_p": region_masks["M_p"][i],
+                    "M_s": region_masks["M_s"][i],
+                    "M_object": region_masks["M_object"][i],
+                },
+                scale_ratio=scale_ratio,
+                bbox_expand=bbox_expand,
+                out_size=(crop_h, crop_w),
+            )
+
+            frame_name = f"frame_{i:06d}.png"
+            cv2.imwrite(os.path.join(rgb_dir, frame_name), cropped["rgb"])
+
+            cropped_depth.append(cropped["depth"])
+            cropped_mh.append(cropped["mask_human"])
+            cropped_mo.append(cropped["mask_object"])
+            cropped_mp.append(cropped["extra_maps"]["M_p"])
+            cropped_ms.append(cropped["extra_maps"]["M_s"])
+            cropped_mobj.append(cropped["extra_maps"]["M_object"])
+            if "keypoints_2d" in cropped:
+                cropped_kp.append(cropped["keypoints_2d"])
+            bbox_xywh.append(cropped["bbox_xywh"])
+            fx_all.append(cropped["fx"])
+            fy_all.append(cropped["fy"])
+            cx_all.append(cropped["cx"])
+            cy_all.append(cropped["cy"])
+            orig_hw.append(cropped["orig_size_hw"])
+            down_hw.append(cropped["downsampled_size_hw"])
+
+        save_npz(
+            os.path.join(crop_root, "depth_aligned.npz"),
+            depth=np.stack(cropped_depth, axis=0).astype(np.float32),
+        )
+        save_npz(
+            os.path.join(crop_root, "region_masks.npz"),
+            M_p=np.stack(cropped_mp, axis=0).astype(np.float32),
+            M_s=np.stack(cropped_ms, axis=0).astype(np.float32),
+            M_object=np.stack(cropped_mobj, axis=0).astype(np.float32),
+        )
+        save_npz(
+            os.path.join(crop_root, "masks_raw.npz"),
+            human=np.stack(cropped_mh, axis=0).astype(np.float32),
+            object=np.stack(cropped_mo, axis=0).astype(np.float32),
+        )
+        if cropped_kp:
+            save_npz(
+                os.path.join(crop_root, "keypoints_2d.npz"),
+                keypoints=np.stack(cropped_kp, axis=0).astype(np.float32),
+            )
+        save_npz(
+            os.path.join(crop_root, "meta.npz"),
+            bbox_xywh=np.stack(bbox_xywh, axis=0).astype(np.float32),
+            fx=np.asarray(fx_all, dtype=np.float32),
+            fy=np.asarray(fy_all, dtype=np.float32),
+            cx=np.asarray(cx_all, dtype=np.float32),
+            cy=np.asarray(cy_all, dtype=np.float32),
+            orig_size_hw=np.stack(orig_hw, axis=0).astype(np.int32),
+            downsampled_size_hw=np.stack(down_hw, axis=0).astype(np.int32),
+            scale_ratio=np.asarray([scale_ratio], dtype=np.int32),
+        )
 
     @staticmethod
     def _cleanup_gpu():

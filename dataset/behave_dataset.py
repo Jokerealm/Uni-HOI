@@ -76,7 +76,9 @@ class BehaveDataset(Dataset):
                  std_coverage=3.5,
                  debug=False,
                  behave_path='',
-                 procigen_path=''
+                 procigen_path='',
+                 scale_ratio=2,  # CARI4D-style spatial downsampling factor
+                 bbox_expand=1.1,  # CARI4D-style bbox expansion factor
                  ):
         self.data_paths = data_paths
         self.num_samples = num_samples
@@ -84,6 +86,8 @@ class BehaveDataset(Dataset):
         self.sample_ratio_hum = sample_ratio_hum
         self.split = split
         self.input_size = input_size
+        self.scale_ratio = scale_ratio  # CARI4D-style: downsample raw images before crop
+        self.bbox_expand = bbox_expand  # CARI4D-style: expand bbox by this factor
         
         # 使用简单的路径缓存（只缓存文件路径，不缓存数据）
         self.samples_cache = PathCache()  # 缓存 mesh 文件路径
@@ -274,11 +278,23 @@ class BehaveDataset(Dataset):
         rgb_full = cv2.imread(rgb_file)[:, :, ::-1]
         color_h, color_w = rgb_full.shape[:2]
 
+        # --- CARI4D-style spatial downsampling ---
+        # Downsample raw 2K images by scale_ratio before any crop/processing.
+        # This reduces memory and compute while preserving sufficient detail.
+        # Camera intrinsics are scaled accordingly in compute_K_roi.
+        if self.scale_ratio > 1:
+            new_w = color_w // self.scale_ratio
+            new_h = color_h // self.scale_ratio
+            rgb_full = cv2.resize(rgb_full, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            mask_hum = cv2.resize(mask_hum, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+            mask_obj = cv2.resize(mask_obj, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+            color_h, color_w = new_h, new_w
+
         if self.split == 'train' and np.random.uniform()>0.5:
             rgb_full = self.blur_image(rgb_full, self.aug_blur)
 
-        # crop
-        bmax, bmin, crop_center, crop_size = self.get_crop_params(mask_hum, mask_obj)
+        # crop — use CARI4D-style bbox expansion
+        bmax, bmin, crop_center, crop_size = self.get_crop_params(mask_hum, mask_obj, bbox_exp=self.bbox_expand)
         rgb = resize(crop(rgb_full, crop_center, crop_size), self.input_size) / 255.
         person_mask = resize(crop(mask_hum, crop_center, crop_size), self.input_size) / 255.
         obj_mask = resize(crop(mask_obj, crop_center, crop_size), self.input_size) / 255.
@@ -305,13 +321,17 @@ class BehaveDataset(Dataset):
         cent_transform = np.eye(4)  # the transform applied to the mesh that moves it back to kinect camera frame
         transl_estimate = np.zeros(4) # dummy data
         if self.test_transl_type == 'estimated-2d':
-            assert rgb_full.shape[1] in [2048, 1920], 'the image is not normalized to BEHAVE or ICAP size!'
+            # After downsampling, image width is 2048/scale_ratio or 1920/scale_ratio
+            valid_widths = [2048 // self.scale_ratio, 1920 // self.scale_ratio, 2048, 1920]
+            assert rgb_full.shape[1] in valid_widths, \
+                f'unexpected image width {rgb_full.shape[1]} (scale_ratio={self.scale_ratio})'
             indices = np.indices(rgb_full.shape[:2])
             assert np.sum(mask_obj > 127) > 5, f'not enough object mask found for {rgb_file}'
             pts_h = np.stack([indices[1][mask_hum > 127], indices[0][mask_hum > 127]], -1)
             pts_o = np.stack([indices[1][mask_obj > 127], indices[0][mask_obj > 127]], -1)
             proj_cent_est = (np.mean(pts_h, 0) + np.mean(pts_o, 0)) / 2.
-            transl_estimate = compute_translation(proj_cent_est, crop_size_ho, is_behave, self.std_coverage)
+            transl_estimate = compute_translation(proj_cent_est, crop_size_ho, is_behave, self.std_coverage,
+                                                   scale_ratio=self.scale_ratio)
             cent_transform[:3, 3] = transl_estimate / 7.0
             radius = 0.5  # don't do normalization anymore
             cent = transl_estimate / 7.0
@@ -652,10 +672,15 @@ class BehaveDataset(Dataset):
                       image_width=2048,
                       image_height=1536):
         """
-        compute Kroi for the cropped patch, return results in ndc coordinate
+        compute Kroi for the cropped patch, return results in ndc coordinate.
+        
+        Accounts for CARI4D-style spatial downsampling: if scale_ratio > 1,
+        the image_width/height passed in are already downsampled, so we compute
+        the ratio relative to the downsampled reference size.
+        
         :param bbox_square: (x,y,b,w) of the patch
-        :param image_width: width of the original image
-        :param image_height: height of the original image
+        :param image_width: width of the (possibly downsampled) image
+        :param image_height: height of the (possibly downsampled) image
         :return:
         """
         x, y, b, w = bbox_square
@@ -663,25 +688,27 @@ class BehaveDataset(Dataset):
         is_behave = self.is_behave_dataset(image_width)
 
         if is_behave:
-            assert image_height / image_width == 0.75, f"invalid image aspect ratio: width={image_width}, height={image_height}"
-            # the image might be rendered at different size
-            ratio = image_width/2048.
-            fx, fy = 979.7844*ratio, 979.840*ratio
-            cx, cy = 1018.952*ratio, 779.486*ratio
+            # Reference size after downsampling
+            ref_w = 2048 // self.scale_ratio if self.scale_ratio > 1 else 2048
+            ratio = image_width / ref_w
+            # Intrinsics: original values divided by scale_ratio, then multiplied by ratio
+            ds = 1.0 / self.scale_ratio if self.scale_ratio > 1 else 1.0
+            fx, fy = 979.7844 * ratio * ds, 979.840 * ratio * ds
+            cx, cy = 1018.952 * ratio * ds, 779.486 * ratio * ds
         else:
-            assert image_height / image_width == 9/16, f"invalid image aspect ratio: width={image_width}, height={image_height}"
-            # intercap camera
-            ratio = image_width/1920
-            fx, fy = 918.457763671875*ratio, 918.4373779296875*ratio
-            cx, cy = 956.9661865234375*ratio, 555.944580078125*ratio
+            ref_w = 1920 // self.scale_ratio if self.scale_ratio > 1 else 1920
+            ratio = image_width / ref_w
+            ds = 1.0 / self.scale_ratio if self.scale_ratio > 1 else 1.0
+            fx, fy = 918.457763671875 * ratio * ds, 918.4373779296875 * ratio * ds
+            cx, cy = 956.9661865234375 * ratio * ds, 555.944580078125 * ratio * ds
 
         cx, cy = cx - x, cy - y
-        scale = b/2.
+        half_b = b / 2.
         # in ndc
-        cx_ = (scale - cx)/scale
-        cy_ = (scale - cy)/scale
-        fx_ = fx/scale
-        fy_ = fy/scale
+        cx_ = (half_b - cx) / half_b
+        cy_ = (half_b - cy) / half_b
+        fx_ = fx / half_b
+        fy_ = fy / half_b
 
         K_roi = np.array([
             [fx_, 0, cx_, 0],
@@ -692,12 +719,17 @@ class BehaveDataset(Dataset):
         return K_roi
 
     def is_behave_dataset(self, image_width):
-        assert image_width in [2048, 1920, 1024, 960], f'unknwon image width {image_width}!'
-        if image_width in [2048, 1024]:
-            is_behave = True
+        # After CARI4D-style downsampling, BEHAVE images may be 1024 (2048/2),
+        # 512 (2048/4), etc. InterCap may be 960 (1920/2), 480 (1920/4), etc.
+        behave_widths = {2048 // (2**i) for i in range(4)}  # {2048, 1024, 512, 256}
+        icap_widths = {1920 // (2**i) for i in range(4)}    # {1920, 960, 480, 240}
+        if image_width in behave_widths:
+            return True
+        elif image_width in icap_widths:
+            return False
         else:
-            is_behave = False
-        return is_behave
+            # Fallback: check aspect ratio
+            return True  # default to BEHAVE
 
     def load_masks(self, rgb_file, flip=False):
         person_mask_file = rgb_file.replace('.color.jpg', ".person_mask.png")

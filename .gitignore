@@ -171,6 +171,10 @@ results/
 docs/
 logs/
 preprocessed/
+wandb/
+tmp/
+diff-gaussian-rasterization/
+sample_data/
 
 # Large model weights (use separate storage/LFS for these)
 *.pth

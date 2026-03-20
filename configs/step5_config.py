@@ -47,8 +47,6 @@ class Step5PipelineConfig:
     output_subdir: str = "final_output"
 
     # Training
-    num_epochs: int = 2
-    num_iters_per_epoch: int = 500
     image_height: int = 256
     image_width: int = 256
     focal: float = 500.0

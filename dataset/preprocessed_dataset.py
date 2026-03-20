@@ -1,17 +1,20 @@
 """
 Preprocessed Dataset — Pure file-read DataLoader
 =================================================
-This Dataset reads *only* from the serialised outputs of ``preprocess.py``.
+This Dataset reads *only* from the serialised outputs of Step 1 from ``main.py``.
 No model inference or heavy geometry computation happens in ``__getitem__``.
 
-Expected directory layout (created by preprocess.py):
+Expected directory layout (created by `main.py run.job=step1`):
     <root>/<video_name>/processed/
-        masks/human/        *.png   (uint8 binary)
-        masks/object/       *.png   (uint8 binary)
-        masks/multi_region/ *.npz   (float16 soft masks)
-        depth/              *.npz   (float32 aligned depth)
-        poses/              smplh_aligned.npz
-        keypoints/          openpose_2d.npz
+        depth_aligned.npz
+        region_masks.npz
+        masks_raw.npz
+        smpl_params.npz
+        keypoints_2d.npz
+        cropped/
+            rgb/*.png
+            meta.npz
+            keypoints_2d.npz
     <root>/<video_name>/frames/     *.jpg / *.png  (original RGB)
 """
 import os
@@ -90,9 +93,12 @@ class PreprocessedDataset(Dataset):
         stem = self.stems[idx]
         H, W = self.image_size
 
-        # 1. RGB frame
+        # 1. RGB frame — apply CARI4D-style downsampling for large images
         rgb = cv2.imread(self.frame_paths[idx])
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+        oh, ow = rgb.shape[:2]
+        if ow > 1024:  # raw BEHAVE 2K resolution, downsample 2x first
+            rgb = cv2.resize(rgb, (ow // 2, oh // 2), interpolation=cv2.INTER_LINEAR)
         rgb = cv2.resize(rgb, (W, H)).astype(np.float32) / 255.0  # (H, W, 3)
 
         # 2. Binary masks (human / object)

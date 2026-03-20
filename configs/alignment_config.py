@@ -59,6 +59,7 @@ class AlignmentPipelineConfig:
     image_height: int = 256
     image_width: int = 256
     focal: float = 500.0  # fallback focal length
+    frame_selection: str = "middle"
 
     # Core alignment config
     alignment: MetricAlignmentConfig = field(

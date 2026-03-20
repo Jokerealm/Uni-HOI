@@ -51,10 +51,9 @@ class Step3Pipeline:
         try:
             from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
         except (ImportError, AttributeError, Exception) as e:
-            print(f"[Step3] WARNING: hy3dgen unavailable ({type(e).__name__}: {e})")
-            print("[Step3] Will use synthetic 3DGS init as fallback.")
-            self._pipeline = "FALLBACK"
-            return
+            raise ImportError(
+                f"[Step3] Failed to import hy3dgen for Hunyuan3D-2 inference: {type(e).__name__}: {e}"
+            ) from e
 
         hy3d = self.cfg.hy3d
         dtype = torch.float16 if hy3d.dtype == "float16" else torch.float32
@@ -237,55 +236,6 @@ class Step3Pipeline:
         torch.save(gs, out_path)
         print(f"[Step3] Saved {name}: {gs['xyz'].shape[0]} Gaussians → {out_path}")
 
-    def _generate_synthetic_gs(self, label: str, num_points: int) -> dict:
-        """Generate synthetic 3DGS init (random sphere) when hy3dgen is unavailable."""
-        N = num_points
-        init_scale = self.cfg.hy3d.init_gaussian_scale
-
-        # Random points on a unit sphere
-        theta = np.random.uniform(0, 2 * np.pi, N).astype(np.float32)
-        phi = np.random.uniform(0, np.pi, N).astype(np.float32)
-        r = np.random.uniform(0.3, 0.5, N).astype(np.float32)
-        xyz_np = np.stack([
-            r * np.sin(phi) * np.cos(theta),
-            r * np.sin(phi) * np.sin(theta),
-            r * np.cos(phi),
-        ], axis=-1)
-
-        xyz = torch.from_numpy(xyz_np)
-        rotation = torch.zeros(N, 4)
-        rotation[:, 0] = 1.0  # identity quaternion
-        scaling = torch.full((N, 3), init_scale)
-        opacity = torch.full((N, 1), 0.9)
-        shs = torch.ones(N, 3) * 0.5  # neutral gray
-
-        raw = torch.cat([xyz, rotation, scaling, opacity, shs], dim=-1)
-        print(f"[Step3] {label}: generated {N} synthetic Gaussians (fallback)")
-        return {"xyz": xyz, "rotation": rotation, "scaling": scaling,
-                "opacity": opacity, "shs": shs, "raw": raw}
-
-    def _run_fallback(self) -> dict:
-        """Fallback path: generate synthetic 3DGS when hy3dgen is unavailable."""
-        N = self.cfg.hy3d.num_sample_points
-        results = {}
-        for gs_name, n_pts in [("G_o", N), ("G_h", N)]:
-            gs = self._generate_synthetic_gs(gs_name, n_pts)
-            self._save_gaussians(gs, gs_name)
-            results[gs_name] = gs
-
-        combined_path = os.path.join(self.output_dir, "gs_init_combined.pt")
-        torch.save({
-            "G_o": results["G_o"], "G_h": results["G_h"],
-            "config": {"model": "synthetic_fallback", "num_sample_points": N},
-        }, combined_path)
-        print(f"[Step3] Combined output → {combined_path}")
-
-        if self.cfg.run_alignment:
-            self._run_alignment()
-
-        print("[Step3] Done (fallback mode).")
-        return results
-
     def run(self):
         """Execute the full Step 3 pipeline for both human and object branches."""
         print("=" * 60)
@@ -297,19 +247,26 @@ class Step3Pipeline:
         # Load model
         self._load_pipeline()
 
-        # Fallback: generate synthetic 3DGS when hy3dgen is unavailable
-        if self._pipeline == "FALLBACK":
-            return self._run_fallback()
-
         results = {}
         for branch, gs_name in [
             ("object_amodal", "G_o"),
             ("human_amodal", "G_h"),
         ]:
+            gs_path = os.path.join(self.output_dir, f"{gs_name}.pt")
+            if os.path.isfile(gs_path):
+                print(f"\n--- Reusing existing {gs_name} from {gs_path} ---")
+                results[gs_name] = torch.load(gs_path, map_location="cpu", weights_only=False)
+                continue
+
             print(f"\n--- Processing {branch} → {gs_name} ---")
 
             # 1. Select best frame from amodal completion
             frames_dir = os.path.join(self.amodal_dir, branch, "frames")
+            if not os.path.isdir(frames_dir):
+                raise FileNotFoundError(
+                    f"[Step3] Missing {branch} frames under {frames_dir}. "
+                    "Run Step 2 first or provide the expected amodal outputs."
+                )
             frame_path = self._select_frame(frames_dir)
 
             # 2. Prepare image
@@ -354,13 +311,25 @@ class Step3Pipeline:
         from pipeline.metric_alignment_bridge import MetricAlignmentBridge
 
         print("\n--- Running Metric Alignment Bridge ---")
+        aligned_output_subdir = (
+            "gs_aligned" if self.cfg.output_subdir == "gs_init"
+            else self.cfg.output_subdir + "_aligned"
+        )
         align_cfg = AlignmentPipelineConfig(
             input_dir=self.cfg.input_dir,
             video_name=self.cfg.video_name,
             processed_subdir=self.cfg.processed_subdir,
             gs_init_subdir=self.cfg.output_subdir,
-            output_subdir=self.cfg.output_subdir + "_aligned",
+            output_subdir=aligned_output_subdir,
+            image_height=self.cfg.image_height,
+            image_width=self.cfg.image_width,
+            focal=self.cfg.focal,
+            frame_selection=self.cfg.frame_selection,
         )
+        if self.cfg.alignment:
+            for key, value in self.cfg.alignment.items():
+                if hasattr(align_cfg.alignment, key):
+                    setattr(align_cfg.alignment, key, value)
         # Handle BEHAVE path
         if not os.path.isdir(os.path.join(self.cfg.input_dir, self.cfg.video_name)):
             seq_path = os.path.join(self.cfg.input_dir, "sequences")

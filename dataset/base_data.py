@@ -43,12 +43,15 @@ class BaseDataset(Dataset):
         return bmax, bmin, crop_center, crop_size
 
     def is_behave_dataset(self, image_width):
-        assert image_width in [2048, 1920, 1024, 960], f'unknwon image width {image_width}!'
-        if image_width in [2048, 1024]:
-            is_behave = True
+        # Support downsampled sizes: BEHAVE 2048→1024→512→256, InterCap 1920→960→480→240
+        behave_widths = {2048 // (2**i) for i in range(4)}
+        icap_widths = {1920 // (2**i) for i in range(4)}
+        if image_width in behave_widths:
+            return True
+        elif image_width in icap_widths:
+            return False
         else:
-            is_behave = False
-        return is_behave
+            return True  # default to BEHAVE
 
     def compute_K_roi(self, bbox_square,
                       image_width=2048,

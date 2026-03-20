@@ -1,8 +1,4 @@
-"""
-UniDepth V2 metric depth estimator wrapper.
-
-Falls back to inverse-distance stub if UniDepth is unavailable.
-"""
+"""UniDepth V2 metric depth estimator wrapper."""
 from __future__ import annotations
 
 import os
@@ -24,13 +20,20 @@ class UniDepthEstimator:
 
     def _load(self, model_dir: str, backbone: str):
         try:
+            import os as _os
+            # Force offline mode — weights already cached locally, skip HF hub checks
+            _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
             from unidepth.models import UniDepthV2
-            # Use HuggingFace model ID (weights auto-downloaded & cached)
             hf_name = f"lpiccinelli/unidepth-v2-{backbone}"
             self._model = UniDepthV2.from_pretrained(hf_name).to(self.device).eval()
-            print(f"[UniDepth] Loaded model from {hf_name}")
+            print(f"[UniDepth] Loaded model from {hf_name} (offline)")
         except Exception as e:
-            print(f"[UniDepth] Could not load: {e}. Using stub.")
+            raise RuntimeError(
+                f"[UniDepth] Failed to load model `{backbone}`. "
+                "Step 1 cannot continue without metric depth."
+            ) from e
 
     def predict(self, frame_bgr: np.ndarray) -> np.ndarray:
         """
@@ -39,7 +42,7 @@ class UniDepthEstimator:
         Returns depth map (H, W) float32 in meters.
         """
         if self._model is None:
-            return self._predict_stub(frame_bgr)
+            raise RuntimeError("UniDepth model is unavailable.")
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         img_t = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
@@ -59,11 +62,3 @@ class UniDepthEstimator:
         from tqdm import tqdm
         depths = [self.predict(f) for f in tqdm(frames, desc="UniDepth")]
         return np.stack(depths, axis=0)
-
-    @staticmethod
-    def _predict_stub(frame_bgr: np.ndarray) -> np.ndarray:
-        """Return a synthetic depth map (linear gradient, 1-5m range)."""
-        H, W = frame_bgr.shape[:2]
-        depth = np.linspace(1.0, 5.0, H, dtype=np.float32)
-        depth = np.tile(depth[:, None], (1, W))
-        return depth

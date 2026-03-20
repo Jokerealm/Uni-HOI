@@ -4,8 +4,6 @@ SAM 3 wrapper: text-prompted 2D segmentation + video tracking.
 Uses the HuggingFace transformers API:
   - Sam3Model / Sam3Processor for per-image text-prompted segmentation
   - Sam3VideoModel / Sam3VideoProcessor for video-level tracking
-
-Falls back to stub masks if the model is unavailable.
 """
 from __future__ import annotations
 
@@ -54,7 +52,10 @@ class SAM3Segmenter:
             )
             print("[SAM3] Loaded image + video models.")
         except Exception as e:
-            print(f"[SAM3] Could not load models: {e}. Using stub fallback.")
+            raise RuntimeError(
+                f"[SAM3] Failed to load SAM3 models from {model_dir}. "
+                "Step 1 cannot continue without a real segmenter."
+            ) from e
 
     # ------------------------------------------------------------------
     # Public API
@@ -73,7 +74,7 @@ class SAM3Segmenter:
         Returns dict mapping prompt text -> binary mask (H, W) uint8 {0, 255}.
         """
         if self._image_model is None:
-            return self._segment_first_frame_stub(frame_bgr, text_prompts)
+            raise RuntimeError("SAM3 image model is unavailable.")
 
         from PIL import Image as PILImage
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -112,7 +113,7 @@ class SAM3Segmenter:
         Returns dict mapping prompt text -> list of (H, W) uint8 masks.
         """
         if self._video_model is None:
-            return self._track_video_stub(frames, text_prompts)
+            raise RuntimeError("SAM3 video model is unavailable.")
 
         from PIL import Image as PILImage
         H, W = frames[0].shape[:2]
@@ -156,43 +157,4 @@ class SAM3Segmenter:
             blank = np.zeros((H, W), dtype=np.uint8)
             result[prompt] = [m if m is not None else blank for m in result[prompt]]
 
-        return result
-
-    # ------------------------------------------------------------------
-    # Stubs
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _segment_first_frame_stub(
-        frame_bgr: np.ndarray, text_prompts: List[str]
-    ) -> dict:
-        H, W = frame_bgr.shape[:2]
-        result = {}
-        for i, prompt in enumerate(text_prompts):
-            mask = np.zeros((H, W), dtype=np.uint8)
-            if "human" in prompt.lower():
-                mask[H // 4: 3 * H // 4, W // 8: 3 * W // 8] = 255
-            else:
-                mask[H // 4: 3 * H // 4, 5 * W // 8: 7 * W // 8] = 255
-            result[prompt] = mask
-        print("[SAM3-stub] Generated dummy first-frame masks.")
-        return result
-
-    @staticmethod
-    def _track_video_stub(
-        frames: List[np.ndarray], text_prompts: List[str]
-    ) -> dict:
-        H, W = frames[0].shape[:2]
-        result = {}
-        for prompt in text_prompts:
-            masks = []
-            for _ in frames:
-                m = np.zeros((H, W), dtype=np.uint8)
-                if "human" in prompt.lower():
-                    m[H // 4: 3 * H // 4, W // 8: 3 * W // 8] = 255
-                else:
-                    m[H // 4: 3 * H // 4, 5 * W // 8: 7 * W // 8] = 255
-                masks.append(m)
-            result[prompt] = masks
-        print("[SAM3-stub] Generated dummy video tracking masks.")
         return result

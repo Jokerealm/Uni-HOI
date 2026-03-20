@@ -13,7 +13,11 @@ class DataPrepConfig:
     video_name: str = "test_video"
     output_subdir: str = "processed"
     max_frames: Optional[int] = None
+    behave_cam_id: int = 1
     device: str = "cuda"
+    scale_ratio: int = 2
+    bbox_expand: float = 1.1
+    crop_size: Tuple[int, int] = (256, 256)
 
 
 @dataclass

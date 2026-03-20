@@ -1,8 +1,4 @@
-"""
-OpenPose 2D keypoint detector wrapper.
-
-Falls back to stub keypoints if OpenPose is unavailable.
-"""
+"""OpenPose 2D keypoint detector wrapper."""
 from __future__ import annotations
 
 import os
@@ -40,9 +36,13 @@ class OpenPoseDetector:
                     self._net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
                 print("[OpenPose] Loaded Caffe model.")
             except Exception as e:
-                print(f"[OpenPose] Failed to load: {e}. Using stub.")
+                raise RuntimeError(
+                    f"[OpenPose] Failed to load model from {model_dir}."
+                ) from e
         else:
-            print(f"[OpenPose] Weights not found in {model_dir}. Using stub.")
+            raise FileNotFoundError(
+                f"[OpenPose] Missing Caffe weights under {model_dir}."
+            )
 
     def detect(self, frame_bgr: np.ndarray) -> np.ndarray:
         """
@@ -53,7 +53,7 @@ class OpenPoseDetector:
         keypoints : np.ndarray, shape (18, 3) — (x, y, confidence)
         """
         if self._net is None:
-            return self._detect_stub(frame_bgr)
+            raise RuntimeError("OpenPose network is unavailable.")
 
         H, W = frame_bgr.shape[:2]
         inp_h = 368
@@ -86,22 +86,3 @@ class OpenPoseDetector:
         from tqdm import tqdm
         kps = [self.detect(f) for f in tqdm(frames, desc="OpenPose")]
         return np.stack(kps, axis=0)
-
-    @staticmethod
-    def _detect_stub(frame_bgr: np.ndarray) -> np.ndarray:
-        """Return dummy keypoints at image center."""
-        H, W = frame_bgr.shape[:2]
-        cx, cy = W // 2, H // 2
-        kps = np.zeros((18, 3), dtype=np.float32)
-        # Place keypoints in a rough body layout around center
-        offsets = [
-            (0, -80), (0, -60),                          # nose, neck
-            (-30, -50), (-50, -20), (-60, 10),            # r_shoulder..r_wrist
-            (30, -50), (50, -20), (60, 10),               # l_shoulder..l_wrist
-            (-20, 20), (-20, 60), (-20, 100),             # r_hip..r_ankle
-            (20, 20), (20, 60), (20, 100),                # l_hip..l_ankle
-            (-10, -90), (10, -90), (-20, -85), (20, -85), # eyes, ears
-        ]
-        for i, (dx, dy) in enumerate(offsets):
-            kps[i] = [cx + dx, cy + dy, 0.5]
-        return kps

@@ -7,6 +7,7 @@ Uses ProPainter to inpaint occluded regions, producing:
 """
 import os
 import sys
+import glob
 import cv2
 import numpy as np
 import imageio
@@ -27,6 +28,8 @@ from model.propainter import InpaintGenerator
 from core.utils import to_tensors
 
 from configs.step2_config import Step2PipelineConfig
+from pipeline.io_utils import save_masks_png
+from pipeline.behave_gt_loader import load_behave_sequence
 
 
 class Step2Pipeline:
@@ -37,16 +40,58 @@ class Step2Pipeline:
         self.device = torch.device(cfg.device)
 
         # Resolve paths
-        self.frames_dir = os.path.join(cfg.input_dir, cfg.video_name, "frames")
-        self.masks_human_dir = os.path.join(cfg.input_dir, cfg.video_name, cfg.processed_subdir, "masks_human")
-        self.masks_object_dir = os.path.join(cfg.input_dir, cfg.video_name, cfg.processed_subdir, "masks_object")
-        self.output_dir = os.path.join(cfg.input_dir, cfg.video_name, cfg.output_subdir)
+        self.video_dir = os.path.join(cfg.input_dir, cfg.video_name)
+        self.frames_dir = os.path.join(self.video_dir, "frames")
+        self.processed_dir = os.path.join(self.video_dir, cfg.processed_subdir)
+        self.masks_human_dir = os.path.join(self.processed_dir, "masks_human")
+        self.masks_object_dir = os.path.join(self.processed_dir, "masks_object")
+        self.output_dir = os.path.join(self.video_dir, cfg.output_subdir)
         os.makedirs(self.output_dir, exist_ok=True)
+        self.is_behave = bool(glob.glob(os.path.join(self.video_dir, "t*.000")))
 
         self.use_half = cfg.propainter.fp16 and self.device.type != "cpu"
 
+        self._prepare_inputs()
+
         # Load models once
         self._load_models()
+
+    def _prepare_inputs(self):
+        """Materialize the exact frame/mask inputs used by Step 2."""
+        if not self.is_behave:
+            return
+
+        gt = load_behave_sequence(
+            self.video_dir,
+            cam_id=self.cfg.behave_cam_id,
+            max_frames=self.cfg.max_frames,
+        )
+        frames = gt["frames"]
+        masks_human = gt["masks_human"]
+        masks_object = gt["masks_object"]
+
+        os.makedirs(self.frames_dir, exist_ok=True)
+        os.makedirs(self.masks_human_dir, exist_ok=True)
+        os.makedirs(self.masks_object_dir, exist_ok=True)
+
+        for pattern in ("frame_*.png",):
+            for path in glob.glob(os.path.join(self.frames_dir, pattern)):
+                os.remove(path)
+        for pattern in ("human_*.png",):
+            for path in glob.glob(os.path.join(self.masks_human_dir, pattern)):
+                os.remove(path)
+        for pattern in ("object_*.png",):
+            for path in glob.glob(os.path.join(self.masks_object_dir, pattern)):
+                os.remove(path)
+
+        for idx, frame in enumerate(frames):
+            cv2.imwrite(os.path.join(self.frames_dir, f"frame_{idx:06d}.png"), frame)
+        save_masks_png(masks_human, self.masks_human_dir, "human")
+        save_masks_png(masks_object, self.masks_object_dir, "object")
+        print(
+            f"[Step2] Synced BEHAVE GT inputs from {self.video_dir} "
+            f"(camera=k{self.cfg.behave_cam_id})"
+        )
 
     # ------------------------------------------------------------------
     # Model loading

@@ -22,6 +22,34 @@ def show_item(item: Dict):
 
 def normalize_to_zero_one(x: torch.Tensor):
     return (x - x.min()) / (x.max() - x.min())
+
+
+def normalize_xyz_by_diameter(xyz: torch.Tensor, diameter: float) -> torch.Tensor:
+    """
+    CARI4D-style XYZ normalization: scale 3D coordinates so the object
+    fits approximately within a unit sphere (radius ≈ 1).
+    
+    xyz: (..., 3) tensor of 3D coordinates
+    diameter: mesh bounding-sphere diameter (max extent)
+    returns: normalized xyz
+    """
+    if diameter < 1e-6:
+        return xyz
+    return xyz * (2.0 / diameter)
+
+
+def compute_mesh_diameter(points: torch.Tensor) -> float:
+    """
+    Compute the bounding-sphere diameter of a point cloud.
+    
+    points: (N, 3) tensor
+    returns: scalar diameter
+    """
+    if points.numel() == 0:
+        return 1.0
+    pmin = points.min(dim=0).values
+    pmax = points.max(dim=0).values
+    return float(torch.norm(pmax - pmin).item())
     
 
 def default(x, d):

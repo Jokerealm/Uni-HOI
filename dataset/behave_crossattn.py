@@ -31,6 +31,16 @@ class BehaveCrossAttnDataset(BehaveDataset):
         mask_hum, mask_obj = self.load_masks(rgb_file)
         rgb_full = cv2.imread(rgb_file)[:, :, ::-1]
         color_h, color_w = rgb_full.shape[:2]
+
+        # --- CARI4D-style spatial downsampling ---
+        if self.scale_ratio > 1:
+            new_w = color_w // self.scale_ratio
+            new_h = color_h // self.scale_ratio
+            rgb_full = cv2.resize(rgb_full, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            mask_hum = cv2.resize(mask_hum, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+            mask_obj = cv2.resize(mask_obj, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+            color_h, color_w = new_h, new_w
+
         if self.split == 'train' and np.random.uniform()>0.5:
             rgb_full = self.blur_image(rgb_full, self.aug_blur)
 
@@ -55,7 +65,8 @@ class BehaveCrossAttnDataset(BehaveDataset):
         if self.test_transl_type == 'estimated':
             _, _, crop_center_ho, crop_size_ho = self.get_crop_params(mask_hum, mask_obj, 1.0)
             is_behave = self.is_behave_dataset(rgb_full.shape[1])
-            transl_estimate = compute_translation(crop_center_ho, crop_size_ho, is_behave, self.std_coverage)
+            transl_estimate = compute_translation(crop_center_ho, crop_size_ho, is_behave, self.std_coverage,
+                                                  scale_ratio=self.scale_ratio)
             T_ho_scaled = transl_estimate / 7.0 * np.array([-1, -1, 1.])
             radius_ho = 0.5
             cent_ho = transl_estimate / 7.0
@@ -63,13 +74,16 @@ class BehaveCrossAttnDataset(BehaveDataset):
         elif self.test_transl_type == 'estimated-2d':
             _, _, crop_center_ho, crop_size_ho = self.get_crop_params(mask_hum, mask_obj, 1.0)
             is_behave = self.is_behave_dataset(rgb_full.shape[1])
-            assert rgb_full.shape[1] in [2048, 1920], 'the image is not normalized to BEHAVE or ICAP size!'
+            valid_widths = [2048 // self.scale_ratio, 1920 // self.scale_ratio, 2048, 1920]
+            assert rgb_full.shape[1] in valid_widths, \
+                f'unexpected image width {rgb_full.shape[1]} (scale_ratio={self.scale_ratio})'
             indices = np.indices(rgb_full.shape[:2])
             assert np.sum(mask_obj > 127) > 5, f'not enough object mask found for {rgb_file}'
             pts_h = np.stack([indices[1][mask_hum > 127], indices[0][mask_hum > 127]], -1)
             pts_o = np.stack([indices[1][mask_obj > 127], indices[0][mask_obj > 127]], -1)
             proj_cent_est = (np.mean(pts_h, 0) + np.mean(pts_o, 0)) / 2.
-            transl_estimate = compute_translation(proj_cent_est, crop_size_ho, is_behave, self.std_coverage)
+            transl_estimate = compute_translation(proj_cent_est, crop_size_ho, is_behave, self.std_coverage,
+                                                  scale_ratio=self.scale_ratio)
             T_ho_scaled = transl_estimate / 7.0 * np.array([-1, -1, 1.])
             radius_ho = 0.5
             cent_ho = transl_estimate / 7.0

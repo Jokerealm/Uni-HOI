@@ -32,6 +32,48 @@ from omegaconf import DictConfig, OmegaConf
 import torch
 import numpy as np
 
+from dataset.video_transforms import (
+    infer_camera_intrinsics,
+    resize_intrinsics_to_image,
+    resize_keypoints_to_image,
+    validate_pixel_keypoints,
+)
+
+
+def infer_se3_num_frames_from_state_dict(se3_state: dict) -> int:
+    translation = se3_state["translation"]
+    if torch.is_tensor(translation):
+        return int(translation.shape[0]) if translation.ndim == 2 else 1
+    translation = np.asarray(translation)
+    return int(translation.shape[0]) if translation.ndim == 2 else 1
+
+
+def get_se3_num_frames(se3_transform) -> int:
+    translation = getattr(se3_transform, "translation")
+    return int(translation.shape[0]) if translation.ndim == 2 else 1
+
+
+def instantiate_se3_from_state_dict(se3_state: dict, device: torch.device = None):
+    from scripts.step4_joint_optimization import SE3Transform
+
+    se3 = SE3Transform(num_frames=infer_se3_num_frames_from_state_dict(se3_state))
+    se3.load_state_dict(se3_state)
+    if device is not None:
+        se3 = se3.to(device)
+    return se3
+
+
+def transform_points_for_frame(se3_transform, xyz: torch.Tensor, frame_idx: int = 0) -> torch.Tensor:
+    num_frames = get_se3_num_frames(se3_transform)
+    if num_frames <= 1:
+        return se3_transform(xyz)
+    frame_idx = int(max(0, min(num_frames - 1, int(frame_idx))))
+    return se3_transform(xyz, frame_idx=frame_idx)
+
+
+def se3_pose_sequence_to_numpy(se3_transform) -> np.ndarray:
+    return se3_transform.pose_sequence().detach().cpu().numpy()
+
 
 # ============================================================
 # Metric Computation
@@ -164,7 +206,7 @@ def compute_all_metrics(
 def render_and_save_visualization(
     human_gs, object_gs, se3_human, se3_object,
     renderer, frames, keypoints_2d, output_dir, device,
-    focal=500.0, H=256, W=256,
+    focal=500.0, H=256, W=256, camera_params=None,
 ):
     """Generate and save visualization outputs."""
     import cv2
@@ -173,25 +215,37 @@ def render_and_save_visualization(
     os.makedirs(vis_dir, exist_ok=True)
 
     with torch.no_grad():
-        # Render each frame
-        xyz_h = se3_human(human_gs.get_xyz)
-        xyz_o = se3_object(object_gs.get_xyz)
-        xyz_all = torch.cat([xyz_h, xyz_o], 0)
         col_all = torch.cat([human_gs.get_colors, object_gs.get_colors], 0)
         opa_all = torch.cat([human_gs.get_opacity, object_gs.get_opacity], 0)
         scl_all = torch.cat([human_gs.get_scaling, object_gs.get_scaling], 0)
 
-        rendered = renderer(xyz_all, col_all, opa_all, scl_all)  # (3, H, W)
-        rendered_np = (rendered.clamp(0, 1).cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-
-        # Save rendered image
-        cv2.imwrite(
-            os.path.join(vis_dir, "rendered_final.png"),
-            cv2.cvtColor(rendered_np, cv2.COLOR_RGB2BGR),
-        )
-
-        # Overlay with GT frame
+        first_rendered_np = None
+        novel_xyz_all = None
         for i, frame_t in enumerate(frames[:3]):
+            cam = None
+            if camera_params and i < len(camera_params):
+                cam = camera_params[i]
+            if cam is None:
+                cam = {
+                    "fx": float(focal),
+                    "fy": float(focal),
+                    "cx": float(W / 2.0),
+                    "cy": float(H / 2.0),
+                }
+            if hasattr(renderer, "set_camera"):
+                renderer.set_camera(cam["fx"], cam["fy"], cam["cx"], cam["cy"])
+
+            xyz_h = transform_points_for_frame(se3_human, human_gs.get_xyz, frame_idx=i)
+            xyz_o = transform_points_for_frame(se3_object, object_gs.get_xyz, frame_idx=i)
+            xyz_all = torch.cat([xyz_h, xyz_o], 0)
+            rendered = renderer(xyz_all, col_all, opa_all, scl_all)
+            rendered_np = (
+                rendered.clamp(0, 1).cpu().permute(1, 2, 0).numpy() * 255
+            ).astype(np.uint8)
+            if first_rendered_np is None:
+                first_rendered_np = rendered_np
+                novel_xyz_all = xyz_all
+
             gt_np = (frame_t.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
             overlay = cv2.addWeighted(gt_np, 0.5, rendered_np, 0.5, 0)
 
@@ -206,8 +260,8 @@ def render_and_save_visualization(
             # Draw projected 3D contact points
             hand_xyz = xyz_h[:10]  # first few points as proxy
             z = hand_xyz[:, 2].clamp(min=0.1)
-            px = (hand_xyz[:, 0] / z * focal + W / 2).cpu().numpy().astype(int)
-            py = (hand_xyz[:, 1] / z * focal + H / 2).cpu().numpy().astype(int)
+            px = (hand_xyz[:, 0] / z * cam["fx"] + cam["cx"]).cpu().numpy().astype(int)
+            py = (hand_xyz[:, 1] / z * cam["fy"] + cam["cy"]).cpu().numpy().astype(int)
             for x, y in zip(px, py):
                 if 0 <= x < W and 0 <= y < H:
                     cv2.circle(overlay, (x, y), 4, (255, 0, 0), -1)
@@ -217,25 +271,158 @@ def render_and_save_visualization(
                 cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR),
             )
 
-        # Novel view rendering (rotate camera)
-        for angle_deg in [0, 45, 90, 135]:
-            angle_rad = np.radians(angle_deg)
-            cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
-            R = torch.tensor([
-                [cos_a, 0, sin_a],
-                [0, 1, 0],
-                [-sin_a, 0, cos_a],
-            ], dtype=torch.float32, device=device)
-
-            xyz_rotated = xyz_all @ R.T
-            rendered_nv = renderer(xyz_rotated, col_all, opa_all, scl_all)
-            nv_np = (rendered_nv.clamp(0, 1).cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        if first_rendered_np is not None:
             cv2.imwrite(
-                os.path.join(vis_dir, f"novel_view_{angle_deg:03d}deg.png"),
-                cv2.cvtColor(nv_np, cv2.COLOR_RGB2BGR),
+                os.path.join(vis_dir, "rendered_final.png"),
+                cv2.cvtColor(first_rendered_np, cv2.COLOR_RGB2BGR),
             )
 
+        # Novel view rendering (rotate camera)
+        cam0 = camera_params[0] if camera_params else None
+        if cam0 is None:
+            cam0 = {
+                "fx": float(focal),
+                "fy": float(focal),
+                "cx": float(W / 2.0),
+                "cy": float(H / 2.0),
+            }
+        if hasattr(renderer, "set_camera"):
+            renderer.set_camera(cam0["fx"], cam0["fy"], cam0["cx"], cam0["cy"])
+        if novel_xyz_all is not None:
+            for angle_deg in [0, 45, 90, 135]:
+                angle_rad = np.radians(angle_deg)
+                cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+                R = torch.tensor([
+                    [cos_a, 0, sin_a],
+                    [0, 1, 0],
+                    [-sin_a, 0, cos_a],
+                ], dtype=torch.float32, device=device)
+
+                xyz_rotated = novel_xyz_all @ R.T
+                rendered_nv = renderer(xyz_rotated, col_all, opa_all, scl_all)
+                nv_np = (rendered_nv.clamp(0, 1).cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                cv2.imwrite(
+                    os.path.join(vis_dir, f"novel_view_{angle_deg:03d}deg.png"),
+                    cv2.cvtColor(nv_np, cv2.COLOR_RGB2BGR),
+                )
+
     print(f"[Test] Visualizations saved to {vis_dir}")
+
+
+def load_visualization_inputs(
+    base_dir: str,
+    processed_dir: str,
+    H: int,
+    W: int,
+    device: torch.device,
+    is_behave: bool = False,
+    max_frames: int = 5,
+    default_focal: float = 500.0,
+):
+    """Load visualization frames, keypoints, and per-frame camera intrinsics."""
+    import cv2
+
+    cropped_dir = os.path.join(processed_dir, "cropped")
+    cropped_rgb_dir = os.path.join(cropped_dir, "rgb")
+    use_cropped = os.path.isdir(cropped_rgb_dir)
+
+    frame_paths = []
+    if use_cropped:
+        frame_paths = sorted(
+            glob.glob(os.path.join(cropped_rgb_dir, "*.png"))
+            + glob.glob(os.path.join(cropped_rgb_dir, "*.jpg"))
+        )
+    else:
+        frames_dir = os.path.join(base_dir, "frames")
+        if is_behave and not os.path.isdir(frames_dir):
+            from dataset.behave_paths import DataPaths
+
+            frame_paths = DataPaths.get_image_paths_seq(base_dir, tid=1)
+            if not frame_paths:
+                for cid in [0, 2, 3]:
+                    frame_paths = DataPaths.get_image_paths_seq(base_dir, tid=cid)
+                    if frame_paths:
+                        break
+        else:
+            frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
+            if not frame_paths:
+                frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+
+    frames = []
+    frame_sizes_hw = []
+    for p in frame_paths[:max_frames]:
+        img = cv2.imread(p)
+        if img is None:
+            continue
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        frame_sizes_hw.append(tuple(int(v) for v in img.shape[:2]))
+        if img.shape[:2] != (H, W):
+            img = cv2.resize(img, (W, H))
+        frames.append(torch.from_numpy(img).float().permute(2, 0, 1).div(255.0).to(device))
+
+    kp_data = []
+    kp_path = os.path.join(processed_dir, "keypoints_2d.npz")
+    cropped_kp_path = os.path.join(cropped_dir, "keypoints_2d.npz")
+    if use_cropped and os.path.isfile(cropped_kp_path):
+        kp_path = cropped_kp_path
+    if os.path.isfile(kp_path):
+        kps = np.load(kp_path)["keypoints"]
+        for i in range(min(kps.shape[0], len(frames), max_frames)):
+            kp_np = np.asarray(kps[i], dtype=np.float32)
+            if use_cropped:
+                kp_np = validate_pixel_keypoints(
+                    kp_np,
+                    image_size_hw=(H, W),
+                    context=f"{kp_path} frame {i}",
+                )
+            else:
+                kp_np = resize_keypoints_to_image(
+                    kp_np,
+                    src_size_hw=frame_sizes_hw[i],
+                    dst_size_hw=(H, W),
+                    context=f"{kp_path} frame {i}",
+                )
+            kp_data.append(torch.from_numpy(kp_np[:, :2]).float().to(device))
+
+    camera_params = []
+    meta_path = os.path.join(cropped_dir, "meta.npz")
+    if use_cropped and os.path.isfile(meta_path):
+        meta = np.load(meta_path)
+        for i in range(min(len(frames), len(meta["fx"]))):
+            camera_params.append({
+                "fx": float(meta["fx"][i]),
+                "fy": float(meta["fy"][i]),
+                "cx": float(meta["cx"][i]),
+                "cy": float(meta["cy"][i]),
+            })
+    else:
+        for src_h, src_w in frame_sizes_hw:
+            fx_src, fy_src, cx_src, cy_src = infer_camera_intrinsics(
+                image_width=src_w,
+                image_height=src_h,
+                scale_ratio=1,
+            )
+            fx_dst, fy_dst, cx_dst, cy_dst = resize_intrinsics_to_image(
+                fx_src, fy_src, cx_src, cy_src,
+                src_size_hw=(src_h, src_w),
+                dst_size_hw=(H, W),
+            )
+            camera_params.append({
+                "fx": float(fx_dst),
+                "fy": float(fy_dst),
+                "cx": float(cx_dst),
+                "cy": float(cy_dst),
+            })
+
+    while len(camera_params) < len(frames):
+        camera_params.append({
+            "fx": float(default_focal),
+            "fy": float(default_focal),
+            "cx": float(W / 2.0),
+            "cy": float(H / 2.0),
+        })
+
+    return frames, kp_data, camera_params
 
 
 # ============================================================
@@ -283,15 +470,15 @@ def main(cfg: DictConfig):
     print("  HDM / Uni-HOI — Evaluation & Metrics (Step 5)")
     print("=" * 60)
 
-    # Resolve dataset shorthand
-    if cfg.get("dataset") == "sample":
+    # Resolve dataset shorthand, but preserve explicit custom input_dir overrides.
+    if cfg.get("dataset") == "sample" and cfg.data_prep.input_dir in {"./sample_data", "sample_data"}:
         from omegaconf import open_dict
         with open_dict(cfg):
             cfg.data_prep.input_dir = "./sample_data"
-    elif cfg.get("dataset") == "behave":
+    elif cfg.get("dataset") == "behave" and cfg.data_prep.input_dir in {"./sample_data", "sample_data"}:
         from omegaconf import open_dict
         with open_dict(cfg):
-            cfg.data_prep.input_dir = "/data4/guanz/data/Behave"
+            cfg.data_prep.input_dir = "/data4/guanz/data/Behave/sequences"
 
     device = torch.device(cfg.data_prep.device if torch.cuda.is_available() else "cpu")
     print(f"[Test] Device: {device}")
@@ -306,6 +493,7 @@ def main(cfg: DictConfig):
     base_dir = os.path.join(input_dir, video_name)
     processed_dir = os.path.join(base_dir, cfg.data_prep.output_subdir)
     gs_init_dir = os.path.join(base_dir, cfg.get("step3", {}).get("output_subdir", "gs_init"))
+    is_behave = bool(glob.glob(os.path.join(base_dir, "t*.000")))
 
     H = cfg.step4.image_height
     W = cfg.step4.image_width
@@ -330,12 +518,10 @@ def main(cfg: DictConfig):
         human_gs.load_state_dict(ckpt["human_gs"])
         object_gs.load_state_dict(ckpt["object_gs"])
 
-        se3_human = SE3Transform()
-        se3_object = SE3Transform()
-        se3_human.load_state_dict(ckpt["se3_human"])
-        se3_object.load_state_dict(ckpt["se3_object"])
+        se3_human = instantiate_se3_from_state_dict(ckpt["se3_human"])
+        se3_object = instantiate_se3_from_state_dict(ckpt["se3_object"])
 
-        print(f"[Test] Loaded: Human {n_h} pts, Object {n_o} pts, epoch {ckpt.get('epoch', '?')}")
+        print(f"[Test] Loaded: Human {n_h} pts, Object {n_o} pts, step {ckpt.get('step', ckpt.get('epoch', '?'))}")
     else:
         print("[Test] No checkpoint found, loading from GS init (Step 3 output)")
         combined_path = os.path.join(gs_init_dir, "gs_init_combined.pt")
@@ -370,8 +556,8 @@ def main(cfg: DictConfig):
 
     # --- Compute 3D point clouds in world space ---
     with torch.no_grad():
-        xyz_h_world = se3_human(human_gs.get_xyz).cpu().numpy()
-        xyz_o_world = se3_object(object_gs.get_xyz).cpu().numpy()
+        xyz_h_world = transform_points_for_frame(se3_human, human_gs.get_xyz, frame_idx=0).cpu().numpy()
+        xyz_o_world = transform_points_for_frame(se3_object, object_gs.get_xyz, frame_idx=0).cpu().numpy()
 
     print(f"\n[Test] Human points: {xyz_h_world.shape}")
     print(f"[Test] Object points: {xyz_o_world.shape}")
@@ -400,16 +586,11 @@ def main(cfg: DictConfig):
             human_joints_seq = sp["joints_3d"]  # (T, J, 3)
             print(f"[Test] Human joints sequence: {human_joints_seq.shape}")
 
-    # Build object pose sequence from SE(3) params
-    with torch.no_grad():
-        obj_pose = torch.cat([
-            se3_object.axis_angle, se3_object.translation
-        ]).cpu().numpy()
-    # For sample data with few frames, replicate to simulate sequence
-    num_frames_data = 3  # from sample_data
-    object_pose_seq = np.tile(obj_pose, (num_frames_data, 1))
-    # Add small noise to simulate temporal variation
-    object_pose_seq += np.random.randn(*object_pose_seq.shape) * 0.001
+    if get_se3_num_frames(se3_object) >= 3:
+        object_pose_seq = se3_pose_sequence_to_numpy(se3_object)
+        print(f"[Test] Object pose trajectory: {object_pose_seq.shape}")
+    else:
+        print("[Test] Acc-o skipped: checkpoint does not contain a per-frame object pose trajectory.")
 
     # --- Compute metrics ---
     print("\n[Test] Computing metrics...")
@@ -454,30 +635,22 @@ def main(cfg: DictConfig):
 
     # --- Visualization ---
     print("\n[Test] Generating visualizations...")
-    import cv2
-    frames = []
-    frames_dir = os.path.join(base_dir, "frames")
-    frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
-    if not frame_paths:
-        frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
-    for p in frame_paths:
-        img = cv2.imread(p)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (W, H))
-        t = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
-        frames.append(t.to(device))
-
-    kp_data = []
-    kp_path = os.path.join(processed_dir, "keypoints_2d.npz")
-    if os.path.isfile(kp_path):
-        kps = np.load(kp_path)["keypoints"]
-        for i in range(kps.shape[0]):
-            kp_data.append(torch.from_numpy(kps[i, :, :2]).float().to(device))
+    frames, kp_data, camera_params = load_visualization_inputs(
+        base_dir=base_dir,
+        processed_dir=processed_dir,
+        H=H,
+        W=W,
+        device=device,
+        is_behave=is_behave,
+        max_frames=5,
+        default_focal=float(cfg.step4.focal),
+    )
 
     render_and_save_visualization(
         human_gs, object_gs, se3_human, se3_object,
         renderer, frames, kp_data, output_dir, device,
         focal=cfg.step4.focal, H=H, W=W,
+        camera_params=camera_params,
     )
 
     # --- Save Hydra config ---

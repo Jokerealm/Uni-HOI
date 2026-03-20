@@ -169,7 +169,9 @@ def get_dataset(cfg: ProjectConfig):
                                   aug_blur=cfg.dataset.aug_blur,
                                   std_coverage=cfg.dataset.std_coverage,
                                    behave_path=dataset_cfg.behave_dir,
-                                   procigen_path=dataset_cfg.procigen_dir)
+                                   procigen_path=dataset_cfg.procigen_dir,
+                                   scale_ratio=dataset_cfg.scale_ratio,
+                                   bbox_expand=dataset_cfg.bbox_expand)
         # we do cross validation, the validation set is a random subset of full test set
         dataset_val = val_datatype(val_paths, dataset_cfg.max_points, dataset_cfg.fix_sample,
                                       (dataset_cfg.image_size, dataset_cfg.image_size),
@@ -183,7 +185,9 @@ def get_dataset(cfg: ProjectConfig):
                                    sep_same_crop=cfg.dataset.sep_same_crop,
                                    std_coverage=cfg.dataset.std_coverage,
                                    behave_path=dataset_cfg.behave_dir,
-                                   procigen_path=dataset_cfg.procigen_dir
+                                   procigen_path=dataset_cfg.procigen_dir,
+                                   scale_ratio=dataset_cfg.scale_ratio,
+                                   bbox_expand=dataset_cfg.bbox_expand
                                    )
         dataloader_train = DataLoader(dataset_train, batch_size=cfg.dataloader.batch_size,
                                       collate_fn=collate_batched_meshes,
@@ -228,7 +232,7 @@ def get_dataset(cfg: ProjectConfig):
                                     num_workers=cfg.dataloader.num_workers, shuffle=shuffle)
     elif cfg.dataset.type == 'preprocessed':
         # ---------------------------------------------------------------
-        # Pure file-read DataLoader for preprocess.py outputs.
+        # Pure file-read DataLoader for Step 1 outputs from `main.py`.
         # No model inference in __getitem__ — only reads .png / .npz.
         # ---------------------------------------------------------------
         from .preprocessed_dataset import PreprocessedDataset

@@ -74,7 +74,7 @@ def masks2bbox(masks, threshold=127):
     return bmin, bmax
 
 
-def compute_translation(crop_center, crop_size, is_behave=True, std_coverage=3.5):
+def compute_translation(crop_center, crop_size, is_behave=True, std_coverage=3.5, scale_ratio=1):
     """
     solve for an optimal translation that project gaussian in origin to the crop
     Parameters
@@ -82,6 +82,7 @@ def compute_translation(crop_center, crop_size, is_behave=True, std_coverage=3.5
     crop_center: (x, y) of the crop center
     crop_size: float, the size of the square crop
     std_coverage: which edge point should be projected back to the edge of the 2d crop
+    scale_ratio: CARI4D-style spatial downsampling factor applied to the image
 
     Returns
     -------
@@ -92,16 +93,16 @@ def compute_translation(crop_center, crop_size, is_behave=True, std_coverage=3.5
     x1, y1 = x0 + crop_size/2, y0
     x2, y2 = x0 - crop_size/2, y0
     x3, y3 = x0, y0 + crop_size/2.
-    # predefined kinect intrinsics
+    # predefined kinect intrinsics, scaled by downsampling factor
     if is_behave:
-        fx = 979.7844
-        fy = 979.840
-        cx = 1018.952
-        cy = 779.486
+        fx = 979.7844 / scale_ratio
+        fy = 979.840 / scale_ratio
+        cx = 1018.952 / scale_ratio
+        cy = 779.486 / scale_ratio
     else:
         # intercap camera
-        fx, fy = 918.457763671875, 918.4373779296875
-        cx, cy = 956.9661865234375, 555.944580078125
+        fx, fy = 918.457763671875 / scale_ratio, 918.4373779296875 / scale_ratio
+        cx, cy = 956.9661865234375 / scale_ratio, 555.944580078125 / scale_ratio
 
     # Construct the matrix
     # First two equations: origin (0, 0, 0) is projected to the crop center

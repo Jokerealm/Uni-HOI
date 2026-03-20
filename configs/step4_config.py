@@ -61,7 +61,7 @@ class PenetrationLossConfig:
 
 @dataclass
 class TemporalSmoothnessConfig:
-    """Acceleration-based temporal smoothness on object pose."""
+    """Acceleration-based temporal smoothness on framewise SE(3) trajectories."""
     enabled: bool = True
     lambda_acc: float = 0.5
 
