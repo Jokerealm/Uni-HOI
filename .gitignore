@@ -166,16 +166,6 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-outputs/
-results/
-docs/
-logs/
-preprocessed/
-wandb/
-tmp/
-diff-gaussian-rasterization/
-sample_data/
-
 # Large model weights (use separate storage/LFS for these)
 *.pth
 *.ckpt
@@ -189,3 +179,15 @@ model/smpl_models/
 unidepth/ops/*/build/
 unidepth/ops/*/dist/
 unidepth/ops/*/*.egg-info/
+
+
+outputs/
+results/
+docs/
+logs/
+preprocessed/
+wandb/
+tmp/
+diff-gaussian-rasterization/
+sample_data/
+Uni-HOI/

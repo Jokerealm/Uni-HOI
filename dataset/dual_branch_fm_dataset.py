@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import pickle
+import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -108,6 +109,65 @@ def _resolve_joint_targets_from_smpl_params(smpl_params: Dict[str, np.ndarray], 
     return joints
 
 
+def _expand_fallback_vector(vector: Tensor, fallback: Sequence[float]) -> Tensor:
+    fallback_t = torch.as_tensor(fallback, dtype=vector.dtype, device=vector.device)
+    while fallback_t.ndim < vector.ndim:
+        fallback_t = fallback_t.unsqueeze(0)
+    return fallback_t.expand_as(vector)
+
+
+def _safe_normalize(vector: Tensor, fallback: Sequence[float]) -> Tensor:
+    norm = torch.linalg.norm(vector, dim=-1, keepdim=True)
+    normalized = vector / norm.clamp(min=1e-6)
+    return torch.where(norm > 1e-6, normalized, _expand_fallback_vector(vector, fallback))
+
+
+def _canonicalize_vertices_with_body_frame(vertices: Tensor, joints_3d: Tensor) -> Tensor:
+    if vertices.ndim != 3 or vertices.shape[-1] != 3:
+        raise ValueError(f"`vertices` must have shape [T, V, 3], got {tuple(vertices.shape)}.")
+    if joints_3d.ndim != 3 or joints_3d.shape[-1] != 3:
+        raise ValueError(f"`joints_3d` must have shape [T, J, 3], got {tuple(joints_3d.shape)}.")
+    if vertices.shape[0] != joints_3d.shape[0]:
+        raise ValueError(
+            f"`vertices` and `joints_3d` must share the same frame count, got {vertices.shape[0]} and {joints_3d.shape[0]}."
+        )
+
+    root = joints_3d[:, 0]
+    if joints_3d.shape[1] >= 3:
+        hip_center = 0.5 * (joints_3d[:, 1] + joints_3d[:, 2])
+        lateral = joints_3d[:, 2] - joints_3d[:, 1]
+    else:
+        hip_center = root
+        lateral = root.new_zeros(root.shape)
+
+    if joints_3d.shape[1] >= 18:
+        shoulder_center = 0.5 * (joints_3d[:, 16] + joints_3d[:, 17])
+        torso_up = shoulder_center - hip_center
+    elif joints_3d.shape[1] >= 4:
+        torso_up = joints_3d[:, 3] - root
+    else:
+        torso_up = root.new_zeros(root.shape)
+
+    axis_x = _safe_normalize(lateral, fallback=(1.0, 0.0, 0.0))
+    axis_y_hint = _safe_normalize(torso_up, fallback=(0.0, 1.0, 0.0))
+    axis_z = _safe_normalize(torch.cross(axis_x, axis_y_hint, dim=-1), fallback=(0.0, 0.0, 1.0))
+    axis_y = _safe_normalize(torch.cross(axis_z, axis_x, dim=-1), fallback=(0.0, 1.0, 0.0))
+    axis_z = _safe_normalize(torch.cross(axis_x, axis_y, dim=-1), fallback=(0.0, 0.0, 1.0))
+    basis = torch.stack([axis_x, axis_y, axis_z], dim=-1)
+    centered = vertices - root.unsqueeze(1)
+    return torch.matmul(centered, basis)
+
+
+def _select_reference_vertices(vertices: Tensor) -> Tensor:
+    if vertices.ndim != 3 or vertices.shape[-1] != 3:
+        raise ValueError(f"`vertices` must have shape [T, V, 3], got {tuple(vertices.shape)}.")
+    if vertices.shape[0] == 1:
+        return vertices[0]
+    mean_vertices = vertices.mean(dim=0, keepdim=True)
+    distances = (vertices - mean_vertices).square().mean(dim=(1, 2))
+    return vertices[int(distances.argmin().item())]
+
+
 def _axis_angle_to_matrix(axis_angle: Tensor) -> Tensor:
     angle = torch.linalg.norm(axis_angle)
     if float(angle) < 1e-8:
@@ -139,6 +199,30 @@ def make_extrinsic_from_rotation_and_translation(rotation: np.ndarray, translati
     extrinsic[:3, :3] = rotation_t
     extrinsic[:3, 3] = translation_t
     return extrinsic
+
+
+def _project_rotations_to_so3(rotations: Tensor) -> Tensor:
+    if rotations.shape[-2:] != (3, 3):
+        raise ValueError(f"`rotations` must have shape [..., 3, 3], got {tuple(rotations.shape)}.")
+    flat = rotations.reshape(-1, 3, 3)
+    u, _, vh = torch.linalg.svd(flat)
+    projected = torch.matmul(u, vh)
+    det = torch.det(projected)
+    if bool((det < 0.0).any()):
+        correction = torch.eye(3, dtype=projected.dtype, device=projected.device).unsqueeze(0).repeat(flat.shape[0], 1, 1)
+        correction[det < 0.0, 2, 2] = -1.0
+        projected = torch.matmul(torch.matmul(u, correction), vh)
+    return projected.reshape_as(rotations)
+
+
+def _project_object_poses_to_se3(object_poses: Tensor) -> Tensor:
+    if object_poses.ndim != 3 or object_poses.shape[-2:] != (4, 4):
+        raise ValueError(f"`object_poses` must have shape [T, 4, 4], got {tuple(object_poses.shape)}.")
+    projected = object_poses.clone()
+    projected[:, :3, :3] = _project_rotations_to_so3(projected[:, :3, :3])
+    projected[:, 3, :] = 0.0
+    projected[:, 3, 3] = 1.0
+    return projected
 
 
 def _load_sequence_names_from_split_file(split_file: str, split_key: str) -> List[str]:
@@ -188,7 +272,7 @@ def load_object_pose_sequence(sequence_dir: Path, num_frames: int, processed_sub
                 f"Object pose sequence in {object_pose_path} is too short: "
                 f"{object_poses.shape[0]} < required {num_frames} frames."
             )
-        return object_poses[:num_frames]
+        return _project_object_poses_to_se3(object_poses[:num_frames])
 
     timestep_dirs = _discover_timestep_dirs(sequence_dir)
     poses: List[Tensor] = []
@@ -219,7 +303,7 @@ def load_object_pose_sequence(sequence_dir: Path, num_frames: int, processed_sub
             f"Object pose sequence for {sequence_dir} is too short: "
             f"{len(poses)} < required {num_frames} frames."
         )
-    return torch.stack(poses[:num_frames], dim=0)
+    return _project_object_poses_to_se3(torch.stack(poses[:num_frames], dim=0))
 
 
 def _assemble_raw_gaussian_tokens(payload: Dict[str, Tensor]) -> Tensor:
@@ -336,15 +420,28 @@ def _build_human_gaussians_from_smpl_params(
     vertices = np.asarray(smpl_params["vertices"], dtype=np.float32)
     faces = np.asarray(smpl_params["faces"], dtype=np.int64)
     if vertices.ndim == 3:
-        if "cam_t" in smpl_params:
-            cam_t = np.asarray(smpl_params["cam_t"], dtype=np.float32)
-            if cam_t.ndim == 2 and cam_t.shape[0] == vertices.shape[0]:
-                vertices = vertices - cam_t[:, None, :]
-        vertices = vertices.mean(axis=0)
+        vertices_t = torch.from_numpy(vertices.astype(np.float32))
+        joints_np = smpl_params.get("joints_3d", smpl_params.get("keypoints_3d"))
+        if joints_np is not None:
+            joints_t = torch.from_numpy(np.asarray(joints_np, dtype=np.float32))
+            num_frames = min(vertices_t.shape[0], joints_t.shape[0])
+            vertices_t = _canonicalize_vertices_with_body_frame(vertices_t[:num_frames], joints_t[:num_frames])
+        else:
+            num_frames = vertices_t.shape[0]
+            if "cam_t" in smpl_params:
+                cam_t = np.asarray(smpl_params["cam_t"], dtype=np.float32)
+                if cam_t.ndim == 2 and cam_t.shape[0] >= num_frames:
+                    vertices_t = vertices_t[:num_frames] - torch.from_numpy(cam_t[:num_frames]).float().unsqueeze(1)
+                else:
+                    vertices_t = vertices_t[:num_frames]
+            else:
+                vertices_t = vertices_t[:num_frames]
+        vertices_t = _select_reference_vertices(vertices_t)
     elif vertices.ndim != 2:
         raise ValueError(f"Expected SMPL vertices with shape [T, V, 3] or [V, 3], got {tuple(vertices.shape)}.")
+    else:
+        vertices_t = torch.from_numpy(vertices.astype(np.float32))
 
-    vertices_t = torch.from_numpy(vertices.astype(np.float32))
     faces_t = torch.from_numpy(faces.astype(np.int64))
     normals_t = _compute_vertex_normals(vertices_t, faces_t)
     rotations_t = _normals_to_quaternions(normals_t)
@@ -482,13 +579,6 @@ def _validate_sequence_bundle(bundle: Dict[str, object], *, num_frames: int, num
             raise ValueError(f"{name} must have shape [N, 14], got {tuple(tensor.shape)}.")
         if not torch.isfinite(tensor).all():
             raise ValueError(f"{name} contains non-finite values.")
-    contact_signature = bundle["contact_signature"]
-    if contact_signature.shape[0] != num_frames:
-        raise ValueError(
-            f"contact_signature frame count mismatch: expected {num_frames}, got {contact_signature.shape[0]}."
-        )
-    if not torch.isfinite(contact_signature).all():
-        raise ValueError("contact_signature contains non-finite values.")
 
 
 def _discover_sequence_dirs(
@@ -556,6 +646,7 @@ def _build_index_cache_path(
     processed_subdir: str,
     gs_subdir: str,
     human_gaussian_source: str,
+    max_sequences: int,
     split_file: str,
     split_key: str,
 ) -> Path:
@@ -566,6 +657,7 @@ def _build_index_cache_path(
         "processed_subdir": processed_subdir,
         "gs_subdir": gs_subdir,
         "human_gaussian_source": _normalize_human_gaussian_source(human_gaussian_source),
+        "max_sequences": int(max_sequences),
         "split_file": _path_signature(split_file) if split_file else {"path": "", "exists": False},
         "split_key": split_key,
     }
@@ -682,6 +774,7 @@ def load_dual_branch_sequence_bundle(
     hand_joint_indices: Optional[Sequence[int]] = None,
     require_gaussian_targets: bool = True,
     preload_rgb: bool = False,
+    validate_bundle: bool = False,
 ) -> Dict[str, object]:
     sequence_path = Path(sequence_dir)
     human_gaussian_source = _normalize_human_gaussian_source(human_gaussian_source)
@@ -784,21 +877,8 @@ def load_dual_branch_sequence_bundle(
         human_gaussians = _subsample_tokens(human_gaussians, num_human_gaussians)
     if object_gaussians is None:
         object_gaussians = _placeholder_gaussian_tokens(num_object_gaussians)
-        contact_signature = joints_3d.new_zeros(num_frames, contact_dim)
     else:
         object_gaussians = _subsample_tokens(object_gaussians, num_object_gaussians)
-        contact_signature = _compute_contact_signature(
-            joints_3d,
-            object_gaussians,
-            object_poses,
-            contact_dim=contact_dim,
-            hand_joint_indices=hand_joint_indices,
-        )
-    keypoint_heatmaps = _build_keypoint_heatmaps(
-        keypoints_2d,
-        height=depth.shape[-2],
-        width=depth.shape[-1],
-    )
 
     bundle = {
         "rgb_paths": rgb_paths,
@@ -810,14 +890,12 @@ def load_dual_branch_sequence_bundle(
         "depth": depth,
         "intrinsics": intrinsics,
         "keypoints_2d": keypoints_2d,
-        "keypoint_heatmaps": keypoint_heatmaps,
         "joints_3d": joints_3d,
         "body_pose": body_pose,
         "cam_t": cam_t,
         "object_poses": object_poses[:num_frames],
         "human_gaussians": human_gaussians,
         "object_gaussians": object_gaussians,
-        "contact_signature": contact_signature[:num_frames],
         "num_frames": num_frames,
         "sequence_name": sequence_path.name,
     }
@@ -826,7 +904,8 @@ def load_dual_branch_sequence_bundle(
             [load_rgb_image_uint8(str(path)) for path in rgb_paths],
             dim=0,
         )
-    _validate_sequence_bundle(bundle, num_frames=num_frames, num_joints=num_joints)
+    if validate_bundle:
+        _validate_sequence_bundle(bundle, num_frames=num_frames, num_joints=num_joints)
     return bundle
 
 
@@ -849,10 +928,12 @@ class DualBranchHOIDataset(Dataset):
         hand_joint_indices: Optional[Sequence[int]] = None,
         cache_sequences: int = 2,
         cache_rgb: bool = True,
+        rgb_cache_max_frames: int = 256,
         index_progress_every: int = 0,
         index_progress_callback: Optional[Callable[[int, int, str, int], None]] = None,
         split_file: str = "",
         split_key: str = "train",
+        validate_sequence_bundles: bool = False,
     ) -> None:
         super().__init__()
         self.clip_length = int(clip_length)
@@ -868,14 +949,17 @@ class DualBranchHOIDataset(Dataset):
         self.hand_joint_indices = tuple(hand_joint_indices or [])
         self.cache_sequences = max(int(cache_sequences), 0)
         self.cache_rgb = bool(cache_rgb)
+        self.rgb_cache_max_frames = max(int(rgb_cache_max_frames), 0)
         self.index_progress_every = max(int(index_progress_every), 0)
         self.index_progress_callback = index_progress_callback
+        self.validate_sequence_bundles = bool(validate_sequence_bundles)
         self.loaded_from_disk_cache = False
         self.index_cache_path = _build_index_cache_path(
             data_root=data_root,
             processed_subdir=processed_subdir,
             gs_subdir=gs_subdir,
             human_gaussian_source=self.human_gaussian_source,
+            max_sequences=max_sequences,
             split_file=split_file,
             split_key=split_key,
         )
@@ -883,7 +967,9 @@ class DualBranchHOIDataset(Dataset):
         if split_file:
             split_sequence_names = _load_sequence_names_from_split_file(split_file, split_key)
         self._cache: "OrderedDict[str, Dict[str, object]]" = OrderedDict()
+        self._cache_lock = threading.RLock()
         self.sequence_frame_counts: Dict[str, int] = {}
+        self.sequence_sample_indices: Dict[str, List[int]] = OrderedDict()
         self.samples: List[Tuple[str, int]] = []
         cached_payload = self._load_disk_index_cache()
         if cached_payload is not None:
@@ -966,7 +1052,9 @@ class DualBranchHOIDataset(Dataset):
     def _append_sequence_samples(self, sequence_dir: str, num_frames: int) -> None:
         if num_frames < self.clip_length:
             return
+        sample_indices = self.sequence_sample_indices.setdefault(sequence_dir, [])
         for start in range(0, num_frames - self.clip_length + 1, self.clip_stride):
+            sample_indices.append(len(self.samples))
             self.samples.append((sequence_dir, start))
 
     def _load_disk_index_cache(self) -> Optional[Dict[str, object]]:
@@ -1007,32 +1095,58 @@ class DualBranchHOIDataset(Dataset):
             return
 
     def _load_sequence_bundle(self, sequence_dir: str) -> Dict[str, object]:
-        if sequence_dir in self._cache:
-            self._cache.move_to_end(sequence_dir)
-            return self._cache[sequence_dir]
-        bundle = load_dual_branch_sequence_bundle(
-            sequence_dir,
-            processed_subdir=self.processed_subdir,
-            gs_subdir=self.gs_subdir,
-            human_gaussian_source=self.human_gaussian_source,
-            num_human_gaussians=self.num_human_gaussians,
-            num_object_gaussians=self.num_object_gaussians,
-            num_joints=self.num_joints,
-            contact_dim=self.contact_dim,
-            hand_joint_indices=self.hand_joint_indices,
-            require_gaussian_targets=True,
-            preload_rgb=self.cache_rgb and self.cache_sequences > 0,
-        )
-        if self.cache_sequences > 0:
-            self._cache[sequence_dir] = bundle
-            self._cache.move_to_end(sequence_dir)
-            while len(self._cache) > self.cache_sequences:
-                self._cache.popitem(last=False)
-        return bundle
+        with self._cache_lock:
+            if sequence_dir in self._cache:
+                self._cache.move_to_end(sequence_dir)
+                return self._cache[sequence_dir]
+            num_frames = int(self.sequence_frame_counts.get(sequence_dir, 0))
+            preload_rgb = (
+                self.cache_rgb
+                and self.cache_sequences > 0
+                and (
+                    self.rgb_cache_max_frames == 0
+                    or (num_frames > 0 and num_frames <= self.rgb_cache_max_frames)
+                )
+            )
+            bundle = load_dual_branch_sequence_bundle(
+                sequence_dir,
+                processed_subdir=self.processed_subdir,
+                gs_subdir=self.gs_subdir,
+                human_gaussian_source=self.human_gaussian_source,
+                num_human_gaussians=self.num_human_gaussians,
+                num_object_gaussians=self.num_object_gaussians,
+                num_joints=self.num_joints,
+                contact_dim=self.contact_dim,
+                hand_joint_indices=self.hand_joint_indices,
+                require_gaussian_targets=True,
+                preload_rgb=preload_rgb,
+                validate_bundle=self.validate_sequence_bundles,
+            )
+            if self.cache_sequences > 0:
+                self._cache[sequence_dir] = bundle
+                self._cache.move_to_end(sequence_dir)
+                while len(self._cache) > self.cache_sequences:
+                    self._cache.popitem(last=False)
+            return bundle
 
-    def __getitem__(self, index: int) -> Dict[str, Tensor]:
+    def get_sample_by_index(
+        self,
+        index: int,
+        *,
+        bundle: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, Tensor]:
         sequence_dir, start = self.samples[index]
-        bundle = self._load_sequence_bundle(sequence_dir)
+        return self.get_sample(sequence_dir, start, bundle=bundle)
+
+    def get_sample(
+        self,
+        sequence_dir: str,
+        start: int,
+        *,
+        bundle: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, Tensor]:
+        if bundle is None:
+            bundle = self._load_sequence_bundle(sequence_dir)
         end = start + self.clip_length
 
         if "rgb_uint8" in bundle:
@@ -1046,13 +1160,18 @@ class DualBranchHOIDataset(Dataset):
         m_object_region = bundle["m_object_region"][start:end].clone()
         depth = bundle["depth"][start:end].clone()
         keypoints_2d = bundle["keypoints_2d"][start:end].clone()
-        keypoint_heatmaps = bundle["keypoint_heatmaps"][start:end].clone()
         joints_3d = bundle["joints_3d"][start:end].clone()
         object_poses = bundle["object_poses"][start:end].clone()
         camera_intrinsics = bundle["intrinsics"][start:end].clone()
-        contact_signature = bundle["contact_signature"][start:end].clone()
         human_gaussians = bundle["human_gaussians"].clone()
         object_gaussians = bundle["object_gaussians"].clone()
+
+        keypoint_heatmaps = _build_keypoint_heatmaps(
+            keypoints_2d,
+            height=depth.shape[-2],
+            width=depth.shape[-1],
+        )
+        contact_signature = self._compute_contact_signature(joints_3d, object_gaussians, object_poses)
 
         background = torch.full_like(rgb, self.background_value)
         human_visible = rgb * masks_human + background * (1.0 - masks_human)
@@ -1076,6 +1195,9 @@ class DualBranchHOIDataset(Dataset):
             "object_gaussians": object_gaussians,
             "sequence_name": bundle["sequence_name"],
         }
+
+    def __getitem__(self, index: int) -> Dict[str, Tensor]:
+        return self.get_sample_by_index(index)
 
 
 __all__ = [

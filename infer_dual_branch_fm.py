@@ -10,10 +10,11 @@ import json
 from pathlib import Path
 from typing import Dict, Tuple
 
+import numpy as np
 import torch
 from PIL import Image
 
-from dataset.dual_branch_fm_dataset import load_dual_branch_sequence_bundle, load_rgb_image
+from dataset.dual_branch_fm_dataset import _build_keypoint_heatmaps, load_dual_branch_sequence_bundle, load_rgb_image
 from model.dual_branch_cogenerative_fm import DecodedHOIState, DualBranchCoGenerativeFlowMatching
 from train_dual_branch_fm import resize_video_batch, scale_camera_intrinsics
 from train_dual_branch_fm import build_arg_parser as build_train_arg_parser
@@ -83,7 +84,11 @@ def load_inference_clip(
     m_secondary = bundle["m_secondary"]
     m_object_region = bundle["m_object_region"]
     depth = bundle["depth"]
-    keypoint_heatmaps = bundle["keypoint_heatmaps"]
+    keypoint_heatmaps = _build_keypoint_heatmaps(
+        bundle["keypoints_2d"],
+        height=depth.shape[-2],
+        width=depth.shape[-1],
+    )
     camera_intrinsics = bundle["intrinsics"]
 
     rgb = pad_sequence(rgb, clip_length)
@@ -185,6 +190,127 @@ def save_combined_state(
     torch.save(payload, output_dir / "gs_init_combined.pt")
 
 
+def gaussian_tokens_to_xyz_rgb(tokens: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+    raw = tokens.detach().squeeze(0).cpu()
+    xyz = raw[:, 0:3].numpy()
+    rgb = raw[:, 11:14].clamp(0.0, 1.0).numpy()
+    return xyz, rgb
+
+
+def transform_points(points: np.ndarray, transform: torch.Tensor) -> np.ndarray:
+    transform_np = transform.detach().cpu().numpy()
+    points_h = np.concatenate([points, np.ones((points.shape[0], 1), dtype=points.dtype)], axis=1)
+    return (transform_np @ points_h.T).T[:, :3]
+
+
+def write_ascii_ply(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rgb_u8 = (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("ply\n")
+        handle.write("format ascii 1.0\n")
+        handle.write(f"element vertex {xyz.shape[0]}\n")
+        handle.write("property float x\n")
+        handle.write("property float y\n")
+        handle.write("property float z\n")
+        handle.write("property uchar red\n")
+        handle.write("property uchar green\n")
+        handle.write("property uchar blue\n")
+        handle.write("end_header\n")
+        for idx in range(xyz.shape[0]):
+            handle.write(
+                f"{xyz[idx, 0]:.6f} {xyz[idx, 1]:.6f} {xyz[idx, 2]:.6f} "
+                f"{int(rgb_u8[idx, 0])} {int(rgb_u8[idx, 1])} {int(rgb_u8[idx, 2])}\n"
+            )
+
+
+def export_point_cloud_visualization(
+    decoded_state: DecodedHOIState,
+    output_dir: Path,
+    *,
+    sequence_name: str,
+) -> Tuple[Dict[str, Path], np.ndarray, np.ndarray]:
+    pointcloud_dir = output_dir / "pointcloud"
+    human_xyz, human_rgb = gaussian_tokens_to_xyz_rgb(decoded_state.human_gaussians)
+    object_xyz, object_rgb = gaussian_tokens_to_xyz_rgb(decoded_state.object_gaussians)
+    object_world_xyz = transform_points(object_xyz, decoded_state.object_transforms[0, 0])
+
+    human_path = pointcloud_dir / "human_world.ply"
+    object_path = pointcloud_dir / "object_world_frame0000.ply"
+    merged_path = pointcloud_dir / "merged_world_frame0000.ply"
+    write_ascii_ply(human_path, human_xyz, human_rgb)
+    write_ascii_ply(object_path, object_world_xyz, object_rgb)
+    merged_xyz = np.concatenate([human_xyz, object_world_xyz], axis=0)
+    merged_rgb = np.concatenate([human_rgb, object_rgb], axis=0)
+    write_ascii_ply(merged_path, merged_xyz, merged_rgb)
+    metadata = {
+        "sequence_name": sequence_name,
+        "num_human_points": int(human_xyz.shape[0]),
+        "num_object_points": int(object_world_xyz.shape[0]),
+        "frame_index": 0,
+    }
+    (pointcloud_dir / "pointcloud_meta.json").write_text(json.dumps(metadata, indent=2))
+    return (
+        {
+            "human_pointcloud": human_path,
+            "object_pointcloud": object_path,
+            "merged_pointcloud": merged_path,
+        },
+        merged_xyz,
+        merged_rgb,
+    )
+
+
+def maybe_log_wandb_visualization(
+    *,
+    args: argparse.Namespace,
+    sequence_name: str,
+    merged_xyz: np.ndarray,
+    merged_rgb: np.ndarray,
+    merged_pointcloud_path: Path,
+) -> None:
+    if not args.wandb:
+        return
+    try:
+        import wandb
+    except ImportError as exc:
+        print(f"[infer_dual_branch_fm] wandb import failed: {exc}")
+        return
+
+    try:
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            name=args.wandb_name or f"dual-branch-infer-{sequence_name}",
+            mode=args.wandb_mode,
+            config={
+                "sequence_name": sequence_name,
+                "checkpoint": args.checkpoint,
+                "num_ode_steps": args.num_ode_steps,
+            },
+        )
+    except Exception as exc:  # pragma: no cover - best-effort logging path
+        print(f"[infer_dual_branch_fm] wandb init failed: {exc}")
+        return
+
+    try:
+        rgb_u8 = (np.clip(merged_rgb, 0.0, 1.0) * 255.0).astype(np.float32)
+        point_cloud = np.concatenate([merged_xyz.astype(np.float32), rgb_u8], axis=1)
+        wandb.log(
+            {
+                "reconstruction/point_cloud": wandb.Object3D(point_cloud),
+            }
+        )
+        artifact = wandb.Artifact(
+            name=(args.wandb_artifact_name or f"{sequence_name}-pointcloud").replace("/", "-"),
+            type="pointcloud",
+        )
+        artifact.add_file(str(merged_pointcloud_path), name=merged_pointcloud_path.name)
+        run.log_artifact(artifact)
+    finally:
+        run.finish()
+
+
 def build_runtime_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run dual-branch co-generative Flow Matching inference.")
     parser.add_argument("--input_dir", type=str, required=False, default="")
@@ -201,6 +327,12 @@ def build_runtime_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--clamp_visible_rgb", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--wandb_project", type=str, default="uni-hoi-4d")
+    parser.add_argument("--wandb_entity", type=str, default="")
+    parser.add_argument("--wandb_name", type=str, default="")
+    parser.add_argument("--wandb_mode", type=str, default="online")
+    parser.add_argument("--wandb_artifact_name", type=str, default="")
     return parser
 
 
@@ -318,8 +450,8 @@ def run_dual_branch_inference(args: argparse.Namespace) -> Dict[str, Path]:
     pred_human = decoded_video[:, :, :3]
     pred_object = decoded_video[:, :, 3:6]
     if args.clamp_visible_rgb:
-        pred_human = pred_human * masks_object + human_visible * (1.0 - masks_object)
-        pred_object = pred_object * masks_human + object_visible * (1.0 - masks_human)
+        pred_human = pred_human * (1.0 - masks_human) + human_visible * masks_human
+        pred_object = pred_object * (1.0 - masks_object) + object_visible * masks_object
 
     amodal_dir = video_dir / args.output_subdir
     gs_output_dir = video_dir / args.gs_output_subdir
@@ -341,6 +473,18 @@ def run_dual_branch_inference(args: argparse.Namespace) -> Dict[str, Path]:
         sequence_name=inputs["sequence_name"],
         num_ode_steps=args.num_ode_steps,
     )
+    pointcloud_paths, merged_xyz, merged_rgb = export_point_cloud_visualization(
+        decoded_state,
+        gs_output_dir,
+        sequence_name=inputs["sequence_name"],
+    )
+    maybe_log_wandb_visualization(
+        args=args,
+        sequence_name=inputs["sequence_name"],
+        merged_xyz=merged_xyz,
+        merged_rgb=merged_rgb,
+        merged_pointcloud_path=pointcloud_paths["merged_pointcloud"],
+    )
     (gs_output_dir / "dual_branch_inference.json").write_text(json.dumps(metadata, indent=2))
 
     return {
@@ -348,6 +492,7 @@ def run_dual_branch_inference(args: argparse.Namespace) -> Dict[str, Path]:
         "human_amodal_dir": human_branch_dir,
         "object_amodal_dir": object_branch_dir,
         "gs_dir": gs_output_dir,
+        "pointcloud_dir": pointcloud_paths["merged_pointcloud"].parent,
     }
 
 

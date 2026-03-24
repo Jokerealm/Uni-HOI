@@ -65,18 +65,40 @@ def _apply_gaussian_activation(raw_tokens: Tensor) -> Tensor:
     return torch.cat([xyz, rotation, scaling, opacity, shs], dim=-1)
 
 
+def _rotation_matrix_to_6d(matrix: Tensor) -> Tensor:
+    if matrix.shape[-2:] != (3, 3):
+        raise ValueError(f"`matrix` must have shape [..., 3, 3], got {tuple(matrix.shape)}.")
+    return torch.cat([matrix[..., :, 0], matrix[..., :, 1]], dim=-1)
+
+
+def _rotation_6d_to_matrix(rotation_6d: Tensor) -> Tensor:
+    if rotation_6d.shape[-1] != 6:
+        raise ValueError(f"`rotation_6d` must have shape [..., 6], got {tuple(rotation_6d.shape)}.")
+    first = rotation_6d[..., 0:3]
+    second = rotation_6d[..., 3:6]
+    basis_x = F.normalize(first, dim=-1)
+    second = second - (basis_x * second).sum(dim=-1, keepdim=True) * basis_x
+    basis_y = F.normalize(second, dim=-1)
+    basis_z = F.normalize(torch.cross(basis_x, basis_y, dim=-1), dim=-1)
+    basis_y = F.normalize(torch.cross(basis_z, basis_x, dim=-1), dim=-1)
+    return torch.stack([basis_x, basis_y, basis_z], dim=-1)
+
+
 def _flatten_object_transforms(transforms: Tensor) -> Tensor:
     if transforms.ndim != 4 or transforms.shape[-2:] != (4, 4):
         raise ValueError(f"`transforms` must have shape [B, T, 4, 4], got {tuple(transforms.shape)}.")
-    return transforms[:, :, :3, :].reshape(transforms.shape[0], transforms.shape[1], 12)
+    rotation_6d = _rotation_matrix_to_6d(transforms[:, :, :3, :3])
+    translation = transforms[:, :, :3, 3]
+    return torch.cat([rotation_6d, translation], dim=-1)
 
 
 def _unflatten_object_transforms(flattened: Tensor) -> Tensor:
-    if flattened.ndim != 3 or flattened.shape[-1] != 12:
-        raise ValueError(f"`flattened` must have shape [B, T, 12], got {tuple(flattened.shape)}.")
+    if flattened.ndim != 3 or flattened.shape[-1] != 9:
+        raise ValueError(f"`flattened` must have shape [B, T, 9], got {tuple(flattened.shape)}.")
     batch_size, num_frames = flattened.shape[:2]
     transforms = flattened.new_zeros(batch_size, num_frames, 4, 4)
-    transforms[:, :, :3, :] = flattened.view(batch_size, num_frames, 3, 4)
+    transforms[:, :, :3, :3] = _rotation_6d_to_matrix(flattened[:, :, :6])
+    transforms[:, :, :3, 3] = flattened[:, :, 6:9]
     transforms[:, :, 3, 3] = 1.0
     return transforms
 
@@ -517,13 +539,13 @@ class HOIStateCodec(nn.Module):
         self.human_in = nn.Linear(14, hidden_dim)
         self.object_in = nn.Linear(14, hidden_dim)
         self.joint_in = nn.Linear(3, hidden_dim)
-        self.motion_in = nn.Linear(12, hidden_dim)
+        self.motion_in = nn.Linear(9, hidden_dim)
         self.contact_in = nn.Linear(self.contact_dim, hidden_dim)
 
         self.human_out = nn.Linear(hidden_dim, 14)
         self.object_out = nn.Linear(hidden_dim, 14)
         self.joint_out = nn.Linear(hidden_dim, 3)
-        self.motion_out = nn.Linear(hidden_dim, 12)
+        self.motion_out = nn.Linear(hidden_dim, 9)
         self.contact_out = nn.Linear(hidden_dim, self.contact_dim)
 
         self.human_pos = nn.Parameter(torch.zeros(self.num_human_gaussians, hidden_dim))
@@ -705,7 +727,6 @@ class GeometryProjector(nn.Module):
 
         object_gaussians = decoded_state.object_gaussians
         object_xyz = object_gaussians[..., 0:3]
-        object_scale = object_gaussians[..., 7:10].mean(dim=-1)
         object_opacity = object_gaussians[..., 10:11]
 
         for frame_idx in range(num_frames):
@@ -732,7 +753,6 @@ class GeometryProjector(nn.Module):
             object_h = torch.cat([object_xyz, ones], dim=-1)
             object_world = torch.matmul(transform.unsqueeze(1), object_h.unsqueeze(-1)).squeeze(-1)[..., :3]
             object_coords, object_depth = _project_points(object_world, intrinsics_frame.unsqueeze(1))
-            object_sigma = object_scale.unsqueeze(-1).clamp(min=0.5, max=5.0)
             object_heat = _make_heatmap(
                 object_coords,
                 object_opacity,

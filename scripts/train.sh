@@ -15,10 +15,11 @@ source "${OPT_FILE}"
 
 PYTHON_BIN="${PYTHON_BIN:-/data3/guanz/miniforge3/envs/cari4d/bin/python}"
 RAW_ROOT="${RAW_ROOT:-/data4/guanz/data/ProciGen}"
-PREPARED_ROOT="${PREPARED_ROOT:-$RAW_ROOT}"
+PREPARED_ROOT="${PREPARED_ROOT:-${REPO_ROOT}/preprocessed/ProciGen_preprocessed_fixed}"
 SPLIT_FILE="${SPLIT_FILE:-/data4/guanz/data/train-procigen-test-behave.pkl}"
 SPLIT_KEY="${SPLIT_KEY:-train}"
 CAMERA_ID="${CAMERA_ID:-k1}"
+ALLOW_PREPARE_IN_PLACE="${ALLOW_PREPARE_IN_PLACE:-0}"
 
 CPU_COUNT="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
 if (( CPU_COUNT <= 2 )); then
@@ -46,6 +47,7 @@ RUN_NAME="${RUN_NAME:-procigen_dual_branch_fm}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/outputs/${RUN_NAME}}"
 GPU_ID="${GPU_ID:-0}"
 GPU_ID_CLEAN="${GPU_ID// /}"
+CUDA_DEVICE_ORDER_VALUE="${CUDA_DEVICE_ORDER:-FASTEST_FIRST}"
 BATCH_SIZE="${BATCH_SIZE:-${OPT_BATCH_SIZE}}"
 NUM_WORKERS="${NUM_WORKERS:-${OPT_NUM_WORKERS}}"
 MAX_STEPS="${MAX_STEPS:-${OPT_MAX_STEPS}}"
@@ -62,6 +64,19 @@ if [[ ! -x "${ACCELERATE_BIN}" ]]; then
   if command -v accelerate >/dev/null 2>&1; then
     ACCELERATE_BIN="$(command -v accelerate)"
   fi
+fi
+
+canonicalize_path() {
+  "${PYTHON_BIN}" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' "$1"
+}
+
+RAW_ROOT_RESOLVED="$(canonicalize_path "${RAW_ROOT}")"
+PREPARED_ROOT_RESOLVED="$(canonicalize_path "${PREPARED_ROOT}")"
+
+if [[ "${SKIP_PREPARE}" != "1" && "${ALLOW_PREPARE_IN_PLACE}" != "1" && "${RAW_ROOT_RESOLVED}" == "${PREPARED_ROOT_RESOLVED}" ]]; then
+  echo "[train.sh] Refusing to preprocess in-place into RAW_ROOT." >&2
+  echo "[train.sh] Set PREPARED_ROOT to a separate directory, or ALLOW_PREPARE_IN_PLACE=1 if you really want this." >&2
+  exit 1
 fi
 
 echo "============================================================"
@@ -193,6 +208,7 @@ TRAIN_ARGS=(
   --num_object_gaussians "${NUM_OBJECT_GAUSSIANS:-${OPT_NUM_OBJECT_GAUSSIANS}}"
   --num_joints "${NUM_JOINTS:-${OPT_NUM_JOINTS}}"
   --contact_dim "${CONTACT_DIM:-${OPT_CONTACT_DIM}}"
+  --loss_preset "${LOSS_PRESET:-${OPT_LOSS_PRESET}}"
   --curriculum_fusion_start_ratio "${CURRICULUM_FUSION_START_RATIO:-${OPT_CURRICULUM_FUSION_START_RATIO}}"
   --curriculum_full_start_ratio "${CURRICULUM_FULL_START_RATIO:-${OPT_CURRICULUM_FULL_START_RATIO}}"
   --video_unfreeze_start_ratio "${VIDEO_UNFREEZE_START_RATIO:-${OPT_VIDEO_UNFREEZE_START_RATIO}}"
@@ -219,7 +235,7 @@ if [[ "${GPU_COUNT}" -gt 1 ]]; then
   echo "[train.sh] Launching dual-branch FM distributed training on GPUs ${GPU_ID_CLEAN}..."
   echo "[train.sh] Processes     : ${DIST_NUM_PROCESSES}"
   echo "[train.sh] Master port   : ${DIST_MAIN_PROCESS_PORT}"
-  PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="${GPU_ID_CLEAN}" \
+  PYTHONUNBUFFERED=1 CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER_VALUE}" CUDA_VISIBLE_DEVICES="${GPU_ID_CLEAN}" \
     "${ACCELERATE_BIN}" launch \
       --multi_gpu \
       --num_machines 1 \
@@ -232,5 +248,5 @@ else
   if (( BATCH_SIZE > 8 )); then
     echo "[train.sh] Warning: BATCH_SIZE=${BATCH_SIZE} is per-device. On a single GPU this is likely too large."
   fi
-  PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="${GPU_ID_CLEAN}" "${PYTHON_BIN}" "${TRAIN_ARGS[@]}"
+  PYTHONUNBUFFERED=1 CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER_VALUE}" CUDA_VISIBLE_DEVICES="${GPU_ID_CLEAN}" "${PYTHON_BIN}" "${TRAIN_ARGS[@]}"
 fi

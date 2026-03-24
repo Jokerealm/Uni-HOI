@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import pickle
+import re
 import socket
 import sys
 import tempfile
@@ -54,6 +55,8 @@ from dataset.video_transforms import (
     transform_keypoints_to_crop,
 )
 from pipeline.multi_region_mask import compute_multi_region_masks
+
+TIMESTEP_DIR_PATTERN = re.compile(r"^\d+-\d+$")
 
 
 @dataclass(frozen=True)
@@ -164,10 +167,21 @@ def load_split_sequence_names(split_file: str, split_key: str) -> List[str]:
 
 
 def iter_timestep_dirs(seq_dir: Path) -> List[Path]:
+    def is_timestep_dir(path: Path) -> bool:
+        if not path.is_dir():
+            return False
+        if not TIMESTEP_DIR_PATTERN.match(path.name):
+            return False
+        if not any(path.glob("k*.color.jpg")):
+            return False
+        if not (path / "person" / "fit01").is_dir():
+            return False
+        return True
+
     return sorted(
         child
         for child in seq_dir.iterdir()
-        if child.is_dir() and any(grandchild.is_dir() for grandchild in child.iterdir())
+        if is_timestep_dir(child)
     )
 
 
@@ -197,7 +211,7 @@ def discover_sequence_dirs(
 
 def estimate_sequence_length(sequence_dir: Path) -> int:
     try:
-        return sum(1 for child in sequence_dir.iterdir() if child.is_dir())
+        return len(iter_timestep_dirs(sequence_dir))
     except OSError:
         return 10**9
 
@@ -239,13 +253,23 @@ def transform_world_to_camera(
     return (points_world - cam_translation[None, :]) @ cam_rotation
 
 
+def project_rotation_to_so3(rotation: np.ndarray) -> np.ndarray:
+    rotation = np.asarray(rotation, dtype=np.float32).reshape(3, 3)
+    u, _, vh = np.linalg.svd(rotation, full_matrices=False)
+    projected = u @ vh
+    if np.linalg.det(projected) < 0.0:
+        u[:, -1] *= -1.0
+        projected = u @ vh
+    return projected.astype(np.float32)
+
+
 def convert_world_pose_to_camera(
     object_rotation_world: np.ndarray,
     object_translation_world: np.ndarray,
     cam_rotation: np.ndarray,
     cam_translation: np.ndarray,
 ) -> np.ndarray:
-    object_rotation_world = np.asarray(object_rotation_world, dtype=np.float32).reshape(3, 3)
+    object_rotation_world = project_rotation_to_so3(object_rotation_world)
     object_translation_world = np.asarray(object_translation_world, dtype=np.float32).reshape(3)
     cam_rotation = np.asarray(cam_rotation, dtype=np.float32).reshape(3, 3)
     cam_translation = np.asarray(cam_translation, dtype=np.float32).reshape(3)
@@ -576,7 +600,7 @@ def prepare_sequence(
             joints_body = joints_camera[:22].astype(np.float32)
             keypoints_frame = project_points(joints_body, K).astype(np.float32)
 
-            object_rotation_world = np.asarray(object_fit["rot"], dtype=np.float32).reshape(3, 3)
+            object_rotation_world = project_rotation_to_so3(object_fit["rot"])
             object_translation_world = np.asarray(object_fit["trans"], dtype=np.float32).reshape(3)
             object_pose_camera = convert_world_pose_to_camera(
                 object_rotation_world,

@@ -16,9 +16,11 @@ The training graph is unified:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 import importlib.util
 import math
 import os
+import random
 import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -27,10 +29,12 @@ import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration, set_seed
+from PIL import Image
 from torch import Tensor, nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
+from torch.utils.data._utils.collate import default_collate
 from tqdm.auto import tqdm
 
 from dataset.dual_branch_fm_dataset import DualBranchHOIDataset
@@ -56,6 +60,32 @@ LOSS_NAMES = (
     "object_depth",
     "geometry_distill",
 )
+
+CORE_LOSS_NAMES = (
+    "video_fm",
+    "state_fm",
+    "human_visible",
+    "object_video",
+    "joints",
+    "object_motion",
+)
+
+STAGE0_LOSS_NAMES = (
+    "video_fm",
+    "state_fm",
+    "video_latent",
+    "state_latent",
+    "human_visible",
+    "object_video",
+    "joints",
+    "object_motion",
+)
+
+LOSS_PRESETS: dict[str, tuple[str, ...]] = {
+    "core": CORE_LOSS_NAMES,
+    "stage0": STAGE0_LOSS_NAMES,
+    "full": LOSS_NAMES,
+}
 
 
 def decode_gaussian_params(tokens: Tensor) -> Dict[str, Tensor]:
@@ -131,6 +161,93 @@ def infer_condition_channels(dataset: DualBranchHOIDataset) -> int:
     return int(dataset.condition_channels)
 
 
+class SequencePrefetchBatchIterator:
+    def __init__(
+        self,
+        dataset: DualBranchHOIDataset,
+        *,
+        batch_size: int,
+        drop_last: bool,
+        seed: int,
+        warm_start_short_sequences: bool = True,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.warm_start_short_sequences = bool(warm_start_short_sequences)
+        self._epoch = 0
+        self._sequence_dirs = [
+            sequence_dir
+            for sequence_dir in dataset.sequence_dirs
+            if dataset.sequence_sample_indices.get(sequence_dir)
+        ]
+
+    def __len__(self) -> int:
+        total = 0
+        for sequence_dir in self._sequence_dirs:
+            num_samples = len(self.dataset.sequence_sample_indices[sequence_dir])
+            if self.drop_last:
+                total += num_samples // self.batch_size
+            else:
+                total += math.ceil(num_samples / self.batch_size)
+        return total
+
+    def _ordered_sequence_dirs(self) -> list[str]:
+        sequence_dirs = list(self._sequence_dirs)
+        if self._epoch == 0 and self.warm_start_short_sequences:
+            sequence_dirs.sort(
+                key=lambda sequence_dir: (
+                    self.dataset.sequence_frame_counts[sequence_dir],
+                    sequence_dir,
+                )
+            )
+            return sequence_dirs
+        rng = random.Random(self.seed + self._epoch)
+        rng.shuffle(sequence_dirs)
+        return sequence_dirs
+
+    def __iter__(self):
+        sequence_dirs = self._ordered_sequence_dirs()
+        rng = random.Random(self.seed + self._epoch)
+        self._epoch += 1
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sequence-prefetch")
+        prefetched_dir: Optional[str] = None
+        prefetched_future: Optional[Future] = None
+        try:
+            if sequence_dirs:
+                prefetched_dir = sequence_dirs[0]
+                prefetched_future = executor.submit(self.dataset.get_sequence_bundle, prefetched_dir)
+
+            for sequence_idx, sequence_dir in enumerate(sequence_dirs):
+                if prefetched_dir == sequence_dir and prefetched_future is not None:
+                    bundle = prefetched_future.result()
+                else:
+                    bundle = self.dataset.get_sequence_bundle(sequence_dir)
+
+                next_dir = sequence_dirs[sequence_idx + 1] if sequence_idx + 1 < len(sequence_dirs) else None
+                if next_dir is not None:
+                    prefetched_dir = next_dir
+                    prefetched_future = executor.submit(self.dataset.get_sequence_bundle, next_dir)
+                else:
+                    prefetched_dir = None
+                    prefetched_future = None
+
+                sample_indices = list(self.dataset.sequence_sample_indices[sequence_dir])
+                rng.shuffle(sample_indices)
+                for batch_start in range(0, len(sample_indices), self.batch_size):
+                    batch_indices = sample_indices[batch_start : batch_start + self.batch_size]
+                    if len(batch_indices) < self.batch_size and self.drop_last:
+                        continue
+                    samples = [
+                        self.dataset.get_sample_by_index(sample_index, bundle=bundle)
+                        for sample_index in batch_indices
+                    ]
+                    yield default_collate(samples)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+
 def configure_torch_runtime() -> None:
     torch.set_float32_matmul_precision("high")
     if not torch.cuda.is_available():
@@ -169,6 +286,116 @@ def compute_masked_l1(prediction: Tensor, target: Tensor, mask: Tensor) -> Tenso
     mask = mask.expand_as(target)
     denom = mask.sum().clamp(min=1.0)
     return ((prediction - target).abs() * mask).sum() / denom
+
+
+def _video_strip_to_uint8(video: Tensor) -> Tensor:
+    if video.ndim != 4:
+        raise ValueError(f"`video` must have shape [T, C, H, W], got {tuple(video.shape)}.")
+    video = torch.nan_to_num(video.detach().float().cpu(), nan=0.0, posinf=1.0, neginf=0.0)
+    if video.shape[1] == 1:
+        vmin = video.amin(dim=(0, 2, 3), keepdim=True)
+        vmax = video.amax(dim=(0, 2, 3), keepdim=True)
+        video = (video - vmin) / (vmax - vmin).clamp(min=1e-6)
+        video = video.repeat(1, 3, 1, 1)
+    else:
+        if video.shape[1] < 3:
+            repeats = math.ceil(3 / video.shape[1])
+            video = video.repeat(1, repeats, 1, 1)
+        video = video[:, :3].clamp(0.0, 1.0)
+    frames = (video * 255.0).round().to(torch.uint8)
+    return torch.cat([frame.permute(1, 2, 0) for frame in frames], dim=1)
+
+
+def _build_visualization_grid(rows: list[tuple[str, Tensor]]) -> Image.Image:
+    strips = [_video_strip_to_uint8(row_video) for _, row_video in rows]
+    pad = 8
+    total_height = sum(int(strip.shape[0]) for strip in strips) + pad * max(len(strips) - 1, 0)
+    max_width = max(int(strip.shape[1]) for strip in strips)
+    canvas = torch.full((total_height, max_width, 3), 18, dtype=torch.uint8)
+    cursor = 0
+    for strip in strips:
+        h, w = int(strip.shape[0]), int(strip.shape[1])
+        canvas[cursor : cursor + h, :w] = strip
+        cursor += h + pad
+    return Image.fromarray(canvas.numpy())
+
+
+@torch.no_grad()
+def export_training_visualization(
+    *,
+    model: DualBranchCoGenerativeFlowMatching,
+    output,
+    video_xt: Tensor,
+    state_xt: Tensor,
+    timesteps: Tensor,
+    rgb: Tensor,
+    human_visible: Tensor,
+    object_visible: Tensor,
+    masks_human: Tensor,
+    masks_object: Tensor,
+    teacher_object_render: Tensor,
+    teacher_object_video: Tensor,
+    camera_intrinsics_render: Tensor,
+    renderer: DiffRasterizationLayer,
+    output_dir: str,
+    step: int,
+) -> tuple[Path, str]:
+    vis_dir = Path(output_dir) / "visualizations"
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    was_training = model.training
+    model.eval()
+    try:
+        batch_size = 1
+        t_view = timesteps[:batch_size].view(batch_size, 1, 1)
+        video_x1_hat = video_xt[:batch_size] + (1.0 - t_view) * output.video_velocity[:batch_size]
+        state_x1_hat = state_xt[:batch_size] + (1.0 - t_view) * output.state_velocity[:batch_size]
+        decoded_video = model.decode_video_tokens(video_x1_hat)
+        decoded_state = model.decode_state_tokens(state_x1_hat)
+
+        pred_human_video = decoded_video[:, :, :3]
+        pred_object_video = decoded_video[:, :, 3:6]
+        pred_object_render = render_object_branch(
+            renderer,
+            decoded_state.object_gaussians,
+            decoded_state.object_transforms,
+            camera_intrinsics_render[:batch_size],
+        )
+
+        rows = [
+            ("rgb", rgb[0]),
+            ("human_target", human_visible[0]),
+            ("human_pred", pred_human_video[0]),
+            ("object_visible", object_visible[0]),
+            ("object_target", teacher_object_video[0]),
+            ("object_pred", pred_object_video[0]),
+            ("object_render_target", teacher_object_render[0]),
+            ("object_render_pred", pred_object_render[0]),
+            ("mask_human", masks_human[0]),
+            ("mask_object", masks_object[0]),
+        ]
+        image = _build_visualization_grid(rows)
+        path = vis_dir / f"step_{step:07d}.png"
+        image.save(path)
+        caption = (
+            f"step={step} | rows=rgb,human_target,human_pred,object_visible,"
+            f"object_target,object_pred,object_render_target,object_render_pred,mask_human,mask_object"
+        )
+        return path, caption
+    finally:
+        if was_training:
+            model.train()
+
+
+def rotation_geodesic_loss(prediction: Tensor, target: Tensor) -> Tensor:
+    if prediction.shape[-2:] != (3, 3) or target.shape[-2:] != (3, 3):
+        raise ValueError(
+            f"`prediction` and `target` must have shape [..., 3, 3], got {tuple(prediction.shape)} and {tuple(target.shape)}."
+        )
+    relative = torch.matmul(prediction.transpose(-1, -2), target)
+    trace = relative[..., 0, 0] + relative[..., 1, 1] + relative[..., 2, 2]
+    cosine = ((trace - 1.0) * 0.5).clamp(min=-1.0 + 1e-6, max=1.0 - 1e-6)
+    return torch.acos(cosine).mean() / math.pi
 
 
 def resolve_curriculum_boundaries(args: argparse.Namespace) -> Tuple[int, int]:
@@ -238,41 +465,56 @@ def linear_ramp(step: int, start: int, end: int) -> float:
     return float(step - start) / float(max(end - start, 1))
 
 
-def build_curriculum_loss_weights(args: argparse.Namespace, step: int) -> Tuple[Dict[str, float], Dict[str, float]]:
-    base_weights = {name: float(getattr(args, f"lambda_{name}")) for name in LOSS_NAMES}
-    fusion_start, full_start = resolve_curriculum_boundaries(args)
-    fusion_progress = linear_ramp(step, fusion_start, full_start)
-    full_progress = linear_ramp(step, full_start, args.max_steps)
+def resolve_active_loss_names(args: argparse.Namespace) -> tuple[str, ...]:
+    return LOSS_PRESETS[args.loss_preset]
 
-    multipliers = {
-        "video_fm": 1.0,
-        "state_fm": 1.0,
-        "video_latent": 1.0,
-        "state_latent": 1.0,
-        "human_visible": 1.0,
-        "object_video": 1.0,
-        "joints": 1.0,
-        "object_motion": 1.0,
-        "object_render": fusion_progress,
-        "branch_coupling": fusion_progress,
-        "human_gaussian": fusion_progress,
-        "object_gaussian": fusion_progress,
-        "joint_heat": fusion_progress,
-        "object_silhouette": fusion_progress,
-        "geometry_distill": fusion_progress,
-        "contact": full_progress,
-        "object_depth": full_progress,
+
+def build_curriculum_loss_weights(args: argparse.Namespace, step: int) -> Tuple[Dict[str, float], Dict[str, float]]:
+    active_loss_names = set(resolve_active_loss_names(args))
+    base_weights = {
+        name: float(getattr(args, f"lambda_{name}")) if name in active_loss_names else 0.0
+        for name in LOSS_NAMES
     }
+
+    if args.loss_preset == "full":
+        fusion_start, full_start = resolve_curriculum_boundaries(args)
+        fusion_progress = linear_ramp(step, fusion_start, full_start)
+        full_progress = linear_ramp(step, full_start, args.max_steps)
+        multipliers = {
+            "video_fm": 1.0,
+            "state_fm": 1.0,
+            "video_latent": 1.0,
+            "state_latent": 1.0,
+            "human_visible": 1.0,
+            "object_video": 1.0,
+            "joints": 1.0,
+            "object_motion": 1.0,
+            "object_render": fusion_progress,
+            "branch_coupling": fusion_progress,
+            "human_gaussian": fusion_progress,
+            "object_gaussian": fusion_progress,
+            "joint_heat": fusion_progress,
+            "object_silhouette": fusion_progress,
+            "geometry_distill": fusion_progress,
+            "contact": full_progress,
+            "object_depth": full_progress,
+        }
+    else:
+        fusion_progress = 0.0
+        full_progress = 0.0
+        multipliers = {name: 1.0 for name in LOSS_NAMES}
+
     weights = {name: base_weights[name] * multipliers.get(name, 1.0) for name in LOSS_NAMES}
     stage = 0.0
-    if fusion_progress > 0.0:
+    if args.loss_preset == "full" and fusion_progress > 0.0:
         stage = 1.0
-    if full_progress > 0.0:
+    if args.loss_preset == "full" and full_progress > 0.0:
         stage = 2.0
     metrics = {
         "curriculum_stage": stage,
         "curriculum_fusion_progress": fusion_progress,
         "curriculum_full_progress": full_progress,
+        "loss_active_count": float(sum(weight > 0.0 for weight in weights.values())),
     }
     return weights, metrics
 
@@ -286,6 +528,7 @@ def compute_losses(
     state_xt: Tensor,
     state_velocity_target: Tensor,
     teacher_state: DecodedHOIState,
+    teacher_object_render: Tensor,
     teacher_object_video: Tensor,
     human_visible_target: Tensor,
     masks_human: Tensor,
@@ -308,6 +551,7 @@ def compute_losses(
     pred_human_video = decoded_video[:, :, :3]
     pred_object_video = decoded_video[:, :, 3:6]
     zero = output.video_velocity.new_zeros(())
+    object_focus_mask = (masks_object + masks_human).clamp(0.0, 1.0)
 
     render_active = weights["object_render"] > 0.0 or weights["branch_coupling"] > 0.0
     if render_active:
@@ -343,16 +587,30 @@ def compute_losses(
     loss_video_latent_recon = F.smooth_l1_loss(video_x1_hat, video_target_tokens)
     loss_state_latent_recon = F.smooth_l1_loss(state_x1_hat, state_target_tokens)
     loss_human_visible = compute_masked_l1(pred_human_video, human_visible_target, masks_human)
-    loss_object_video = F.l1_loss(pred_object_video, teacher_object_video)
-    loss_object_render = F.l1_loss(pred_object_render, teacher_object_video) if pred_object_render is not None else zero
+    loss_object_video = compute_masked_l1(pred_object_video, teacher_object_video, object_focus_mask)
+    loss_object_render = (
+        compute_masked_l1(pred_object_render, teacher_object_render, object_focus_mask)
+        if pred_object_render is not None
+        else zero
+    )
     loss_branch_coupling = (
-        F.l1_loss(pred_object_video, pred_object_render.detach()) if pred_object_render is not None else zero
+        compute_masked_l1(pred_object_video, pred_object_render.detach(), masks_human)
+        if pred_object_render is not None
+        else zero
     )
 
     loss_human_gaussian = F.smooth_l1_loss(decoded_state.human_gaussians, teacher_state.human_gaussians)
     loss_object_gaussian = F.smooth_l1_loss(decoded_state.object_gaussians, teacher_state.object_gaussians)
     loss_joints = F.smooth_l1_loss(decoded_state.joints_3d, teacher_state.joints_3d)
-    loss_object_motion = F.smooth_l1_loss(decoded_state.object_transforms, teacher_state.object_transforms)
+    loss_object_motion_translation = F.smooth_l1_loss(
+        decoded_state.object_transforms[..., :3, 3],
+        teacher_state.object_transforms[..., :3, 3],
+    )
+    loss_object_motion_rotation = rotation_geodesic_loss(
+        decoded_state.object_transforms[..., :3, :3],
+        teacher_state.object_transforms[..., :3, :3],
+    )
+    loss_object_motion = loss_object_motion_translation + loss_object_motion_rotation
     loss_contact = F.smooth_l1_loss(decoded_state.contact_signature, teacher_state.contact_signature)
 
     loss_joint_heat = (
@@ -405,6 +663,8 @@ def compute_losses(
 
     metrics = {"loss_total": total_loss.detach()}
     metrics.update({f"loss_{name}": loss_value.detach() for name, loss_value in losses.items()})
+    metrics["loss_object_motion_translation"] = loss_object_motion_translation.detach()
+    metrics["loss_object_motion_rotation"] = loss_object_motion_rotation.detach()
     return total_loss, metrics
 
 
@@ -471,7 +731,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project_name", type=str, default="dual-branch-fm")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_with", type=str, default="tensorboard", choices=("tensorboard", "wandb", "none"))
-    parser.add_argument("--mixed_precision", type=str, default="fp16", choices=("no", "fp16", "bf16"))
+    parser.add_argument("--mixed_precision", type=str, default="no", choices=("no", "fp16", "bf16"))
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--resume_checkpoint", type=str, default="")
 
@@ -492,6 +752,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_sequences", type=int, default=0)
     parser.add_argument("--dataset_cache_sequences", type=int, default=2)
     parser.add_argument("--cache_rgb", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--rgb_cache_max_frames", type=int, default=256)
     parser.add_argument("--index_progress_every", type=int, default=10)
     parser.add_argument("--background_value", type=float, default=1.0)
     parser.add_argument("--prefetch_factor", type=int, default=2)
@@ -510,6 +771,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_joints", type=int, default=22)
     parser.add_argument("--contact_dim", type=int, default=4)
 
+    parser.add_argument(
+        "--loss_preset",
+        type=str,
+        default="core",
+        choices=tuple(LOSS_PRESETS.keys()),
+        help="`core` keeps only the main optimization targets, `stage0` enables the original base losses, `full` enables the full curriculum.",
+    )
     parser.add_argument("--lambda_video_fm", type=float, default=1.0)
     parser.add_argument("--lambda_state_fm", type=float, default=1.0)
     parser.add_argument("--lambda_video_latent", type=float, default=0.1)
@@ -529,7 +797,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda_geometry_distill", type=float, default=0.25)
     parser.add_argument("--curriculum_fusion_start_ratio", type=float, default=0.2)
     parser.add_argument("--curriculum_full_start_ratio", type=float, default=0.6)
-    parser.add_argument("--freeze_video_backbone", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--freeze_video_backbone", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--video_unfreeze_start_ratio", type=float, default=-1.0)
     parser.add_argument("--video_stage2_num_top_blocks", type=int, default=2)
     return parser
@@ -583,6 +851,7 @@ def main() -> None:
         log_with=log_with,
         project_config=project_config,
     )
+    wandb_enabled = log_with == "wandb"
     set_seed(args.seed, device_specific=True)
     if accelerator.is_main_process and log_with is not None:
         accelerator.init_trackers(args.project_name, config=vars(args))
@@ -634,6 +903,7 @@ def main() -> None:
         max_sequences=args.max_sequences,
         cache_sequences=args.dataset_cache_sequences,
         cache_rgb=args.cache_rgb,
+        rgb_cache_max_frames=args.rgb_cache_max_frames,
         index_progress_every=args.index_progress_every,
         index_progress_callback=report_dataset_index_progress if accelerator.is_main_process else None,
         split_file=args.split_file,
@@ -661,6 +931,12 @@ def main() -> None:
     condition_channels = infer_condition_channels(dataset)
     if accelerator.is_main_process:
         print(f"[train_dual_branch_fm] condition channels ready | channels={condition_channels}", flush=True)
+        print(
+            "[train_dual_branch_fm] loss preset ready "
+            f"| preset={args.loss_preset} "
+            f"| active={','.join(resolve_active_loss_names(args))}",
+            flush=True,
+        )
 
     model = DualBranchCoGenerativeFlowMatching(
         hidden_dim=args.hidden_dim,
@@ -686,32 +962,56 @@ def main() -> None:
     video_schedule_metrics = apply_video_backbone_schedule(model, args, global_step)
     trainable_parameters = collect_trainable_parameters(model)
 
-    dataloader_kwargs = {
-        "batch_size": args.batch_size,
-        "shuffle": True,
-        "num_workers": args.num_workers,
-        "pin_memory": True,
-        "drop_last": True,
-        "persistent_workers": args.num_workers > 0,
-    }
-    if args.num_workers > 0:
-        dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
-    dataloader = DataLoader(dataset, **dataloader_kwargs)
-    if len(dataloader) == 0:
+    use_sequence_prefetch_iterator = accelerator.num_processes == 1
+    train_iterator = None
+    dataloader = None
+    if use_sequence_prefetch_iterator:
+        train_iterator = SequencePrefetchBatchIterator(
+            dataset,
+            batch_size=args.batch_size,
+            drop_last=True,
+            seed=args.seed,
+        )
+        num_batches = len(train_iterator)
+    else:
+        dataloader_kwargs = {
+            "batch_size": args.batch_size,
+            "shuffle": True,
+            "num_workers": args.num_workers,
+            "pin_memory": True,
+            "drop_last": True,
+            "persistent_workers": args.num_workers > 0,
+        }
+        if args.num_workers > 0:
+            dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
+        dataloader = DataLoader(dataset, **dataloader_kwargs)
+        num_batches = len(dataloader)
+    if num_batches == 0:
         raise ValueError(
             "Dataloader has zero batches. "
             f"clips={len(dataset)}, batch_size={args.batch_size}, drop_last=True. "
             "Lower the batch size or provide more training clips."
         )
     if accelerator.is_main_process:
-        print(
-            f"[train_dual_branch_fm] dataloader ready "
-            f"| batch_size_per_device={args.batch_size} "
-            f"| workers={args.num_workers} "
-            f"| persistent_workers={args.num_workers > 0}"
-            ,
-            flush=True,
-        )
+        if use_sequence_prefetch_iterator:
+            print(
+                f"[train_dual_branch_fm] sequence prefetch iterator ready "
+                f"| batch_size_per_device={args.batch_size} "
+                f"| cache_sequences={args.dataset_cache_sequences} "
+                f"| rgb_cache_max_frames={args.rgb_cache_max_frames} "
+                f"| warm_start_short_sequences=1"
+                ,
+                flush=True,
+            )
+        else:
+            print(
+                f"[train_dual_branch_fm] dataloader ready "
+                f"| batch_size_per_device={args.batch_size} "
+                f"| workers={args.num_workers} "
+                f"| persistent_workers={args.num_workers > 0}"
+                ,
+                flush=True,
+            )
 
     renderer = DiffRasterizationLayer(
         image_height=args.image_height,
@@ -721,12 +1021,19 @@ def main() -> None:
     if accelerator.is_main_process:
         print("[train_dual_branch_fm] renderer ready, preparing accelerator-wrapped modules...", flush=True)
 
-    model, optimizer, dataloader, scheduler = accelerator.prepare(
-        model,
-        optimizer,
-        dataloader,
-        scheduler,
-    )
+    if use_sequence_prefetch_iterator:
+        model, optimizer, scheduler = accelerator.prepare(
+            model,
+            optimizer,
+            scheduler,
+        )
+    else:
+        model, optimizer, dataloader, scheduler = accelerator.prepare(
+            model,
+            optimizer,
+            dataloader,
+            scheduler,
+        )
     if accelerator.is_main_process:
         print("[train_dual_branch_fm] accelerator.prepare complete, entering training setup...", flush=True)
     all_parameters = tuple(model.parameters())
@@ -736,6 +1043,11 @@ def main() -> None:
     start_time = time.time()
     last_video_stage = None
     last_unfrozen_video_blocks = None
+    loader_label = (
+        "sequence-prefetch"
+        if use_sequence_prefetch_iterator
+        else f"dataloader:{args.num_workers}w"
+    )
     progress_bar = None
     checkpoint_progress_bar = None
     checkpoint_segment_end = None
@@ -781,7 +1093,7 @@ def main() -> None:
             f"| steps_remaining={max(args.max_steps - global_step, 0):07d} "
             f"| batch_size_per_device={args.batch_size} "
             f"| grad_accum={args.gradient_accumulation_steps} "
-            f"| workers={args.num_workers} "
+            f"| loader={loader_label} "
             f"| save_every={args.save_every} "
             f"| log_every={args.log_every}"
             ,
@@ -801,7 +1113,8 @@ def main() -> None:
 
     try:
         while global_step < args.max_steps:
-            for batch in dataloader:
+            batch_source = train_iterator if use_sequence_prefetch_iterator else dataloader
+            for batch in batch_source:
                 raw_model = accelerator.unwrap_model(model)
                 video_schedule_metrics = apply_video_backbone_schedule(raw_model, args, global_step)
                 current_video_stage = int(video_schedule_metrics["video_optim_stage"])
@@ -902,12 +1215,15 @@ def main() -> None:
                         dim=2,
                     )
 
-                    teacher_object_video = render_object_branch(
+                    background = torch.full_like(rgb, args.background_value)
+                    object_visible = rgb * masks_object + background * (1.0 - masks_object)
+                    teacher_object_render = render_object_branch(
                         renderer,
                         object_gaussians,
                         object_poses,
                         camera_intrinsics_render,
                     ).detach()
+                    teacher_object_video = teacher_object_render * masks_human + object_visible * (1.0 - masks_human)
                     video_target = torch.cat([human_visible, teacher_object_video], dim=2)
                     teacher_state = build_teacher_state(
                         {
@@ -956,6 +1272,7 @@ def main() -> None:
                         state_xt=state_xt,
                         state_velocity_target=state_velocity_target,
                         teacher_state=teacher_state,
+                        teacher_object_render=teacher_object_render,
                         teacher_object_video=teacher_object_video,
                         human_visible_target=human_visible,
                         masks_human=masks_human,
@@ -1035,6 +1352,48 @@ def main() -> None:
                     )
 
                 if global_step % args.save_every == 0:
+                    if accelerator.is_main_process:
+                        vis_path, vis_caption = export_training_visualization(
+                            model=accelerator.unwrap_model(model),
+                            output=output,
+                            video_xt=video_xt.detach(),
+                            state_xt=state_xt.detach(),
+                            timesteps=timesteps.detach(),
+                            rgb=rgb.detach(),
+                            human_visible=human_visible.detach(),
+                            object_visible=object_visible.detach(),
+                            masks_human=masks_human.detach(),
+                            masks_object=masks_object.detach(),
+                            teacher_object_render=teacher_object_render.detach(),
+                            teacher_object_video=teacher_object_video.detach(),
+                            camera_intrinsics_render=camera_intrinsics_render.detach(),
+                            renderer=renderer,
+                            output_dir=args.output_dir,
+                            step=global_step,
+                        )
+                        print(
+                            f"[train_dual_branch_fm] visualization saved "
+                            f"| step={global_step:07d} "
+                            f"| path={vis_path}",
+                            flush=True,
+                        )
+                        if wandb_enabled:
+                            try:
+                                import wandb
+
+                                wandb.log(
+                                    {
+                                        "train/visualization": wandb.Image(str(vis_path), caption=vis_caption),
+                                    },
+                                    step=global_step,
+                                )
+                            except Exception as exc:
+                                print(
+                                    f"[train_dual_branch_fm] warning: failed to upload visualization to wandb "
+                                    f"| step={global_step:07d} "
+                                    f"| error={exc}",
+                                    flush=True,
+                                )
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         save_checkpoint(
