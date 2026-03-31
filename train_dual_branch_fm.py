@@ -903,15 +903,33 @@ def compute_losses(
     state_target_tokens: Tensor,
     weights: Dict[str, float],
 ) -> Tuple[Tensor, Dict[str, Tensor]]:
-    t_view = timesteps.view(timesteps.shape[0], 1, 1)
-    video_x1_hat = video_xt + (1.0 - t_view) * output.video_velocity
-    state_x1_hat = state_xt + (1.0 - t_view) * output.state_velocity
+    t_view = timesteps.float().view(timesteps.shape[0], 1, 1)
+    video_xt = video_xt.float()
+    state_xt = state_xt.float()
+    video_velocity_target = video_velocity_target.float()
+    state_velocity_target = state_velocity_target.float()
+    video_target_tokens = video_target_tokens.float()
+    state_target_tokens = state_target_tokens.float()
+    human_visible_target = human_visible_target.float()
+    teacher_object_video = teacher_object_video.float()
+    teacher_object_render = teacher_object_render.float()
+    masks_human = masks_human.float()
+    masks_object = masks_object.float()
+    keypoint_heatmaps = keypoint_heatmaps.float()
+    depth = depth.float()
+    camera_intrinsics_render = camera_intrinsics_render.float()
+
+    video_velocity = output.video_velocity.float()
+    state_velocity = output.state_velocity.float()
+
+    video_x1_hat = video_xt + (1.0 - t_view) * video_velocity
+    state_x1_hat = state_xt + (1.0 - t_view) * state_velocity
     decoded_video = model.decode_video_tokens(video_x1_hat)
     decoded_state = model.decode_state_tokens(state_x1_hat)
 
-    pred_human_video = decoded_video[:, :, :3]
-    pred_object_video = decoded_video[:, :, 3:6]
-    zero = output.video_velocity.new_zeros(())
+    pred_human_video = decoded_video[:, :, :3].float()
+    pred_object_video = decoded_video[:, :, 3:6].float()
+    zero = video_xt.new_zeros(())
     object_focus_mask = (masks_object + masks_human).clamp(0.0, 1.0)
 
     render_active = weights["object_render"] > 0.0 or weights["branch_coupling"] > 0.0
@@ -921,7 +939,7 @@ def compute_losses(
             decoded_state.object_gaussians,
             decoded_state.object_transforms,
             camera_intrinsics_render,
-        )
+        ).float()
     else:
         pred_object_render = None
 
@@ -943,8 +961,8 @@ def compute_losses(
         target_depth = None
         target_object_mask = None
 
-    loss_video_fm = F.mse_loss(output.video_velocity, video_velocity_target)
-    loss_state_fm = F.mse_loss(output.state_velocity, state_velocity_target)
+    loss_video_fm = F.mse_loss(video_velocity, video_velocity_target)
+    loss_state_fm = F.mse_loss(state_velocity, state_velocity_target)
     loss_video_latent_recon = F.smooth_l1_loss(video_x1_hat, video_target_tokens)
     loss_state_latent_recon = F.smooth_l1_loss(state_x1_hat, state_target_tokens)
     loss_human_visible = compute_masked_l1(pred_human_video, human_visible_target, masks_human)
