@@ -27,24 +27,58 @@
 | `train_dual_branch_fm.py` | 训练双分支联合 FM 主干 |
 | `infer_dual_branch_fm.py` | 对单个 sequence 做 Step2 联合推理 |
 | `pipeline/step2_dual_branch_flow_matching.py` | Hydra Step2 包装 |
-| `main.py` | 主流程调度入口 |
+| `legacy_pipeline.py` | legacy Step1~Step5 主流程调度入口 |
 
 ## 3. 训练命令
 
 ```bash
-GPU_ID=0 BATCH_SIZE=4 LR=1.5e-4 scripts/train.sh
+scripts/train.sh
 ```
 
-详细超参数默认从 `scripts/train_dual_branch_fm.opt` 读取。
+当前 ProciGen 双分支训练推荐统一走：
 
-常见改法：
+- 入口脚本：`scripts/train.sh`
+- 配置文件：`configs/config.yaml`
+- 实际启动器：`scripts/run_dual_branch_fm.py`
+
+`scripts/train.sh` 里放了一组最常改的参数；更细的默认值仍放在 `configs/config.yaml` 的 `dual_branch_fm` 段里。
+GPU 选择统一交给外部环境变量 `CUDA_VISIBLE_DEVICES`，多卡时内部自动走：
 
 ```bash
-GPU_ID=1 BATCH_SIZE=8 LR=2e-4 MIXED_PRECISION=fp16 scripts/train.sh
-OPT_FILE=/abs/path/to/another_train.opt scripts/train.sh
+python -m torch.distributed.run --nproc_per_node N ...
 ```
 
-关键默认值：
+常用覆盖参数可以直接写在命令行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 scripts/train.sh \
+  --dataset procigen_train \
+  --run_name fm_debug \
+  --max_steps 2000 \
+  --lr 2e-4 \
+  --num_processes 2
+```
+
+如果要改路径、缓存、模型宽度、loss 权重等，直接修改：
+
+```bash
+configs/config.yaml
+```
+
+`scripts/train.sh --help` 当前支持直接覆盖：
+
+- `--lr`
+- `--batch_size`
+- `--max_steps`
+- `--dataset`
+- `--prepared_root`
+- `--num_processes`
+- `--prepare/--no-prepare`
+- `--run_name`
+- `--wandb/--no-wandb`
+- `--split_file`
+
+关键默认值位于 `configs/config.yaml` 的 `dual_branch_fm.train`：
 
 - `patch_size=16`
 - `hidden_dim=384`
@@ -54,26 +88,17 @@ OPT_FILE=/abs/path/to/another_train.opt scripts/train.sh
 - `num_human_gaussians=750`
 - `num_object_gaussians=750`
 - `lr=1.5e-4`
-- `mixed_precision=bf16`
+- `mixed_precision=no`
+- `loss_preset=core`
 
-课程式 loss 相关参数：
+训练实现本身不是旧的 `step1-5` 训练图，而是统一双分支模型，内部带课程式阶段：
 
+- `loss_preset=core|stage0|full`
 - `curriculum_fusion_start_ratio=0.2`
 - `curriculum_full_start_ratio=0.6`
-
-两阶段视频主干训练参数：
-
 - `freeze_video_backbone=true`
 - `video_unfreeze_start_ratio=-1`
 - `video_stage2_num_top_blocks=2`
-
-含义：
-
-- 前 `20%` step 主要做 warmup
-- `20% -> 60%` 逐渐打开 fusion losses
-- `60% -> 100%` 逐渐打开 full losses
-- `video_unfreeze_start_ratio=-1` 表示默认跟随 `curriculum_fusion_start_ratio`
-- 到第二阶段时，解冻最顶层的 `2` 个 `video_block`
 
 ## 4. Step2 推理命令
 
@@ -90,7 +115,7 @@ OPT_FILE=/abs/path/to/another_train.opt scripts/train.sh
 通过主 pipeline：
 
 ```bash
-/data3/guanz/miniforge3/envs/cari4d/bin/python main.py \
+/data3/guanz/miniforge3/envs/cari4d/bin/python legacy_pipeline.py \
   run.job=step2 \
   amodal.method=dual_branch_flow_matching \
   fm.checkpoint=/abs/path/to/checkpoint.pt

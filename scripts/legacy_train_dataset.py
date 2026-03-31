@@ -13,12 +13,12 @@ SequenceModelRegistry — kept in CPU, swapped to GPU as needed.
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n cari4d \\
-        python scripts/train_dataset.py \\
+        python scripts/legacy_train_dataset.py \\
         --epochs 3 --steps_per_seq 50 --batch_size 8
 
     # Resume from checkpoint:
     CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n cari4d \\
-        python scripts/train_dataset.py --resume checkpoints/registry_latest.pt
+        python scripts/legacy_train_dataset.py --resume checkpoints/registry_latest.pt
 """
 import sys
 import os

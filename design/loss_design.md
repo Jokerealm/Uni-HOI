@@ -159,8 +159,8 @@ $$\mathcal{L}_{Stage2} = \mathcal{L}_{mr} + \lambda_c \mathcal{L}_{contact}^{3D}
 | Stage 1 core preset 定义 | `train_dual_branch_fm.py` L64 `CORE_LOSS_NAMES` | ✅ 已实现 |
 | 非核心项权重置零 | `train_dual_branch_fm.py` L472 `build_curriculum_loss_weights()` | ✅ 已实现 |
 | 渲染/几何计算短路 | `train_dual_branch_fm.py` L570 `render_active` / L578 `geometry_active` | ✅ 已实现 |
-| 默认 preset = core | `scripts/train_dual_branch_fm.opt` L52 | ✅ 已实现 |
-| train.sh 传递 --loss_preset | `scripts/train.sh` L211 | ✅ 已实现 |
+| 默认 preset = core | `configs/config.yaml` `dual_branch_fm.train.loss_preset` | ✅ 已实现 |
+| train.sh 传递 --loss_preset | `scripts/run_dual_branch_fm.py` `_train_entry()` | ✅ 已实现 |
 | 启动时打印 active losses | `train_dual_branch_fm.py` L937 | ✅ 已实现 |
 | Stage 2 refinement losses | `scripts/step4_joint_optimization.py` L579 `step4_training_step()` | ✅ 已实现 |
 

@@ -1,7 +1,7 @@
 """
-Main entry point for the Uni-HOI 4.0 pipeline.
+Legacy 5-step Uni-HOI pipeline entry point.
 
-Supports the full 5-step zero-shot pipeline:
+This file is kept only for the older per-sequence Step1-Step5 workflow:
   Step 1: Preprocess (offline prior extraction)
   Step 2: Amodal Video Completion (ProPainter)
   Step 3: 3D Lifting & Metric Alignment (zero-shot inference)
@@ -10,19 +10,19 @@ Supports the full 5-step zero-shot pipeline:
 
 Usage:
     # Run full pipeline (Steps 1-5) on sample data:
-    python main.py run.job=full dataset=sample
+    python legacy_pipeline.py run.job=full dataset=sample
 
     # Run only Step 4 training (most common):
-    python main.py run.job=train dataset=sample
+    python legacy_pipeline.py run.job=train dataset=sample
 
     # Run only evaluation (Step 5):
-    python main.py run.job=eval dataset=sample
+    python legacy_pipeline.py run.job=eval dataset=sample
 
     # Run specific step:
-    python main.py run.job=step2 dataset=sample
+    python legacy_pipeline.py run.job=step2 dataset=sample
 
     # Full Behave dataset:
-    python main.py run.job=train dataset=behave
+    python legacy_pipeline.py run.job=train dataset=behave
 """
 import sys
 import os
@@ -947,7 +947,7 @@ def run_step4(cfg: DictConfig, paths: dict, output_dir: str, device: torch.devic
 
 def run_step5(cfg: DictConfig, output_dir: str, device: torch.device):
     """Step 5: End-to-end evaluation."""
-    from test import (
+    from legacy_eval import (
         compute_all_metrics, find_checkpoint,
         get_se3_num_frames, instantiate_se3_from_state_dict,
         load_visualization_inputs, render_and_save_visualization,
@@ -1083,10 +1083,10 @@ def run_step5(cfg: DictConfig, output_dir: str, device: torch.device):
 # Main entry point
 # ---------------------------------------------------------------------------
 
-@hydra.main(config_path='conf', config_name='config', version_base=None)
+@hydra.main(config_path="configs", config_name="config", version_base=None)
 def main(cfg: DictConfig):
     print("=" * 60)
-    print("  Uni-HOI 4.0 — Zero-shot 4D Human-Object Interaction Pipeline")
+    print("  Uni-HOI Legacy Pipeline — Step1 to Step5")
     print("=" * 60)
     print(OmegaConf.to_yaml(cfg))
 

@@ -120,7 +120,7 @@ def load_sequence_data(
     use_cropped = os.path.isdir(rgb_dir)
     frame_sizes_hw = []
 
-    # Prefer Step1-cropped assets so dataset-level training matches main.py Step4.
+    # Prefer Step1-cropped assets so dataset-level training matches legacy_pipeline.py Step4.
     if use_cropped:
         frame_paths = sorted(
             glob.glob(os.path.join(rgb_dir, "*.png"))

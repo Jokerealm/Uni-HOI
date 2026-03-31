@@ -10,7 +10,9 @@ Outputs per sequence:
   - processed/smpl_params.npz
   - processed/object_poses.npz
   - processed/cropped/*
+  - processed/cropped/dual_branch_targets.npz
   - gs_init/G_o.pt
+  - gs_init/G_h_smpl.pt
 
 Runtime features:
   - multi-process sequence parallelism
@@ -47,6 +49,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from dataset.dual_branch_fm_dataset import (
+    DEFAULT_CONTACT_SIGNATURE_DIM,
+    DEFAULT_KEYPOINT_HEATMAP_SIGMA,
+    DUAL_BRANCH_TARGET_CACHE_VERSION,
+    DUAL_BRANCH_TARGETS_FILENAME,
+    SMPL_HUMAN_GAUSSIANS_FILENAME,
+    _assemble_raw_gaussian_tokens,
+    build_human_gaussian_raw_tokens_from_smpl_params,
+    build_keypoint_heatmaps,
+    compute_contact_signature,
+)
 from dataset.video_transforms import (
     compute_bbox_from_masks,
     compute_roi_intrinsics,
@@ -455,7 +468,7 @@ def stack_smpl_params(smpl_params_list: Sequence[Dict[str, np.ndarray]]) -> Dict
     return stacked
 
 
-def sequence_is_prepared(seq_out_dir: Path, processed_subdir: str, gs_subdir: str) -> bool:
+def sequence_has_base_assets(seq_out_dir: Path, processed_subdir: str, gs_subdir: str) -> bool:
     cropped_dir = seq_out_dir / processed_subdir / "cropped"
     required = [
         cropped_dir / "rgb",
@@ -468,6 +481,85 @@ def sequence_is_prepared(seq_out_dir: Path, processed_subdir: str, gs_subdir: st
         seq_out_dir / gs_subdir / "G_o.pt",
     ]
     return all(path.exists() for path in required)
+
+
+def sequence_has_dual_branch_targets(seq_out_dir: Path, processed_subdir: str, gs_subdir: str) -> bool:
+    cropped_dir = seq_out_dir / processed_subdir / "cropped"
+    required = [
+        cropped_dir / DUAL_BRANCH_TARGETS_FILENAME,
+        seq_out_dir / gs_subdir / SMPL_HUMAN_GAUSSIANS_FILENAME,
+    ]
+    return all(path.exists() for path in required)
+
+
+def sequence_is_prepared(seq_out_dir: Path, processed_subdir: str, gs_subdir: str) -> bool:
+    return sequence_has_base_assets(seq_out_dir, processed_subdir, gs_subdir) and sequence_has_dual_branch_targets(
+        seq_out_dir,
+        processed_subdir,
+        gs_subdir,
+    )
+
+
+def prepare_dual_branch_target_caches(
+    seq_out_dir: Path,
+    *,
+    processed_subdir: str,
+    gs_subdir: str,
+    init_gaussian_scale: float,
+) -> int:
+    if not sequence_has_base_assets(seq_out_dir, processed_subdir, gs_subdir):
+        raise FileNotFoundError(f"Base prepared assets are incomplete for {seq_out_dir}")
+
+    processed_dir = seq_out_dir / processed_subdir
+    cropped_dir = processed_dir / "cropped"
+    gs_dir = seq_out_dir / gs_subdir
+
+    with np.load(processed_dir / "smpl_params.npz") as smpl_npz:
+        smpl_params = {key: np.asarray(smpl_npz[key]) for key in smpl_npz.files}
+    human_gaussians_raw = build_human_gaussian_raw_tokens_from_smpl_params(
+        smpl_params,
+        init_gaussian_scale=float(init_gaussian_scale),
+    )
+    torch.save({"raw": human_gaussians_raw.cpu()}, gs_dir / SMPL_HUMAN_GAUSSIANS_FILENAME)
+
+    with np.load(cropped_dir / "keypoints_2d.npz") as keypoints_npz:
+        keypoints_2d = torch.from_numpy(np.asarray(keypoints_npz["keypoints"], dtype=np.float32))
+    with np.load(cropped_dir / "depth_aligned.npz") as depth_npz:
+        depth = np.asarray(depth_npz["depth"], dtype=np.float32)
+    with np.load(processed_dir / "object_poses.npz") as object_pose_npz:
+        object_poses = torch.from_numpy(np.asarray(object_pose_npz["object_poses"], dtype=np.float32))
+    joints_3d = torch.from_numpy(np.asarray(smpl_params["joints_3d"], dtype=np.float32))
+    object_gaussian_payload = torch.load(gs_dir / "G_o.pt", map_location="cpu", weights_only=False)
+    object_gaussians = _assemble_raw_gaussian_tokens(object_gaussian_payload)
+
+    num_frames = min(
+        keypoints_2d.shape[0],
+        depth.shape[0],
+        object_poses.shape[0],
+        joints_3d.shape[0],
+    )
+    keypoint_heatmaps = build_keypoint_heatmaps(
+        keypoints_2d[:num_frames],
+        height=int(depth.shape[-2]),
+        width=int(depth.shape[-1]),
+        sigma=DEFAULT_KEYPOINT_HEATMAP_SIGMA,
+    )
+    contact_signature = compute_contact_signature(
+        joints_3d[:num_frames],
+        object_gaussians,
+        object_poses[:num_frames],
+        contact_dim=DEFAULT_CONTACT_SIGNATURE_DIM,
+    )
+    write_npz(
+        cropped_dir / DUAL_BRANCH_TARGETS_FILENAME,
+        version=np.asarray([DUAL_BRANCH_TARGET_CACHE_VERSION], dtype=np.int32),
+        keypoint_heatmaps=keypoint_heatmaps.cpu().numpy().astype(np.float32),
+        contact_signature=contact_signature.cpu().numpy().astype(np.float32),
+        hand_joint_indices=np.asarray([], dtype=np.int32),
+        contact_base_dim=np.asarray([DEFAULT_CONTACT_SIGNATURE_DIM], dtype=np.int32),
+        heatmap_sigma=np.asarray([DEFAULT_KEYPOINT_HEATMAP_SIGMA], dtype=np.float32),
+    )
+    return int(num_frames)
 
 
 def write_npz(path: Path, **arrays: np.ndarray) -> None:
@@ -493,6 +585,20 @@ def prepare_sequence(
 ) -> Dict[str, object]:
     if sequence_is_prepared(out_seq_dir, processed_subdir, gs_subdir) and not overwrite:
         return {"sequence": raw_seq_dir.name, "status": "skipped"}
+    if not overwrite and sequence_has_base_assets(out_seq_dir, processed_subdir, gs_subdir):
+        cached_frames = prepare_dual_branch_target_caches(
+            out_seq_dir,
+            processed_subdir=processed_subdir,
+            gs_subdir=gs_subdir,
+            init_gaussian_scale=init_gaussian_scale,
+        )
+        return {
+            "sequence": raw_seq_dir.name,
+            "status": "prepared",
+            "frames": cached_frames,
+            "camera": "cache-only",
+            "output_dir": str(out_seq_dir),
+        }
 
     info_path = raw_seq_dir / "info.json"
     if not info_path.is_file():
@@ -874,6 +980,12 @@ def prepare_sequence(
         )
 
         torch.save(object_gaussians_payload, gs_dir / "G_o.pt")
+        prepare_dual_branch_target_caches(
+            out_seq_dir,
+            processed_subdir=processed_subdir,
+            gs_subdir=gs_subdir,
+            init_gaussian_scale=init_gaussian_scale,
+        )
 
     return {
         "sequence": raw_seq_dir.name,

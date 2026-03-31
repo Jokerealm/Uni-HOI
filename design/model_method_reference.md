@@ -8,8 +8,8 @@
 
 | 文件 | 角色 | 主要内容 |
 |---|---|---|
-| `conf/config.yaml` | 全局 Hydra 配置 | 切换 `amodal.method=dual_branch_flow_matching`，并配置 Step1/2/3/4 |
-| `main.py` | 全流程入口 | Step1~Step5 调度；Step2 可走双分支 FM；Step3 在已有 `gs_init_combined.pt` 时会自动跳过 |
+| `configs/config.yaml` | 统一配置入口 | 配置 dual-branch 训练默认值与 legacy pipeline 默认值 |
+| `legacy_pipeline.py` | legacy 全流程入口 | Step1~Step5 调度；Step2 可走双分支 FM；Step3 在已有 `gs_init_combined.pt` 时会自动跳过 |
 | `configs/step2_config.py` | Step2 配置 dataclass | 定义 Step2 wrapper 的输入参数 |
 | `configs/step3_config.py` | FM 推理配置 dataclass | 提供 Step2 FM 推理时共用的配置容器 |
 | `pipeline/step2_dual_branch_flow_matching.py` | Step2 wrapper | 把 Hydra 配置转成 `infer_dual_branch_fm.py` 的参数 |
@@ -52,7 +52,7 @@
 
 - Step1：负责输出稳定条件，不负责生成最终结果
 - Step2：双分支 FM 主模型，直接输出 amodal video + 4D state
-- Step3：如果 Step2 已经写出了 `gs_init_combined.pt`，`main.py` 会跳过 Step3
+- Step3：如果 Step2 已经写出了 `gs_init_combined.pt`，`legacy_pipeline.py` 会跳过 Step3
 - Step4：继续用联合 3DGS 优化做 refinement，而不是主生成
 
 ## 3. 数据契约
@@ -665,7 +665,7 @@ for k in range(num_ode_steps):
 
 ### 10.4 Step3 在双分支 FM 路径里是可跳过的
 
-`main.py` 的逻辑是：
+`legacy_pipeline.py` 的逻辑是：
 
 - 如果 Step2 已经在 `gs_init/gs_init_combined.pt` 写出了联合 4D 状态
 - 那么 Step3 的 Hunyuan3D lifting 可以直接跳过

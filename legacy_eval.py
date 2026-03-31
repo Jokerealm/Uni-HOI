@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test.py — Unified Evaluation & Metrics Entry Point (Step 5)
+legacy_eval.py — Legacy Step-5 evaluation entry point
 
 Loads a trained checkpoint and computes:
   - Chamfer Distance: CD-h (human), CD-o (object), CD-c (combined)
@@ -10,14 +10,14 @@ Loads a trained checkpoint and computes:
 
 Usage:
     # Evaluate latest checkpoint on sample data:
-    CUDA_VISIBLE_DEVICES=1 python test.py dataset=sample checkpoint.run_id=latest
+    CUDA_VISIBLE_DEVICES=1 python legacy_eval.py dataset=sample checkpoint.run_id=latest
 
     # Evaluate specific checkpoint:
-    CUDA_VISIBLE_DEVICES=1 python test.py dataset=sample \
+    CUDA_VISIBLE_DEVICES=1 python legacy_eval.py dataset=sample \
         checkpoint.path=outputs/runs/2026-03-14_12-00-00/checkpoint_latest.pt
 
     # Full Behave evaluation:
-    CUDA_VISIBLE_DEVICES=1 python test.py dataset=behave checkpoint.run_id=latest
+    CUDA_VISIBLE_DEVICES=1 python legacy_eval.py dataset=behave checkpoint.run_id=latest
 """
 import sys
 import os
@@ -463,7 +463,7 @@ def find_checkpoint(cfg: DictConfig) -> str:
 # Main Evaluation
 # ============================================================
 
-@hydra.main(config_path="conf", config_name="config", version_base=None)
+@hydra.main(config_path="configs", config_name="config", version_base=None)
 def main(cfg: DictConfig):
     """Unified evaluation entry point."""
     print("=" * 60)

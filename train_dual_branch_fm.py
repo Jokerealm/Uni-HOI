@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 import importlib.util
+import json
 import math
 import os
 import random
@@ -25,15 +26,14 @@ import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration, set_seed
-from PIL import Image
+from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from torch import Tensor, nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
 from tqdm.auto import tqdm
 
@@ -86,6 +86,8 @@ LOSS_PRESETS: dict[str, tuple[str, ...]] = {
     "stage0": STAGE0_LOSS_NAMES,
     "full": LOSS_NAMES,
 }
+
+_HONEST_RENDER_MODULE = None
 
 
 def decode_gaussian_params(tokens: Tensor) -> Dict[str, Tensor]:
@@ -169,47 +171,58 @@ class SequencePrefetchBatchIterator:
         batch_size: int,
         drop_last: bool,
         seed: int,
+        process_index: int = 0,
+        num_processes: int = 1,
         warm_start_short_sequences: bool = True,
     ) -> None:
         self.dataset = dataset
         self.batch_size = int(batch_size)
         self.drop_last = bool(drop_last)
         self.seed = int(seed)
+        self.process_index = max(int(process_index), 0)
+        self.num_processes = max(int(num_processes), 1)
         self.warm_start_short_sequences = bool(warm_start_short_sequences)
         self._epoch = 0
-        self._sequence_dirs = [
+        self._all_sequence_dirs = [
             sequence_dir
             for sequence_dir in dataset.sequence_dirs
             if dataset.sequence_sample_indices.get(sequence_dir)
         ]
 
-    def __len__(self) -> int:
-        total = 0
-        for sequence_dir in self._sequence_dirs:
-            num_samples = len(self.dataset.sequence_sample_indices[sequence_dir])
-            if self.drop_last:
-                total += num_samples // self.batch_size
-            else:
-                total += math.ceil(num_samples / self.batch_size)
-        return total
-
-    def _ordered_sequence_dirs(self) -> list[str]:
-        sequence_dirs = list(self._sequence_dirs)
-        if self._epoch == 0 and self.warm_start_short_sequences:
+    def _ordered_sequence_dirs_for_epoch(self, epoch: int) -> list[str]:
+        sequence_dirs = list(self._all_sequence_dirs)
+        if epoch == 0 and self.warm_start_short_sequences:
             sequence_dirs.sort(
                 key=lambda sequence_dir: (
                     self.dataset.sequence_frame_counts[sequence_dir],
                     sequence_dir,
                 )
             )
-            return sequence_dirs
-        rng = random.Random(self.seed + self._epoch)
-        rng.shuffle(sequence_dirs)
+        else:
+            rng = random.Random(self.seed + epoch)
+            rng.shuffle(sequence_dirs)
+        if self.num_processes > 1:
+            sequence_dirs = sequence_dirs[self.process_index :: self.num_processes]
         return sequence_dirs
 
+    @property
+    def local_sequence_count(self) -> int:
+        return len(self._ordered_sequence_dirs_for_epoch(self._epoch))
+
+    def __len__(self) -> int:
+        total = 0
+        for sequence_dir in self._ordered_sequence_dirs_for_epoch(self._epoch):
+            num_samples = len(self.dataset.sequence_sample_indices[sequence_dir])
+            if self.drop_last:
+                total += num_samples // self.batch_size
+            else:
+                total += (num_samples + self.batch_size - 1) // self.batch_size
+        return total
+
     def __iter__(self):
-        sequence_dirs = self._ordered_sequence_dirs()
-        rng = random.Random(self.seed + self._epoch)
+        epoch = self._epoch
+        sequence_dirs = self._ordered_sequence_dirs_for_epoch(epoch)
+        rng = random.Random(self.seed + epoch)
         self._epoch += 1
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sequence-prefetch")
         prefetched_dir: Optional[str] = None
@@ -288,103 +301,373 @@ def compute_masked_l1(prediction: Tensor, target: Tensor, mask: Tensor) -> Tenso
     return ((prediction - target).abs() * mask).sum() / denom
 
 
-def _video_strip_to_uint8(video: Tensor) -> Tensor:
-    if video.ndim != 4:
-        raise ValueError(f"`video` must have shape [T, C, H, W], got {tuple(video.shape)}.")
-    video = torch.nan_to_num(video.detach().float().cpu(), nan=0.0, posinf=1.0, neginf=0.0)
-    if video.shape[1] == 1:
-        vmin = video.amin(dim=(0, 2, 3), keepdim=True)
-        vmax = video.amax(dim=(0, 2, 3), keepdim=True)
-        video = (video - vmin) / (vmax - vmin).clamp(min=1e-6)
-        video = video.repeat(1, 3, 1, 1)
-    else:
-        if video.shape[1] < 3:
-            repeats = math.ceil(3 / video.shape[1])
-            video = video.repeat(1, repeats, 1, 1)
-        video = video[:, :3].clamp(0.0, 1.0)
-    frames = (video * 255.0).round().to(torch.uint8)
-    return torch.cat([frame.permute(1, 2, 0) for frame in frames], dim=1)
+def compute_point_set_chamfer(prediction_xyz: Tensor, target_xyz: Tensor) -> Tensor:
+    if prediction_xyz.ndim != 3 or target_xyz.ndim != 3:
+        raise ValueError(
+            f"`prediction_xyz` and `target_xyz` must have shape [B, N, 3] / [B, M, 3], "
+            f"got {tuple(prediction_xyz.shape)} and {tuple(target_xyz.shape)}."
+        )
+    distances = torch.cdist(prediction_xyz, target_xyz)
+    return distances.min(dim=-1).values.mean() + distances.min(dim=-2).values.mean()
 
 
-def _build_visualization_grid(rows: list[tuple[str, Tensor]]) -> Image.Image:
-    strips = [_video_strip_to_uint8(row_video) for _, row_video in rows]
-    pad = 8
-    total_height = sum(int(strip.shape[0]) for strip in strips) + pad * max(len(strips) - 1, 0)
-    max_width = max(int(strip.shape[1]) for strip in strips)
-    canvas = torch.full((total_height, max_width, 3), 18, dtype=torch.uint8)
-    cursor = 0
-    for strip in strips:
-        h, w = int(strip.shape[0]), int(strip.shape[1])
-        canvas[cursor : cursor + h, :w] = strip
-        cursor += h + pad
-    return Image.fromarray(canvas.numpy())
+def _gaussian_tokens_to_cloud(tokens: Tensor) -> np.ndarray:
+    raw = tokens.detach().float().cpu()
+    if raw.ndim == 3:
+        if raw.shape[0] != 1:
+            raise ValueError(f"Expected batched Gaussian tokens with batch=1, got {tuple(raw.shape)}.")
+        raw = raw.squeeze(0)
+    if raw.ndim != 2 or raw.shape[-1] != 14:
+        raise ValueError(f"Expected Gaussian tokens with shape [N, 14], got {tuple(raw.shape)}.")
+    xyz = raw[:, 0:3].numpy().astype(np.float32)
+    rgb = raw[:, 11:14].clamp(0.0, 1.0).numpy().astype(np.float32)
+    return np.concatenate([xyz, rgb], axis=1)
+
+
+def _transform_cloud(cloud: np.ndarray, transform: Tensor) -> np.ndarray:
+    transform_np = transform.detach().cpu().numpy().astype(np.float32)
+    xyz = cloud[:, :3]
+    xyz_h = np.concatenate([xyz, np.ones((xyz.shape[0], 1), dtype=np.float32)], axis=1)
+    xyz_world = (transform_np @ xyz_h.T).T[:, :3]
+    out = cloud.copy()
+    out[:, :3] = xyz_world
+    return out
+
+
+def _load_honest_render_module():
+    global _HONEST_RENDER_MODULE
+    if _HONEST_RENDER_MODULE is not None:
+        return _HONEST_RENDER_MODULE
+    module_path = Path(__file__).resolve().parent / "scripts" / "render_dual_branch_pointclouds.py"
+    spec = importlib.util.spec_from_file_location("dual_branch_honest_render", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load honest render module from {module_path}.")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _HONEST_RENDER_MODULE = module
+    return module
+
+
+def _resolve_honest_validation_sequence_dir(
+    requested_sequence: str,
+    sequence_dirs: list[str],
+) -> str:
+    if not sequence_dirs:
+        raise RuntimeError("No dataset sequences are available for honest 3D validation.")
+    if not requested_sequence:
+        return sequence_dirs[0]
+    requested = requested_sequence.strip()
+    for sequence_dir in sequence_dirs:
+        if sequence_dir == requested or Path(sequence_dir).name == requested:
+            return sequence_dir
+    available = ", ".join(Path(path).name for path in sequence_dirs[:10])
+    raise KeyError(
+        f"Could not resolve honest validation sequence `{requested_sequence}`. "
+        f"Available examples: {available}"
+    )
+
+
+def _save_validation_gaussian_tokens(tokens: Tensor, path: Path, metadata: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = tokens.detach().cpu()
+    if raw.ndim == 3:
+        raw = raw.squeeze(0)
+    payload = {
+        "xyz": raw[:, 0:3],
+        "rotation": raw[:, 3:7],
+        "scaling": raw[:, 7:10],
+        "opacity": raw[:, 10:11],
+        "shs": raw[:, 11:14],
+        "raw": raw,
+        "metadata": metadata,
+    }
+    torch.save(payload, path)
+
+
+def _save_validation_combined_state(
+    decoded_state: DecodedHOIState,
+    output_dir: Path,
+    *,
+    sequence_name: str,
+    num_ode_steps: int,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "G_h": {"raw": decoded_state.human_gaussians.squeeze(0).detach().cpu()},
+        "G_o": {"raw": decoded_state.object_gaussians.squeeze(0).detach().cpu()},
+        "motion": {
+            "joints_3d": decoded_state.joints_3d.squeeze(0).detach().cpu(),
+            "object_poses": decoded_state.object_transforms.squeeze(0).detach().cpu(),
+            "contact_signature": decoded_state.contact_signature.squeeze(0).detach().cpu(),
+        },
+        "metadata": {
+            "sequence_name": sequence_name,
+            "num_frames": int(decoded_state.joints_3d.shape[1]),
+            "num_ode_steps": int(num_ode_steps),
+        },
+    }
+    torch.save(payload, output_dir / "gs_init_combined.pt")
 
 
 @torch.no_grad()
-def export_training_visualization(
+def run_honest_3d_validation(
     *,
     model: DualBranchCoGenerativeFlowMatching,
-    output,
-    video_xt: Tensor,
-    state_xt: Tensor,
-    timesteps: Tensor,
-    rgb: Tensor,
-    human_visible: Tensor,
-    object_visible: Tensor,
-    masks_human: Tensor,
-    masks_object: Tensor,
-    teacher_object_render: Tensor,
-    teacher_object_video: Tensor,
-    camera_intrinsics_render: Tensor,
-    renderer: DiffRasterizationLayer,
+    dataset: DualBranchHOIDataset,
+    sequence_dir: str,
+    device: torch.device,
     output_dir: str,
     step: int,
-) -> tuple[Path, str]:
-    vis_dir = Path(output_dir) / "visualizations"
-    vis_dir.mkdir(parents=True, exist_ok=True)
+    args: argparse.Namespace,
+    wandb_enabled: bool,
+) -> Dict[str, float]:
+    render_module = _load_honest_render_module()
+    render_args = argparse.Namespace(
+        overwrite=True,
+        image_size=512,
+        radius=0.012,
+        points_per_pixel=12,
+        num_frames=24,
+        fps=12,
+        elev=10.0,
+        dist=1.9,
+        azim_start=180.0,
+        focal_scale=3.0,
+        scene_scale=0.85,
+        quantile=0.02,
+    )
+
+    bundle = dataset.get_sequence_bundle(sequence_dir)
+    sample = dataset.get_sample(sequence_dir, 0, bundle=bundle)
+    sequence_name = str(sample["sequence_name"])
+    step_dir = Path(output_dir) / "honest_validations" / f"step_{step:07d}" / sequence_name
+    gs_dir = step_dir / "pred_state"
+    render_dir = step_dir / "honest_renders"
+    render_dir.mkdir(parents=True, exist_ok=True)
+
+    rgb = sample["rgb"].unsqueeze(0).to(device)
+    masks_human = sample["masks_human"].unsqueeze(0).to(device)
+    masks_object = sample["masks_object"].unsqueeze(0).to(device)
+    depth = sample["depth"].unsqueeze(0).to(device)
+    m_primary = sample["m_primary"].unsqueeze(0).to(device)
+    m_secondary = sample["m_secondary"].unsqueeze(0).to(device)
+    m_object_region = sample["m_object_region"].unsqueeze(0).to(device)
+    keypoint_heatmaps = sample["keypoint_heatmaps"].unsqueeze(0).to(device)
+    camera_intrinsics = sample["camera_intrinsics"].unsqueeze(0).to(device)
+
+    if rgb.shape[-2:] != (args.image_height, args.image_width):
+        source_hw = (int(rgb.shape[-2]), int(rgb.shape[-1]))
+        rgb = resize_video_batch(rgb, size=(args.image_height, args.image_width), mode="bilinear")
+        masks_human = resize_video_batch(masks_human, size=(args.image_height, args.image_width), mode="nearest")
+        masks_object = resize_video_batch(masks_object, size=(args.image_height, args.image_width), mode="nearest")
+        depth = resize_video_batch(depth, size=(args.image_height, args.image_width), mode="bilinear")
+        m_primary = resize_video_batch(m_primary, size=(args.image_height, args.image_width), mode="nearest")
+        m_secondary = resize_video_batch(m_secondary, size=(args.image_height, args.image_width), mode="nearest")
+        m_object_region = resize_video_batch(
+            m_object_region,
+            size=(args.image_height, args.image_width),
+            mode="nearest",
+        )
+        keypoint_heatmaps = resize_video_batch(
+            keypoint_heatmaps,
+            size=(args.image_height, args.image_width),
+            mode="bilinear",
+        )
+        camera_intrinsics = scale_camera_intrinsics(
+            camera_intrinsics,
+            source_size=source_hw,
+            target_size=(args.image_height, args.image_width),
+        )
+
+    condition_video = torch.cat(
+        [
+            rgb,
+            masks_human,
+            masks_object,
+            depth,
+            m_primary,
+            m_secondary,
+            m_object_region,
+            keypoint_heatmaps,
+        ],
+        dim=2,
+    )
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(args.seed) + int(step))
+
+    video_latents = torch.randn(
+        1,
+        model.video_codec.num_frames * model.video_codec.num_patches_per_frame,
+        args.hidden_dim,
+        generator=generator,
+        device=device,
+    ) * float(args.honest_val_prior_noise_std)
+    state_latents = torch.randn(
+        1,
+        model.state_codec.total_tokens,
+        args.hidden_dim,
+        generator=generator,
+        device=device,
+    ) * float(args.honest_val_prior_noise_std)
 
     was_training = model.training
     model.eval()
     try:
-        batch_size = 1
-        t_view = timesteps[:batch_size].view(batch_size, 1, 1)
-        video_x1_hat = video_xt[:batch_size] + (1.0 - t_view) * output.video_velocity[:batch_size]
-        state_x1_hat = state_xt[:batch_size] + (1.0 - t_view) * output.state_velocity[:batch_size]
-        decoded_video = model.decode_video_tokens(video_x1_hat)
-        decoded_state = model.decode_state_tokens(state_x1_hat)
-
-        pred_human_video = decoded_video[:, :, :3]
-        pred_object_video = decoded_video[:, :, 3:6]
-        pred_object_render = render_object_branch(
-            renderer,
-            decoded_state.object_gaussians,
-            decoded_state.object_transforms,
-            camera_intrinsics_render[:batch_size],
+        times = torch.linspace(
+            0.0,
+            1.0,
+            int(args.honest_val_num_ode_steps) + 1,
+            device=device,
+            dtype=video_latents.dtype,
         )
-
-        rows = [
-            ("rgb", rgb[0]),
-            ("human_target", human_visible[0]),
-            ("human_pred", pred_human_video[0]),
-            ("object_visible", object_visible[0]),
-            ("object_target", teacher_object_video[0]),
-            ("object_pred", pred_object_video[0]),
-            ("object_render_target", teacher_object_render[0]),
-            ("object_render_pred", pred_object_render[0]),
-            ("mask_human", masks_human[0]),
-            ("mask_object", masks_object[0]),
-        ]
-        image = _build_visualization_grid(rows)
-        path = vis_dir / f"step_{step:07d}.png"
-        image.save(path)
-        caption = (
-            f"step={step} | rows=rgb,human_target,human_pred,object_visible,"
-            f"object_target,object_pred,object_render_target,object_render_pred,mask_human,mask_object"
-        )
-        return path, caption
+        for ode_step in range(int(args.honest_val_num_ode_steps)):
+            t_cur = times[ode_step].expand(1)
+            dt = times[ode_step + 1] - times[ode_step]
+            output = model(
+                video_xt=video_latents,
+                state_xt=state_latents,
+                timesteps=t_cur,
+                condition_video=condition_video,
+                camera_intrinsics=camera_intrinsics,
+            )
+            video_latents = video_latents + dt.view(1, 1, 1) * output.video_velocity
+            state_latents = state_latents + dt.view(1, 1, 1) * output.state_velocity
+        decoded_state = model.decode_state_tokens(state_latents)
     finally:
         if was_training:
             model.train()
+
+    metadata = {
+        "sequence_name": sequence_name,
+        "step": int(step),
+        "num_frames": int(decoded_state.joints_3d.shape[1]),
+        "num_ode_steps": int(args.honest_val_num_ode_steps),
+    }
+    _save_validation_gaussian_tokens(decoded_state.human_gaussians, gs_dir / "G_h.pt", metadata)
+    _save_validation_gaussian_tokens(decoded_state.object_gaussians, gs_dir / "G_o.pt", metadata)
+    _save_validation_combined_state(
+        decoded_state,
+        gs_dir,
+        sequence_name=sequence_name,
+        num_ode_steps=int(args.honest_val_num_ode_steps),
+    )
+
+    pred_human = _gaussian_tokens_to_cloud(decoded_state.human_gaussians)
+    gt_human = _gaussian_tokens_to_cloud(sample["human_gaussians"])
+    pred_object_world = _transform_cloud(
+        _gaussian_tokens_to_cloud(decoded_state.object_gaussians),
+        decoded_state.object_transforms[0, 0],
+    )
+    gt_object_world = _transform_cloud(
+        _gaussian_tokens_to_cloud(sample["object_gaussians"]),
+        sample["object_poses"][0],
+    )
+
+    human_outputs = render_module.render_comparison(
+        pair_key="human_canonical",
+        title="human canonical: pred vs GT",
+        pred_cloud=pred_human,
+        gt_cloud=gt_human,
+        render_dir=render_dir,
+        args=render_args,
+        device=device,
+    )
+    object_outputs = render_module.render_comparison(
+        pair_key="object_world_frame0000",
+        title="object world frame0: pred vs GT",
+        pred_cloud=pred_object_world,
+        gt_cloud=gt_object_world,
+        render_dir=render_dir,
+        args=render_args,
+        device=device,
+    )
+
+    metrics = {
+        "honest3d/human_canonical_pred_to_gt_mean_nn": render_module.compute_pair_metrics(pred_human, gt_human)[
+            "pred_to_gt_mean_nn"
+        ],
+        "honest3d/human_canonical_gt_to_pred_mean_nn": render_module.compute_pair_metrics(pred_human, gt_human)[
+            "gt_to_pred_mean_nn"
+        ],
+        "honest3d/object_world_frame0000_pred_to_gt_mean_nn": render_module.compute_pair_metrics(
+            pred_object_world,
+            gt_object_world,
+        )["pred_to_gt_mean_nn"],
+        "honest3d/object_world_frame0000_gt_to_pred_mean_nn": render_module.compute_pair_metrics(
+            pred_object_world,
+            gt_object_world,
+        )["gt_to_pred_mean_nn"],
+    }
+
+    (render_dir / "honest_render_meta.json").write_text(
+        json.dumps(
+            {
+                "sequence_name": sequence_name,
+                "step": int(step),
+                "num_ode_steps": int(args.honest_val_num_ode_steps),
+                "metrics": metrics,
+                "notes": [
+                    "human is compared in canonical space",
+                    "object is compared in frame-0 world space",
+                    "no mixed-space merged visualization is produced",
+                ],
+            },
+            indent=2,
+        )
+    )
+
+    if wandb_enabled:
+        try:
+            import wandb
+
+            wandb.log(
+                {
+                    "honest3d/sequence_name": sequence_name,
+                    "honest3d/human_canonical_pred_vs_gt_video": wandb.Video(
+                        str(human_outputs["video"]),
+                        format="mp4",
+                    ),
+                    "honest3d/human_canonical_pred_vs_gt_preview": wandb.Image(str(human_outputs["preview"])),
+                    "honest3d/object_world_frame0000_pred_vs_gt_video": wandb.Video(
+                        str(object_outputs["video"]),
+                        format="mp4",
+                    ),
+                    "honest3d/object_world_frame0000_pred_vs_gt_preview": wandb.Image(
+                        str(object_outputs["preview"])
+                    ),
+                    "honest3d/pointcloud/human_canonical_pred": wandb.Object3D(
+                        render_module.cloud_to_object3d(pred_human)
+                    ),
+                    "honest3d/pointcloud/human_canonical_gt": wandb.Object3D(
+                        render_module.cloud_to_object3d(gt_human)
+                    ),
+                    "honest3d/pointcloud/object_world_frame0000_pred": wandb.Object3D(
+                        render_module.cloud_to_object3d(pred_object_world)
+                    ),
+                    "honest3d/pointcloud/object_world_frame0000_gt": wandb.Object3D(
+                        render_module.cloud_to_object3d(gt_object_world)
+                    ),
+                    **metrics,
+                },
+                step=step,
+            )
+        except Exception as exc:
+            print(
+                f"[train_dual_branch_fm] warning: failed to upload honest 3D validation "
+                f"| step={step:07d} | error={exc}",
+                flush=True,
+            )
+
+    print(
+        f"[train_dual_branch_fm] honest 3D validation saved "
+        f"| step={step:07d} "
+        f"| sequence={sequence_name} "
+        f"| object_pred_to_gt={metrics['honest3d/object_world_frame0000_pred_to_gt_mean_nn']:.4f} "
+        f"| human_pred_to_gt={metrics['honest3d/human_canonical_pred_to_gt_mean_nn']:.4f} "
+        f"| render_dir={render_dir}",
+        flush=True,
+    )
+    return metrics
 
 
 def rotation_geodesic_loss(prediction: Tensor, target: Tensor) -> Tensor:
@@ -599,8 +882,14 @@ def compute_losses(
         else zero
     )
 
-    loss_human_gaussian = F.smooth_l1_loss(decoded_state.human_gaussians, teacher_state.human_gaussians)
-    loss_object_gaussian = F.smooth_l1_loss(decoded_state.object_gaussians, teacher_state.object_gaussians)
+    loss_human_gaussian = compute_point_set_chamfer(
+        decoded_state.human_gaussians[..., :3],
+        teacher_state.human_gaussians[..., :3],
+    )
+    loss_object_gaussian = compute_point_set_chamfer(
+        decoded_state.object_gaussians[..., :3],
+        teacher_state.object_gaussians[..., :3],
+    )
     loss_joints = F.smooth_l1_loss(decoded_state.joints_3d, teacher_state.joints_3d)
     loss_object_motion_translation = F.smooth_l1_loss(
         decoded_state.object_transforms[..., :3, 3],
@@ -709,6 +998,8 @@ def resume_if_available(
             f"Missing keys: {incompatible.missing_keys[:10]} "
             f"| Unexpected keys: {incompatible.unexpected_keys[:10]}"
         )
+    if bool(getattr(args, "resume_model_only", False)):
+        return int(checkpoint.get("step", 0))
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
     return int(checkpoint.get("step", 0))
@@ -734,9 +1025,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mixed_precision", type=str, default="no", choices=("no", "fp16", "bf16"))
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--resume_checkpoint", type=str, default="")
+    parser.add_argument("--resume_model_only", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_steps", type=int, default=10000)
     parser.add_argument("--save_every", type=int, default=1000)
     parser.add_argument("--log_every", type=int, default=20)
@@ -755,7 +1046,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rgb_cache_max_frames", type=int, default=256)
     parser.add_argument("--index_progress_every", type=int, default=10)
     parser.add_argument("--background_value", type=float, default=1.0)
-    parser.add_argument("--prefetch_factor", type=int, default=2)
 
     parser.add_argument("--image_height", type=int, default=256)
     parser.add_argument("--image_width", type=int, default=256)
@@ -786,20 +1076,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda_object_video", type=float, default=1.0)
     parser.add_argument("--lambda_object_render", type=float, default=1.0)
     parser.add_argument("--lambda_branch_coupling", type=float, default=0.25)
-    parser.add_argument("--lambda_human_gaussian", type=float, default=0.1)
-    parser.add_argument("--lambda_object_gaussian", type=float, default=0.1)
+    parser.add_argument("--lambda_human_gaussian", type=float, default=1.0)
+    parser.add_argument("--lambda_object_gaussian", type=float, default=1.0)
     parser.add_argument("--lambda_joints", type=float, default=1.0)
     parser.add_argument("--lambda_object_motion", type=float, default=0.5)
     parser.add_argument("--lambda_contact", type=float, default=0.25)
     parser.add_argument("--lambda_joint_heat", type=float, default=0.5)
     parser.add_argument("--lambda_object_silhouette", type=float, default=0.5)
     parser.add_argument("--lambda_object_depth", type=float, default=0.25)
-    parser.add_argument("--lambda_geometry_distill", type=float, default=0.25)
+    parser.add_argument("--lambda_geometry_distill", type=float, default=0.05)
     parser.add_argument("--curriculum_fusion_start_ratio", type=float, default=0.2)
     parser.add_argument("--curriculum_full_start_ratio", type=float, default=0.6)
     parser.add_argument("--freeze_video_backbone", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--video_unfreeze_start_ratio", type=float, default=-1.0)
     parser.add_argument("--video_stage2_num_top_blocks", type=int, default=2)
+    parser.add_argument("--honest_val_every", type=int, default=5000)
+    parser.add_argument("--honest_val_num_ode_steps", type=int, default=50)
+    parser.add_argument("--honest_val_prior_noise_std", type=float, default=1.0)
+    parser.add_argument("--honest_val_sequence", type=str, default="")
     return parser
 
 
@@ -826,12 +1120,12 @@ def main() -> None:
         raise ValueError(f"`clip_length` must be > 0, got {args.clip_length}.")
     if args.max_steps <= 0:
         raise ValueError(f"`max_steps` must be > 0, got {args.max_steps}.")
-    if args.num_workers < 0:
-        raise ValueError(f"`num_workers` must be >= 0, got {args.num_workers}.")
     if args.save_every <= 0 or args.log_every <= 0 or args.print_every <= 0:
         raise ValueError("`save_every`, `log_every`, and `print_every` must all be > 0.")
-    if args.prefetch_factor <= 0:
-        raise ValueError(f"`prefetch_factor` must be > 0, got {args.prefetch_factor}.")
+    if args.honest_val_every < 0:
+        raise ValueError(f"`honest_val_every` must be >= 0, got {args.honest_val_every}.")
+    if args.honest_val_num_ode_steps <= 0:
+        raise ValueError(f"`honest_val_num_ode_steps` must be > 0, got {args.honest_val_num_ode_steps}.")
     resolve_video_backbone_unfreeze_step(args)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     configure_torch_runtime()
@@ -850,11 +1144,13 @@ def main() -> None:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         log_with=log_with,
         project_config=project_config,
+        kwargs_handlers=[DistributedDataParallelKwargs(static_graph=True)],
     )
     wandb_enabled = log_with == "wandb"
     set_seed(args.seed, device_specific=True)
     if accelerator.is_main_process and log_with is not None:
-        accelerator.init_trackers(args.project_name, config=vars(args))
+        init_kwargs = {"wandb": {"name": Path(args.output_dir).name}} if wandb_enabled else {}
+        accelerator.init_trackers(args.project_name, config=vars(args), init_kwargs=init_kwargs)
     if accelerator.is_main_process:
         print(
             f"[train_dual_branch_fm] accelerator ready "
@@ -929,6 +1225,12 @@ def main() -> None:
             )
         print("[train_dual_branch_fm] inferring condition channels from first sample...", flush=True)
     condition_channels = infer_condition_channels(dataset)
+    honest_val_sequence_dir = None
+    if args.honest_val_every > 0:
+        honest_val_sequence_dir = _resolve_honest_validation_sequence_dir(
+            args.honest_val_sequence,
+            list(dataset.sequence_dirs),
+        )
     if accelerator.is_main_process:
         print(f"[train_dual_branch_fm] condition channels ready | channels={condition_channels}", flush=True)
         print(
@@ -937,6 +1239,14 @@ def main() -> None:
             f"| active={','.join(resolve_active_loss_names(args))}",
             flush=True,
         )
+        if honest_val_sequence_dir is not None:
+            print(
+                "[train_dual_branch_fm] honest 3D validation ready "
+                f"| every={args.honest_val_every} "
+                f"| sequence={Path(honest_val_sequence_dir).name} "
+                f"| ode_steps={args.honest_val_num_ode_steps}",
+                flush=True,
+            )
 
     model = DualBranchCoGenerativeFlowMatching(
         hidden_dim=args.hidden_dim,
@@ -962,56 +1272,36 @@ def main() -> None:
     video_schedule_metrics = apply_video_backbone_schedule(model, args, global_step)
     trainable_parameters = collect_trainable_parameters(model)
 
-    use_sequence_prefetch_iterator = accelerator.num_processes == 1
-    train_iterator = None
-    dataloader = None
-    if use_sequence_prefetch_iterator:
-        train_iterator = SequencePrefetchBatchIterator(
-            dataset,
-            batch_size=args.batch_size,
-            drop_last=True,
-            seed=args.seed,
-        )
-        num_batches = len(train_iterator)
-    else:
-        dataloader_kwargs = {
-            "batch_size": args.batch_size,
-            "shuffle": True,
-            "num_workers": args.num_workers,
-            "pin_memory": True,
-            "drop_last": True,
-            "persistent_workers": args.num_workers > 0,
-        }
-        if args.num_workers > 0:
-            dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
-        dataloader = DataLoader(dataset, **dataloader_kwargs)
-        num_batches = len(dataloader)
+    train_iterator = SequencePrefetchBatchIterator(
+        dataset,
+        batch_size=args.batch_size,
+        drop_last=True,
+        seed=args.seed,
+        process_index=accelerator.process_index,
+        num_processes=accelerator.num_processes,
+    )
+    num_batches = len(train_iterator)
     if num_batches == 0:
         raise ValueError(
-            "Dataloader has zero batches. "
-            f"clips={len(dataset)}, batch_size={args.batch_size}, drop_last=True. "
+            "Sequence iterator has zero local batches. "
+            f"clips={len(dataset)}, batch_size={args.batch_size}, drop_last=True, "
+            f"process_index={accelerator.process_index}, world_size={accelerator.num_processes}. "
             "Lower the batch size or provide more training clips."
         )
     if accelerator.is_main_process:
-        if use_sequence_prefetch_iterator:
-            print(
-                f"[train_dual_branch_fm] sequence prefetch iterator ready "
-                f"| batch_size_per_device={args.batch_size} "
-                f"| cache_sequences={args.dataset_cache_sequences} "
-                f"| rgb_cache_max_frames={args.rgb_cache_max_frames} "
-                f"| warm_start_short_sequences=1"
-                ,
-                flush=True,
-            )
+        if accelerator.num_processes == 1:
+            iterator_mode = "sequence-prefetch"
         else:
-            print(
-                f"[train_dual_branch_fm] dataloader ready "
-                f"| batch_size_per_device={args.batch_size} "
-                f"| workers={args.num_workers} "
-                f"| persistent_workers={args.num_workers > 0}"
-                ,
-                flush=True,
-            )
+            iterator_mode = "sequence-shard"
+        print(
+            f"[train_dual_branch_fm] {iterator_mode} iterator ready "
+            f"| batch_size_per_device={args.batch_size} "
+            f"| cache_sequences={args.dataset_cache_sequences} "
+            f"| rgb_cache_max_frames={args.rgb_cache_max_frames} "
+            f"| world_size={accelerator.num_processes}"
+            ,
+            flush=True,
+        )
 
     renderer = DiffRasterizationLayer(
         image_height=args.image_height,
@@ -1021,19 +1311,11 @@ def main() -> None:
     if accelerator.is_main_process:
         print("[train_dual_branch_fm] renderer ready, preparing accelerator-wrapped modules...", flush=True)
 
-    if use_sequence_prefetch_iterator:
-        model, optimizer, scheduler = accelerator.prepare(
-            model,
-            optimizer,
-            scheduler,
-        )
-    else:
-        model, optimizer, dataloader, scheduler = accelerator.prepare(
-            model,
-            optimizer,
-            dataloader,
-            scheduler,
-        )
+    model, optimizer, scheduler = accelerator.prepare(
+        model,
+        optimizer,
+        scheduler,
+    )
     if accelerator.is_main_process:
         print("[train_dual_branch_fm] accelerator.prepare complete, entering training setup...", flush=True)
     all_parameters = tuple(model.parameters())
@@ -1043,19 +1325,17 @@ def main() -> None:
     start_time = time.time()
     last_video_stage = None
     last_unfrozen_video_blocks = None
-    loader_label = (
-        "sequence-prefetch"
-        if use_sequence_prefetch_iterator
-        else f"dataloader:{args.num_workers}w"
-    )
-    progress_bar = None
+    if accelerator.num_processes == 1:
+        loader_label = "sequence-prefetch"
+    else:
+        loader_label = f"sequence-shard:{accelerator.process_index}/{accelerator.num_processes}"
     checkpoint_progress_bar = None
     checkpoint_segment_end = None
 
     def create_checkpoint_progress_bar(step: int):
         if not accelerator.is_main_process:
             return None, None
-        segment_size = max(int(args.save_every), 1)
+        segment_size = int(args.honest_val_every) if int(args.honest_val_every) > 0 else 5000
         segment_start = (step // segment_size) * segment_size
         segment_end = min(segment_start + segment_size, args.max_steps)
         if segment_end <= step and step < args.max_steps:
@@ -1066,12 +1346,11 @@ def main() -> None:
         bar = tqdm(
             total=segment_total,
             initial=segment_initial,
-            desc=f"checkpoint {segment_start:07d}->{segment_end:07d}",
+            desc=f"progress {segment_start:07d}->{segment_end:07d}",
             unit="step",
             dynamic_ncols=True,
             smoothing=0.1,
-            position=1,
-            leave=False,
+            leave=True,
         )
         return bar, segment_end
 
@@ -1095,17 +1374,10 @@ def main() -> None:
             f"| grad_accum={args.gradient_accumulation_steps} "
             f"| loader={loader_label} "
             f"| save_every={args.save_every} "
-            f"| log_every={args.log_every}"
+            f"| log_every={args.log_every} "
+            f"| progress_window={int(args.honest_val_every) if int(args.honest_val_every) > 0 else 5000}"
             ,
             flush=True,
-        )
-        progress_bar = tqdm(
-            total=args.max_steps,
-            initial=global_step,
-            desc="train_dual_branch_fm",
-            unit="step",
-            dynamic_ncols=True,
-            smoothing=0.1,
         )
         checkpoint_progress_bar, checkpoint_segment_end = create_checkpoint_progress_bar(global_step)
     last_video_stage = int(video_schedule_metrics["video_optim_stage"])
@@ -1113,8 +1385,7 @@ def main() -> None:
 
     try:
         while global_step < args.max_steps:
-            batch_source = train_iterator if use_sequence_prefetch_iterator else dataloader
-            for batch in batch_source:
+            for batch in train_iterator:
                 raw_model = accelerator.unwrap_model(model)
                 video_schedule_metrics = apply_video_backbone_schedule(raw_model, args, global_step)
                 current_video_stage = int(video_schedule_metrics["video_optim_stage"])
@@ -1235,14 +1506,15 @@ def main() -> None:
                         }
                     )
 
-                    video_target_tokens = model.encode_video_target(video_target)
-                    state_target_tokens = model.encode_state_target(
-                        human_gaussians=human_gaussians,
-                        object_gaussians=object_gaussians,
-                        joints_3d=joints_3d,
-                        object_transforms=object_poses,
-                        contact_signature=contact_signature,
-                    )
+                    with torch.no_grad():
+                        video_target_tokens = raw_model.encode_video_target(video_target)
+                        state_target_tokens = raw_model.encode_state_target(
+                            human_gaussians=human_gaussians,
+                            object_gaussians=object_gaussians,
+                            joints_3d=joints_3d,
+                            object_transforms=object_poses,
+                            contact_signature=contact_signature,
+                        )
 
                     batch_size = video_target_tokens.shape[0]
                     timesteps = torch.rand(batch_size, device=accelerator.device, dtype=video_target_tokens.dtype)
@@ -1265,7 +1537,7 @@ def main() -> None:
 
                     loss_weights, curriculum_metrics = build_curriculum_loss_weights(args, global_step)
                     loss, metrics = compute_losses(
-                        model=model,
+                        model=raw_model,
                         output=output,
                         video_xt=video_xt,
                         video_velocity_target=video_velocity_target,
@@ -1309,22 +1581,13 @@ def main() -> None:
                     count_parameters(collect_trainable_parameters(accelerator.unwrap_model(model))) / 1e6
                 )
 
-                if accelerator.is_main_process and progress_bar is not None:
-                    progress_bar.update(1)
-                    progress_bar.set_postfix(
-                        loss=f"{reduced_metrics['loss_total']:.4f}",
-                        vfm=f"{reduced_metrics['loss_video_fm']:.4f}",
-                        sfm=f"{reduced_metrics['loss_state_fm']:.4f}",
-                        stage=int(reduced_metrics["curriculum_stage"]),
-                        vstage=int(reduced_metrics["video_optim_stage"]),
-                        lr=f"{reduced_metrics['lr']:.2e}",
-                        refresh=False,
-                    )
                 if accelerator.is_main_process and checkpoint_progress_bar is not None:
                     checkpoint_progress_bar.update(1)
                     checkpoint_progress_bar.set_postfix(
                         loss=f"{reduced_metrics['loss_total']:.4f}",
-                        remain=max((checkpoint_segment_end or global_step) - global_step, 0),
+                        vfm=f"{reduced_metrics['loss_video_fm']:.4f}",
+                        sfm=f"{reduced_metrics['loss_state_fm']:.4f}",
+                        lr=f"{reduced_metrics['lr']:.2e}",
                         refresh=False,
                     )
 
@@ -1334,7 +1597,11 @@ def main() -> None:
                 if global_step % args.print_every == 0 and accelerator.is_main_process:
                     elapsed = time.time() - start_time
                     eta = (elapsed / max(global_step, 1)) * max(args.max_steps - global_step, 0)
-                    next_save = checkpoint_segment_end if checkpoint_segment_end is not None else args.max_steps
+                    next_save = min(
+                        ((global_step // max(int(args.save_every), 1)) + 1) * max(int(args.save_every), 1),
+                        args.max_steps,
+                    )
+                    next_honest = checkpoint_segment_end if checkpoint_segment_end is not None else args.max_steps
                     print(
                         f"[train_dual_branch_fm] step={global_step:07d} "
                         f"loss={reduced_metrics['loss_total']:.4f} "
@@ -1346,55 +1613,13 @@ def main() -> None:
                         f"video_stage={int(reduced_metrics['video_optim_stage'])} "
                         f"unfrozen={int(reduced_metrics['video_unfrozen_blocks'])} "
                         f"next_save={next_save:07d} "
+                        f"next_honest={next_honest:07d} "
                         f"eta={eta / 3600.0:.2f}h"
                         ,
                         flush=True,
                     )
 
                 if global_step % args.save_every == 0:
-                    if accelerator.is_main_process:
-                        vis_path, vis_caption = export_training_visualization(
-                            model=accelerator.unwrap_model(model),
-                            output=output,
-                            video_xt=video_xt.detach(),
-                            state_xt=state_xt.detach(),
-                            timesteps=timesteps.detach(),
-                            rgb=rgb.detach(),
-                            human_visible=human_visible.detach(),
-                            object_visible=object_visible.detach(),
-                            masks_human=masks_human.detach(),
-                            masks_object=masks_object.detach(),
-                            teacher_object_render=teacher_object_render.detach(),
-                            teacher_object_video=teacher_object_video.detach(),
-                            camera_intrinsics_render=camera_intrinsics_render.detach(),
-                            renderer=renderer,
-                            output_dir=args.output_dir,
-                            step=global_step,
-                        )
-                        print(
-                            f"[train_dual_branch_fm] visualization saved "
-                            f"| step={global_step:07d} "
-                            f"| path={vis_path}",
-                            flush=True,
-                        )
-                        if wandb_enabled:
-                            try:
-                                import wandb
-
-                                wandb.log(
-                                    {
-                                        "train/visualization": wandb.Image(str(vis_path), caption=vis_caption),
-                                    },
-                                    step=global_step,
-                                )
-                            except Exception as exc:
-                                print(
-                                    f"[train_dual_branch_fm] warning: failed to upload visualization to wandb "
-                                    f"| step={global_step:07d} "
-                                    f"| error={exc}",
-                                    flush=True,
-                                )
-                    accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         save_checkpoint(
                             accelerator=accelerator,
@@ -1404,6 +1629,33 @@ def main() -> None:
                             step=global_step,
                             args=args,
                         )
+                    accelerator.wait_for_everyone()
+                if args.honest_val_every > 0 and global_step % args.honest_val_every == 0:
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process and honest_val_sequence_dir is not None:
+                        try:
+                            honest_metrics = run_honest_3d_validation(
+                                model=accelerator.unwrap_model(model),
+                                dataset=dataset,
+                                sequence_dir=honest_val_sequence_dir,
+                                device=accelerator.device,
+                                output_dir=args.output_dir,
+                                step=global_step,
+                                args=args,
+                                wandb_enabled=wandb_enabled,
+                            )
+                            if log_with is not None and not wandb_enabled:
+                                accelerator.log(honest_metrics, step=global_step)
+                        except Exception as exc:
+                            print(
+                                f"[train_dual_branch_fm] warning: honest 3D validation failed "
+                                f"| step={global_step:07d} "
+                                f"| error={exc}",
+                                flush=True,
+                            )
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    accelerator.wait_for_everyone()
                 if (
                     accelerator.is_main_process
                     and checkpoint_progress_bar is not None
@@ -1421,9 +1673,6 @@ def main() -> None:
     finally:
         if checkpoint_progress_bar is not None:
             checkpoint_progress_bar.close()
-        if progress_bar is not None:
-            progress_bar.close()
-
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         save_checkpoint(

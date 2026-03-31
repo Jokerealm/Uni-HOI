@@ -1,10 +1,10 @@
 """
 Preprocessed Dataset — Pure file-read DataLoader
 =================================================
-This Dataset reads *only* from the serialised outputs of Step 1 from ``main.py``.
+This Dataset reads *only* from the serialised outputs of Step 1 from ``legacy_pipeline.py``.
 No model inference or heavy geometry computation happens in ``__getitem__``.
 
-Expected directory layout (created by `main.py run.job=step1`):
+Expected directory layout (created by `legacy_pipeline.py run.job=step1`):
     <root>/<video_name>/processed/
         depth_aligned.npz
         region_masks.npz

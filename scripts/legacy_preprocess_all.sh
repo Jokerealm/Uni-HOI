@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 export HYDRA_FULL_ERROR=1
 export HF_HUB_OFFLINE=1
@@ -16,7 +16,7 @@ export TRANSFORMERS_OFFLINE=1
 # to run once.
 #
 # Usage:
-#   CUDA_VISIBLE_DEVICES=0 conda run -n cari4d bash scripts/preprocess_all.sh
+#   CUDA_VISIBLE_DEVICES=0 conda run -n cari4d bash scripts/legacy_preprocess_all.sh
 # ============================================================
 
 BEHAVE_DIR="/data4/guanz/data/Behave/sequences"
@@ -55,7 +55,7 @@ for SEQ in "${SEQUENCES[@]}"; do
 
     LOG_FILE="$LOG_DIR/${SEQ}.log"
 
-    if python main.py \
+    if python legacy_pipeline.py \
         run.job=preprocess \
         dataset=behave \
         data_prep.video_name="$SEQ" \

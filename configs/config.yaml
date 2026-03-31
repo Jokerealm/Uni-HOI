@@ -1,0 +1,320 @@
+defaults:
+  - _self_
+
+# ============================================================
+# Legacy Step1-Step5 Pipeline Config
+# ============================================================
+
+run:
+  job: train
+  name: debug
+  seed: 42
+
+base_weights_dir: /data4/guanz/coding/HDM/model
+project_root: /data4/guanz/coding/HDM
+
+data_prep:
+  input_dir: ./sample_data
+  video_name: test_video
+  output_subdir: processed
+  max_frames: null
+  device: cuda
+
+sam3:
+  model_dir: ${base_weights_dir}/sam3
+  text_prompts:
+    - human
+    - object
+  score_threshold: 0.5
+  mask_threshold: 0.5
+
+sam3d:
+  checkpoint: ${base_weights_dir}/sam-3d-body/model.ckpt
+  mhr_model: ${base_weights_dir}/sam-3d-body/assets/mhr_model.pt
+  config_yaml: ${base_weights_dir}/sam-3d-body/model_config.yaml
+  image_size: [512, 512]
+
+unidepth:
+  model_dir: ${base_weights_dir}/unidepth
+  backbone: vitl14
+
+openpose:
+  model_dir: ${base_weights_dir}/openpose
+
+smplh:
+  model_dir: ${base_weights_dir}/smpl_models/smplh
+
+depth_align:
+  method: median
+
+masking:
+  dilate_kernel_size: 15
+  dilate_iterations: 2
+  contact_radius: 10
+  gaussian_blur_ksize: 11
+  gaussian_blur_sigma: 5.0
+
+propainter:
+  weights_dir: ${base_weights_dir}/ProPainter/weights
+  mask_dilation: 4
+  ref_stride: 10
+  neighbor_length: 10
+  subvideo_length: 80
+  raft_iter: 20
+  fp16: true
+  save_frames: true
+  save_fps: 24
+
+amodal:
+  method: propainter
+  output_subdir: amodal
+
+fm:
+  checkpoint: ""
+  model_type: hunyuan_controlnet
+  video_channels: 3
+  video_input_channels: 4
+  point_channels: 14
+  mask_channels: 2
+  dim: 384
+  depth: 8
+  num_heads: 6
+  cond_dim: 192
+  num_ode_steps: 50
+  num_frames: 12
+  video_h: 256
+  video_w: 256
+  num_points: 4096
+  prior_noise_std: 1.0
+  clamp_visible_rgb: true
+  save_frames: true
+  save_fps: 24
+  precision: float32
+  background_value: 1.0
+  human_branch_mode: segmented_visible
+  seed: 42
+  patch_size: 16
+  hidden_dim: 512
+  fusion_depth: 8
+  num_human_gaussians: 1024
+  num_object_gaussians: 1024
+  num_joints: 22
+  contact_dim: 4
+
+hy3d:
+  model_path: /data4/guanz/models/Hunyuan3D-2
+  subfolder: hunyuan3d-dit-v2-0
+  num_inference_steps: 50
+  guidance_scale: 5.0
+  octree_resolution: 384
+  num_sample_points: 4096
+  init_gaussian_scale: 0.01
+  remove_background: false
+  dtype: float16
+
+step3:
+  output_subdir: gs_init
+  frame_selection: middle
+
+alignment:
+  enabled: true
+  depth_max: 10.0
+  depth_min_pixels: 50
+  percentile: 90.0
+  scale_eps: 1.0e-4
+  scale_default: 1.0
+  scale_min: 0.01
+  scale_max: 100.0
+  human_align_strategy: smplh
+  validate_transform: true
+
+step4:
+  output_subdir: joint_opt
+  image_height: 256
+  image_width: 256
+  batch_size: 8
+  num_points_human: 4096
+  num_points_object: 2048
+  focal: 490.0
+  num_iters: 5000
+  save_every: 1000
+  lr_xyz: 1.6e-4
+  lr_opacity: 5e-2
+  lr_scaling: 5e-3
+  lr_rotation: 1e-3
+  lr_color: 2.5e-3
+  se3:
+    lr_translation: 1e-3
+    lr_rotation: 1e-4
+  region_loss:
+    weight_visible: 1.0
+    weight_primary_occ: 0.3
+    weight_secondary_occ: 0.05
+    lambda_ssim: 0.2
+  contact:
+    enabled: true
+    lambda_contact: 0.5
+  proj2d:
+    enabled: true
+    lambda_j2d: 0.1
+    confidence_threshold: 0.3
+  penetration:
+    enabled: true
+    lambda_pen: 1.0
+    sdf_grid_resolution: 64
+    sdf_padding: 0.1
+  temporal:
+    enabled: true
+    lambda_acc: 0.5
+
+step5:
+  eval:
+    cd_thresholds: [0.005, 0.01, 0.02, 0.05]
+    num_eval_points: 4096
+    compute_acceleration: true
+  vis:
+    save_rendered_images: true
+    save_overlay_keypoints: true
+    save_novel_views: true
+    video_fps: 24
+
+checkpoint:
+  path: ""
+  run_id: latest
+
+dataset: sample
+behave_cam_id: 1
+scale_ratio: 2
+bbox_expand: 1.1
+
+wandb:
+  enabled: true
+  project: uni-hoi-4d
+  vis_interval: 500
+
+model: {}
+
+# ============================================================
+# ProciGen Dual-Branch FM Training Config
+# ============================================================
+
+dual_branch_fm:
+  default_dataset: procigen_train
+  python_bin: /data3/guanz/miniforge3/envs/cari4d/bin/python
+
+  runtime:
+    run_name: procigen_dual_branch_fm
+    output_root: outputs
+    project_name: dual-branch-fm
+    log_with: wandb
+    mixed_precision: "no"
+    seed: 42
+
+  dist:
+    num_processes: 0
+    master_addr: 127.0.0.1
+    main_process_port: 29500
+    nnodes: 1
+    node_rank: 0
+
+  prepare:
+    skip: true
+    only: false
+    overwrite: false
+    allow_in_place: false
+    max_sequences: 0
+    max_frames: 0
+    num_workers: auto
+    heartbeat_interval: 30
+    detach: false
+    status_dir: ""
+
+  train:
+    project_name: "FM"
+    output_dir: ""
+    data_root: ""
+    processed_subdir: ""
+    gs_subdir: ""
+    split_file: ""
+    split_key: train
+    human_gaussian_source: smpl_mesh
+    seed: 42
+    log_with: wandb
+    mixed_precision: "no"
+    resume_checkpoint: ""
+    batch_size: 4
+    max_steps: 200000
+    save_every: 1000
+    log_every: 50
+    print_every: 5000
+    gradient_accumulation_steps: 1
+    max_grad_norm: 1.0
+    lr: 3e-4
+    weight_decay: 1e-4
+    warmup_steps: 300
+    clip_length: 16
+    clip_stride: 8
+    max_sequences: 0
+    dataset_cache_sequences: 4
+    cache_rgb: true
+    rgb_cache_max_frames: 256
+    index_progress_every: 10
+    background_value: 1.0
+    image_height: 256
+    image_width: 256
+    patch_size: 16
+    hidden_dim: 512
+    depth: 8
+    num_heads: 8
+    mlp_ratio: 3.0
+    dropout: 0.0
+    video_channels: 6
+    num_human_gaussians: 750
+    num_object_gaussians: 750
+    num_joints: 22
+    contact_dim: 4
+    loss_preset: full
+    lambda_video_fm: 1.0
+    lambda_state_fm: 1.0
+    lambda_video_latent: 0.1
+    lambda_state_latent: 0.1
+    lambda_human_visible: 1.0
+    lambda_object_video: 1.0
+    lambda_object_render: 1.0
+    lambda_branch_coupling: 0.25
+    lambda_human_gaussian: 1.0
+    lambda_object_gaussian: 1.0
+    lambda_joints: 1.0
+    lambda_object_motion: 0.5
+    lambda_contact: 0.25
+    lambda_joint_heat: 0.5
+    lambda_object_silhouette: 0.5
+    lambda_object_depth: 0.25
+    lambda_geometry_distill: 0.05
+    curriculum_fusion_start_ratio: 0.05
+    curriculum_full_start_ratio: 0.2
+    freeze_video_backbone: false
+    video_unfreeze_start_ratio: -1.0
+    video_stage2_num_top_blocks: 2
+    honest_val_every: 5000
+    honest_val_num_ode_steps: 50
+    honest_val_prior_noise_std: 1.0
+    honest_val_sequence: ""
+
+  datasets:
+    procigen_train:
+      raw_root: /data4/guanz/data/ProciGen
+      prepared_root: preprocessed/ProciGen_preprocessed_fixed
+      split_file: /data4/guanz/data/train-procigen-test-behave.pkl
+      split_key: train
+      camera_id: k1
+      processed_subdir: processed
+      gs_subdir: gs_init
+    procigen_all:
+      raw_root: /data4/guanz/data/ProciGen
+      prepared_root: preprocessed/ProciGen_preprocessed_fixed
+      split_file: ""
+      split_key: train
+      camera_id: k1
+      processed_subdir: processed
+      gs_subdir: gs_init

@@ -10,7 +10,7 @@ SAVE_EVERY="${SAVE_EVERY:-10}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
-"${PYTHON_BIN}" /data4/guanz/coding/HDM/main.py \
+"${PYTHON_BIN}" /data4/guanz/coding/HDM/legacy_pipeline.py \
   dataset=custom \
   run.job=full \
   data_prep.input_dir="${INPUT_DIR}" \

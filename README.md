@@ -90,10 +90,32 @@ Then you can run `python scripts/process_occ.py -o <unzipped occ files> -p <Proc
 
 Alternatively, you can process the sequence using: `python scripts/compute_occ.py -s <path to one sequence>`.
 
-#### Train 
-We train our stage 1 and stage 2 models separately in parallel to reduce training time. You can find example commands in `scripts/train.sh`. The checkpoint and logs will be saved to `outputs`. 
+#### Train
+The current ProciGen training entrypoint is:
 
-The data split file can be downloaded from [Edmond](https://edmond.mpg.de/file.xhtml?fileId=251365&version=4.0). 
+```bash
+scripts/train.sh
+```
+
+Common overrides:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 scripts/train.sh \
+  --dataset procigen_train \
+  --run_name fm_debug \
+  --batch_size 4 \
+  --max_steps 10000 \
+  --lr 3e-4 \
+  --num_processes 4 \
+  --prepare \
+  --wandb \
+  --split_file /data4/guanz/data/train-procigen-test-behave.pkl
+```
+
+All default values now live in `configs/config.yaml` under `dual_branch_fm`.
+
+Older CVPR'24 HDM training code is kept separately in `legacy_hdm_train.py`, and
+the older Step1-Step5 pipeline is kept in `legacy_pipeline.py`.
 
 ## Evaluation
 #### Pre-trained checkpoints
@@ -105,9 +127,24 @@ For more pretrained models, you can checkout our [Huggingface model card](https:
 Specifically, `stagex-<obj>` means the original stage x model first trained on full ProciGen data and then fine tuned on synthetic data of category `<obj>`.
 `stagex-tune` means the model first trained on full ProciGen then fine tuned on training set of BEHAVE and InterCap. 
 
-#### Run inference on BEHAVE test set
-We provide example command to run batch inference at `scripts/test.sh`. Similar to training, the two stages are also run separately to reduce runtime. The example commands are 
-configured to run inference on the pretrained checkpoints. 
+#### Run inference on ProciGen / prepared sequences
+The current single-sequence test entrypoint is:
+
+```bash
+scripts/test.sh
+```
+
+Example:
+
+```bash
+scripts/test.sh \
+  CHECKPOINT=outputs/procigen_dual_branch_fm/checkpoints/checkpoint_0010000.pt \
+  VIDEO_NAME=Date04_Subxx_toolbox_synzv2-10 \
+  GPU_ID=0
+```
+
+This script prepares the target sequence if needed and then runs
+`infer_dual_branch_fm.py`.
 
 Save as the training setup, the split file can be downloaded from [Edmond](https://edmond.mpg.de/file.xhtml?fileId=251365&version=4.0). 
 #### Evaluate results 

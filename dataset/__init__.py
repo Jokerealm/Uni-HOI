@@ -232,7 +232,7 @@ def get_dataset(cfg: ProjectConfig):
                                     num_workers=cfg.dataloader.num_workers, shuffle=shuffle)
     elif cfg.dataset.type == 'preprocessed':
         # ---------------------------------------------------------------
-        # Pure file-read DataLoader for Step 1 outputs from `main.py`.
+        # Pure file-read DataLoader for Step 1 outputs from `legacy_pipeline.py`.
         # No model inference in __getitem__ — only reads .png / .npz.
         # ---------------------------------------------------------------
         from .preprocessed_dataset import PreprocessedDataset

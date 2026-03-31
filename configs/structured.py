@@ -445,7 +445,7 @@ class Joint3DGSModelConfig:
 
 
 ###############################################################################
-# Preprocessed dataset config (pure file-read after `main.py run.job=step1`)
+# Preprocessed dataset config (pure file-read after `legacy_pipeline.py run.job=step1`)
 ###############################################################################
 @dataclass
 class PreprocessedDatasetConfig(PointCloudDatasetConfig):

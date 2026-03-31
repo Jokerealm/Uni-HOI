@@ -38,6 +38,11 @@ from torch.utils.data import Dataset
 
 INDEX_CACHE_VERSION = 5
 VALID_HUMAN_GAUSSIAN_SOURCES = ("smpl_mesh", "teacher")
+DUAL_BRANCH_TARGET_CACHE_VERSION = 1
+DUAL_BRANCH_TARGETS_FILENAME = "dual_branch_targets.npz"
+SMPL_HUMAN_GAUSSIANS_FILENAME = "G_h_smpl.pt"
+DEFAULT_KEYPOINT_HEATMAP_SIGMA = 6.0
+DEFAULT_CONTACT_SIGNATURE_DIM = 4
 
 
 def load_rgb_image(path: str) -> Tensor:
@@ -406,10 +411,9 @@ def _compute_vertex_normals(vertices: Tensor, faces: Tensor) -> Tensor:
     return torch.where(norm > 1e-6, normals / norm.clamp(min=1e-6), fallback)
 
 
-def _build_human_gaussians_from_smpl_params(
+def build_human_gaussian_raw_tokens_from_smpl_params(
     smpl_params: Dict[str, np.ndarray],
     *,
-    num_human_gaussians: int,
     init_gaussian_scale: float = 0.01,
 ) -> Tensor:
     if "vertices" not in smpl_params or "faces" not in smpl_params:
@@ -448,11 +452,23 @@ def _build_human_gaussians_from_smpl_params(
     scaling_t = torch.full((vertices_t.shape[0], 3), float(init_gaussian_scale), dtype=torch.float32)
     opacity_t = torch.full((vertices_t.shape[0], 1), 0.9, dtype=torch.float32)
     shs_t = torch.full((vertices_t.shape[0], 3), 0.5, dtype=torch.float32)
-    raw = torch.cat([vertices_t, rotations_t, scaling_t, opacity_t, shs_t], dim=-1)
+    return torch.cat([vertices_t, rotations_t, scaling_t, opacity_t, shs_t], dim=-1)
+
+
+def _build_human_gaussians_from_smpl_params(
+    smpl_params: Dict[str, np.ndarray],
+    *,
+    num_human_gaussians: int,
+    init_gaussian_scale: float = 0.01,
+) -> Tensor:
+    raw = build_human_gaussian_raw_tokens_from_smpl_params(
+        smpl_params,
+        init_gaussian_scale=init_gaussian_scale,
+    )
     return _subsample_tokens(raw, num_human_gaussians)
 
 
-def _compute_contact_signature(
+def compute_contact_signature(
     joints_3d: Tensor,
     object_gaussians: Tensor,
     object_poses: Tensor,
@@ -494,11 +510,28 @@ def _compute_contact_signature(
     return signature
 
 
-def _build_keypoint_heatmaps(
+def _compute_contact_signature(
+    joints_3d: Tensor,
+    object_gaussians: Tensor,
+    object_poses: Tensor,
+    *,
+    contact_dim: int,
+    hand_joint_indices: Optional[Sequence[int]] = None,
+) -> Tensor:
+    return compute_contact_signature(
+        joints_3d,
+        object_gaussians,
+        object_poses,
+        contact_dim=contact_dim,
+        hand_joint_indices=hand_joint_indices,
+    )
+
+
+def build_keypoint_heatmaps(
     keypoints_2d: Tensor,
     height: int,
     width: int,
-    sigma: float = 6.0,
+    sigma: float = DEFAULT_KEYPOINT_HEATMAP_SIGMA,
 ) -> Tensor:
     num_frames = keypoints_2d.shape[0]
     grid_y = torch.arange(height, dtype=keypoints_2d.dtype).view(1, 1, height, 1)
@@ -508,6 +541,65 @@ def _build_keypoint_heatmaps(
     sq_dist = (grid_x - coords[..., 0]) ** 2 + (grid_y - coords[..., 1]) ** 2
     weights = torch.exp(-sq_dist / (2.0 * sigma * sigma)) * conf
     return weights.sum(dim=1, keepdim=True).reshape(num_frames, 1, height, width)
+
+
+def _build_keypoint_heatmaps(
+    keypoints_2d: Tensor,
+    height: int,
+    width: int,
+    sigma: float = DEFAULT_KEYPOINT_HEATMAP_SIGMA,
+) -> Tensor:
+    return build_keypoint_heatmaps(
+        keypoints_2d,
+        height=height,
+        width=width,
+        sigma=sigma,
+    )
+
+
+def _match_contact_signature_dim(signature: Tensor, contact_dim: int) -> Tensor:
+    contact_dim = int(contact_dim)
+    if signature.shape[-1] == contact_dim:
+        return signature
+    if signature.shape[-1] > contact_dim:
+        return signature[:, :contact_dim]
+    pad = signature.new_zeros(signature.shape[0], contact_dim - signature.shape[-1])
+    return torch.cat([signature, pad], dim=-1)
+
+
+def _maybe_load_precomputed_dual_branch_targets(
+    sequence_dir: Path,
+    *,
+    processed_subdir: str,
+    contact_dim: int,
+    hand_joint_indices: Optional[Sequence[int]] = None,
+) -> Optional[Dict[str, Tensor]]:
+    path = sequence_dir / processed_subdir / "cropped" / DUAL_BRANCH_TARGETS_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        with np.load(path) as target_npz:
+            version = int(target_npz["version"][0]) if "version" in target_npz else DUAL_BRANCH_TARGET_CACHE_VERSION
+            if version != DUAL_BRANCH_TARGET_CACHE_VERSION:
+                return None
+            keypoint_heatmaps = torch.from_numpy(np.asarray(target_npz["keypoint_heatmaps"], dtype=np.float32))
+            contact_signature = torch.from_numpy(np.asarray(target_npz["contact_signature"], dtype=np.float32))
+            cached_indices = tuple(
+                int(index)
+                for index in np.asarray(target_npz["hand_joint_indices"], dtype=np.int64).reshape(-1).tolist()
+            ) if "hand_joint_indices" in target_npz else ()
+    except Exception:
+        return None
+
+    requested_indices = tuple(int(index) for index in (hand_joint_indices or ()))
+    if cached_indices != requested_indices:
+        return None
+    if keypoint_heatmaps.ndim != 4 or contact_signature.ndim != 2:
+        return None
+    return {
+        "keypoint_heatmaps": keypoint_heatmaps,
+        "contact_signature": _match_contact_signature_dim(contact_signature, contact_dim),
+    }
 
 
 def _validate_mask_tensor(name: str, tensor: Tensor) -> None:
@@ -579,6 +671,22 @@ def _validate_sequence_bundle(bundle: Dict[str, object], *, num_frames: int, num
             raise ValueError(f"{name} must have shape [N, 14], got {tuple(tensor.shape)}.")
         if not torch.isfinite(tensor).all():
             raise ValueError(f"{name} contains non-finite values.")
+    keypoint_heatmaps = bundle.get("keypoint_heatmaps")
+    if keypoint_heatmaps is not None:
+        if keypoint_heatmaps.shape[0] != num_frames or keypoint_heatmaps.ndim != 4:
+            raise ValueError(
+                f"keypoint_heatmaps must have shape [{num_frames}, 1, H, W], got {tuple(keypoint_heatmaps.shape)}."
+            )
+        if not torch.isfinite(keypoint_heatmaps).all():
+            raise ValueError("keypoint_heatmaps contains non-finite values.")
+    contact_signature = bundle.get("contact_signature")
+    if contact_signature is not None:
+        if contact_signature.shape[0] != num_frames or contact_signature.ndim != 2:
+            raise ValueError(
+                f"contact_signature must have shape [{num_frames}, C], got {tuple(contact_signature.shape)}."
+            )
+        if not torch.isfinite(contact_signature).all():
+            raise ValueError("contact_signature contains non-finite values.")
 
 
 def _discover_sequence_dirs(
@@ -821,16 +929,18 @@ def load_dual_branch_sequence_bundle(
         else:
             cam_t = torch.zeros(body_pose.shape[0], 3, dtype=torch.float32)
         if human_gaussian_source == "smpl_mesh":
-            if "vertices" in smpl_params and "faces" in smpl_params:
-                human_gaussians = _build_human_gaussians_from_smpl_params(
-                    smpl_params,
-                    num_human_gaussians=num_human_gaussians,
-                )
-            elif require_gaussian_targets:
-                raise FileNotFoundError(
-                    f"Missing SMPL mesh geometry under {processed_dir / 'smpl_params.npz'}. "
-                    "Expected `vertices` and `faces` for `human_gaussian_source=smpl_mesh`."
-                )
+            human_gaussians = _maybe_load_gaussians(sequence_path, gs_subdir, SMPL_HUMAN_GAUSSIANS_FILENAME)
+            if human_gaussians is None:
+                if "vertices" in smpl_params and "faces" in smpl_params:
+                    human_gaussians = _build_human_gaussians_from_smpl_params(
+                        smpl_params,
+                        num_human_gaussians=num_human_gaussians,
+                    )
+                elif require_gaussian_targets:
+                    raise FileNotFoundError(
+                        f"Missing SMPL mesh geometry under {processed_dir / 'smpl_params.npz'}. "
+                        "Expected `vertices` and `faces` for `human_gaussian_source=smpl_mesh`."
+                    )
 
     num_frames = min(
         len(rgb_paths),
@@ -880,6 +990,31 @@ def load_dual_branch_sequence_bundle(
     else:
         object_gaussians = _subsample_tokens(object_gaussians, num_object_gaussians)
 
+    precomputed_targets = _maybe_load_precomputed_dual_branch_targets(
+        sequence_path,
+        processed_subdir=processed_subdir,
+        contact_dim=contact_dim,
+        hand_joint_indices=hand_joint_indices,
+    )
+    if precomputed_targets is not None:
+        keypoint_heatmaps = precomputed_targets["keypoint_heatmaps"][:num_frames]
+        contact_signature = precomputed_targets["contact_signature"][:num_frames]
+        if keypoint_heatmaps.shape[0] < num_frames or contact_signature.shape[0] < num_frames:
+            precomputed_targets = None
+    if precomputed_targets is None:
+        keypoint_heatmaps = _build_keypoint_heatmaps(
+            keypoints_2d,
+            height=depth.shape[-2],
+            width=depth.shape[-1],
+        )
+        contact_signature = _compute_contact_signature(
+            joints_3d,
+            object_gaussians,
+            object_poses,
+            contact_dim=contact_dim,
+            hand_joint_indices=hand_joint_indices,
+        )
+
     bundle = {
         "rgb_paths": rgb_paths,
         "masks_human": masks_human,
@@ -890,10 +1025,12 @@ def load_dual_branch_sequence_bundle(
         "depth": depth,
         "intrinsics": intrinsics,
         "keypoints_2d": keypoints_2d,
+        "keypoint_heatmaps": keypoint_heatmaps,
         "joints_3d": joints_3d,
         "body_pose": body_pose,
         "cam_t": cam_t,
         "object_poses": object_poses[:num_frames],
+        "contact_signature": contact_signature,
         "human_gaussians": human_gaussians,
         "object_gaussians": object_gaussians,
         "num_frames": num_frames,
@@ -1165,13 +1302,8 @@ class DualBranchHOIDataset(Dataset):
         camera_intrinsics = bundle["intrinsics"][start:end].clone()
         human_gaussians = bundle["human_gaussians"].clone()
         object_gaussians = bundle["object_gaussians"].clone()
-
-        keypoint_heatmaps = _build_keypoint_heatmaps(
-            keypoints_2d,
-            height=depth.shape[-2],
-            width=depth.shape[-1],
-        )
-        contact_signature = self._compute_contact_signature(joints_3d, object_gaussians, object_poses)
+        keypoint_heatmaps = bundle["keypoint_heatmaps"][start:end].clone()
+        contact_signature = bundle["contact_signature"][start:end].clone()
 
         background = torch.full_like(rgb, self.background_value)
         human_visible = rgb * masks_human + background * (1.0 - masks_human)
@@ -1201,7 +1333,15 @@ class DualBranchHOIDataset(Dataset):
 
 
 __all__ = [
+    "DEFAULT_CONTACT_SIGNATURE_DIM",
+    "DEFAULT_KEYPOINT_HEATMAP_SIGMA",
+    "DUAL_BRANCH_TARGET_CACHE_VERSION",
+    "DUAL_BRANCH_TARGETS_FILENAME",
     "DualBranchHOIDataset",
+    "SMPL_HUMAN_GAUSSIANS_FILENAME",
+    "build_human_gaussian_raw_tokens_from_smpl_params",
+    "build_keypoint_heatmaps",
+    "compute_contact_signature",
     "inspect_sequence_num_frames",
     "load_dual_branch_sequence_bundle",
     "load_rgb_image",

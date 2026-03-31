@@ -127,6 +127,9 @@ def load_inference_clip(
         "masks_object": masks_object.unsqueeze(0),
         "camera_intrinsics": camera_intrinsics.unsqueeze(0),
         "sequence_name": bundle["sequence_name"],
+        "teacher_human_gaussians": bundle.get("human_gaussians"),
+        "teacher_object_gaussians": bundle.get("object_gaussians"),
+        "teacher_object_pose_frame0": bundle.get("object_poses")[0] if bundle.get("object_poses") is not None else None,
     }
 
 
@@ -191,7 +194,13 @@ def save_combined_state(
 
 
 def gaussian_tokens_to_xyz_rgb(tokens: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
-    raw = tokens.detach().squeeze(0).cpu()
+    raw = tokens.detach().cpu()
+    if raw.ndim == 3:
+        if raw.shape[0] != 1:
+            raise ValueError(f"Expected batched Gaussian tokens with batch=1, got {tuple(raw.shape)}.")
+        raw = raw.squeeze(0)
+    if raw.ndim != 2:
+        raise ValueError(f"Expected Gaussian tokens with shape [N, 14], got {tuple(raw.shape)}.")
     xyz = raw[:, 0:3].numpy()
     rgb = raw[:, 11:14].clamp(0.0, 1.0).numpy()
     return xyz, rgb
@@ -201,6 +210,33 @@ def transform_points(points: np.ndarray, transform: torch.Tensor) -> np.ndarray:
     transform_np = transform.detach().cpu().numpy()
     points_h = np.concatenate([points, np.ones((points.shape[0], 1), dtype=points.dtype)], axis=1)
     return (transform_np @ points_h.T).T[:, :3]
+
+
+def cloud_array_from_tokens(tokens: torch.Tensor) -> np.ndarray:
+    xyz, rgb = gaussian_tokens_to_xyz_rgb(tokens)
+    return np.concatenate([xyz.astype(np.float32), rgb.astype(np.float32)], axis=1)
+
+
+def transform_cloud_array(cloud: np.ndarray, transform: torch.Tensor) -> np.ndarray:
+    out = cloud.copy()
+    out[:, :3] = transform_points(out[:, :3], transform)
+    return out
+
+
+def cloud_array_to_object3d(cloud: np.ndarray) -> np.ndarray:
+    xyz = cloud[:, :3].astype(np.float32)
+    rgb = (np.clip(cloud[:, 3:6], 0.0, 1.0) * 255.0).astype(np.float32)
+    return np.concatenate([xyz, rgb], axis=1)
+
+
+def bidirectional_nn_metrics(pred_xyz: np.ndarray, gt_xyz: np.ndarray) -> Dict[str, float]:
+    pred = torch.from_numpy(pred_xyz.astype(np.float32))
+    gt = torch.from_numpy(gt_xyz.astype(np.float32))
+    distances = torch.cdist(pred.unsqueeze(0), gt.unsqueeze(0)).squeeze(0)
+    return {
+        "pred_to_gt_mean_nn": float(distances.min(dim=1).values.mean().item()),
+        "gt_to_pred_mean_nn": float(distances.min(dim=0).values.mean().item()),
+    }
 
 
 def write_ascii_ply(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
@@ -229,35 +265,96 @@ def export_point_cloud_visualization(
     output_dir: Path,
     *,
     sequence_name: str,
-) -> Tuple[Dict[str, Path], np.ndarray, np.ndarray]:
+    teacher_human_gaussians: torch.Tensor | None = None,
+    teacher_object_gaussians: torch.Tensor | None = None,
+    teacher_object_pose_frame0: torch.Tensor | None = None,
+) -> Tuple[Dict[str, Path], Dict[str, np.ndarray], Dict[str, float]]:
     pointcloud_dir = output_dir / "pointcloud"
-    human_xyz, human_rgb = gaussian_tokens_to_xyz_rgb(decoded_state.human_gaussians)
-    object_xyz, object_rgb = gaussian_tokens_to_xyz_rgb(decoded_state.object_gaussians)
-    object_world_xyz = transform_points(object_xyz, decoded_state.object_transforms[0, 0])
+    pred_human_canonical = cloud_array_from_tokens(decoded_state.human_gaussians)
+    pred_object_canonical = cloud_array_from_tokens(decoded_state.object_gaussians)
+    pred_object_world = transform_cloud_array(pred_object_canonical, decoded_state.object_transforms[0, 0])
 
-    human_path = pointcloud_dir / "human_world.ply"
-    object_path = pointcloud_dir / "object_world_frame0000.ply"
-    merged_path = pointcloud_dir / "merged_world_frame0000.ply"
-    write_ascii_ply(human_path, human_xyz, human_rgb)
-    write_ascii_ply(object_path, object_world_xyz, object_rgb)
-    merged_xyz = np.concatenate([human_xyz, object_world_xyz], axis=0)
-    merged_rgb = np.concatenate([human_rgb, object_rgb], axis=0)
-    write_ascii_ply(merged_path, merged_xyz, merged_rgb)
+    pred_human_path = pointcloud_dir / "pred_human_canonical.ply"
+    pred_object_canonical_path = pointcloud_dir / "pred_object_canonical.ply"
+    pred_object_world_path = pointcloud_dir / "pred_object_world_frame0000.ply"
+    write_ascii_ply(pred_human_path, pred_human_canonical[:, :3], pred_human_canonical[:, 3:6])
+    write_ascii_ply(pred_object_canonical_path, pred_object_canonical[:, :3], pred_object_canonical[:, 3:6])
+    write_ascii_ply(pred_object_world_path, pred_object_world[:, :3], pred_object_world[:, 3:6])
+
+    clouds = {
+        "pred_human_canonical": pred_human_canonical,
+        "pred_object_canonical": pred_object_canonical,
+        "pred_object_world_frame0000": pred_object_world,
+    }
+    metrics: Dict[str, float] = {}
+
+    if teacher_human_gaussians is not None:
+        gt_human_canonical = cloud_array_from_tokens(teacher_human_gaussians)
+        gt_human_path = pointcloud_dir / "gt_human_canonical.ply"
+        write_ascii_ply(gt_human_path, gt_human_canonical[:, :3], gt_human_canonical[:, 3:6])
+        clouds["gt_human_canonical"] = gt_human_canonical
+        metrics.update(
+            {
+                f"human_canonical_{name}": value
+                for name, value in bidirectional_nn_metrics(
+                    pred_human_canonical[:, :3],
+                    gt_human_canonical[:, :3],
+                ).items()
+            }
+        )
+    else:
+        gt_human_path = None
+
+    if teacher_object_gaussians is not None:
+        gt_object_canonical = cloud_array_from_tokens(teacher_object_gaussians)
+        gt_object_canonical_path = pointcloud_dir / "gt_object_canonical.ply"
+        write_ascii_ply(gt_object_canonical_path, gt_object_canonical[:, :3], gt_object_canonical[:, 3:6])
+        clouds["gt_object_canonical"] = gt_object_canonical
+        if teacher_object_pose_frame0 is not None:
+            gt_object_world = transform_cloud_array(gt_object_canonical, teacher_object_pose_frame0)
+            gt_object_world_path = pointcloud_dir / "gt_object_world_frame0000.ply"
+            write_ascii_ply(gt_object_world_path, gt_object_world[:, :3], gt_object_world[:, 3:6])
+            clouds["gt_object_world_frame0000"] = gt_object_world
+            metrics.update(
+                {
+                    f"object_world_frame0000_{name}": value
+                    for name, value in bidirectional_nn_metrics(
+                        pred_object_world[:, :3],
+                        gt_object_world[:, :3],
+                    ).items()
+                }
+            )
+        else:
+            gt_object_world_path = None
+    else:
+        gt_object_canonical_path = None
+        gt_object_world_path = None
+
     metadata = {
         "sequence_name": sequence_name,
-        "num_human_points": int(human_xyz.shape[0]),
-        "num_object_points": int(object_world_xyz.shape[0]),
+        "num_pred_human_points": int(pred_human_canonical.shape[0]),
+        "num_pred_object_points": int(pred_object_world.shape[0]),
+        "num_gt_human_points": int(clouds["gt_human_canonical"].shape[0]) if "gt_human_canonical" in clouds else 0,
+        "num_gt_object_points": int(clouds["gt_object_canonical"].shape[0]) if "gt_object_canonical" in clouds else 0,
         "frame_index": 0,
+        "notes": [
+            "human is exported in canonical space",
+            "object is exported in both canonical and frame-0 world space",
+            "no mixed-space merged point cloud is exported by default",
+        ],
     }
     (pointcloud_dir / "pointcloud_meta.json").write_text(json.dumps(metadata, indent=2))
     return (
         {
-            "human_pointcloud": human_path,
-            "object_pointcloud": object_path,
-            "merged_pointcloud": merged_path,
+            "pred_human_canonical": pred_human_path,
+            "pred_object_canonical": pred_object_canonical_path,
+            "pred_object_world_frame0000": pred_object_world_path,
+            **({"gt_human_canonical": gt_human_path} if gt_human_path is not None else {}),
+            **({"gt_object_canonical": gt_object_canonical_path} if gt_object_canonical_path is not None else {}),
+            **({"gt_object_world_frame0000": gt_object_world_path} if gt_object_world_path is not None else {}),
         },
-        merged_xyz,
-        merged_rgb,
+        clouds,
+        metrics,
     )
 
 
@@ -265,9 +362,9 @@ def maybe_log_wandb_visualization(
     *,
     args: argparse.Namespace,
     sequence_name: str,
-    merged_xyz: np.ndarray,
-    merged_rgb: np.ndarray,
-    merged_pointcloud_path: Path,
+    pointcloud_paths: Dict[str, Path],
+    pointcloud_payload: Dict[str, np.ndarray],
+    pointcloud_metrics: Dict[str, float],
 ) -> None:
     if not args.wandb:
         return
@@ -294,18 +391,18 @@ def maybe_log_wandb_visualization(
         return
 
     try:
-        rgb_u8 = (np.clip(merged_rgb, 0.0, 1.0) * 255.0).astype(np.float32)
-        point_cloud = np.concatenate([merged_xyz.astype(np.float32), rgb_u8], axis=1)
-        wandb.log(
-            {
-                "reconstruction/point_cloud": wandb.Object3D(point_cloud),
-            }
-        )
+        wandb_log = {}
+        for name, cloud in pointcloud_payload.items():
+            wandb_log[f"pointcloud/{name}"] = wandb.Object3D(cloud_array_to_object3d(cloud))
+        for name, value in pointcloud_metrics.items():
+            wandb_log[f"pointcloud_metrics/{name}"] = value
+        wandb.log(wandb_log)
         artifact = wandb.Artifact(
-            name=(args.wandb_artifact_name or f"{sequence_name}-pointcloud").replace("/", "-"),
+            name=(args.wandb_artifact_name or f"{sequence_name}-pointcloud-honest").replace("/", "-"),
             type="pointcloud",
         )
-        artifact.add_file(str(merged_pointcloud_path), name=merged_pointcloud_path.name)
+        for path in pointcloud_paths.values():
+            artifact.add_file(str(path), name=path.name)
         run.log_artifact(artifact)
     finally:
         run.finish()
@@ -473,17 +570,20 @@ def run_dual_branch_inference(args: argparse.Namespace) -> Dict[str, Path]:
         sequence_name=inputs["sequence_name"],
         num_ode_steps=args.num_ode_steps,
     )
-    pointcloud_paths, merged_xyz, merged_rgb = export_point_cloud_visualization(
+    pointcloud_paths, pointcloud_payload, pointcloud_metrics = export_point_cloud_visualization(
         decoded_state,
         gs_output_dir,
         sequence_name=inputs["sequence_name"],
+        teacher_human_gaussians=inputs.get("teacher_human_gaussians"),
+        teacher_object_gaussians=inputs.get("teacher_object_gaussians"),
+        teacher_object_pose_frame0=inputs.get("teacher_object_pose_frame0"),
     )
     maybe_log_wandb_visualization(
         args=args,
         sequence_name=inputs["sequence_name"],
-        merged_xyz=merged_xyz,
-        merged_rgb=merged_rgb,
-        merged_pointcloud_path=pointcloud_paths["merged_pointcloud"],
+        pointcloud_paths=pointcloud_paths,
+        pointcloud_payload=pointcloud_payload,
+        pointcloud_metrics=pointcloud_metrics,
     )
     (gs_output_dir / "dual_branch_inference.json").write_text(json.dumps(metadata, indent=2))
 
@@ -492,7 +592,7 @@ def run_dual_branch_inference(args: argparse.Namespace) -> Dict[str, Path]:
         "human_amodal_dir": human_branch_dir,
         "object_amodal_dir": object_branch_dir,
         "gs_dir": gs_output_dir,
-        "pointcloud_dir": pointcloud_paths["merged_pointcloud"].parent,
+        "pointcloud_dir": next(iter(pointcloud_paths.values())).parent,
     }
 
 

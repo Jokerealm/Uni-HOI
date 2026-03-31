@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Formal HDM stage1/stage2 training and sampling entrypoint.
+Legacy HDM stage1/stage2 training and sampling entrypoint.
 
-This keeps the original ProciGen -> BEHAVE training flow separate from the
-newer per-sequence pipeline in `main.py`.
+This keeps the original CVPR'24 HDM training code separate from the current
+dual-branch ProciGen train/test path.
 """
 import os
 import sys
