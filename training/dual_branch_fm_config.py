@@ -131,7 +131,7 @@ def load_dual_branch_fm_config(
     run_name = str(runtime.get("run_name", "procigen_dual_branch_fm"))
     project_name = str(runtime.get("project_name", "dual-branch-fm"))
     log_with = str(runtime.get("log_with", "none"))
-    mixed_precision = str(runtime.get("mixed_precision", "no"))
+    mixed_precision = str(runtime.get("mixed_precision", "bf16"))
     seed = int(runtime.get("seed", 42))
 
     dataset_section = {

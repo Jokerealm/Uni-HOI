@@ -17,6 +17,7 @@ PROJECT_NAME="FM_model"
 RUN_NAME="FM_model"
 OUTPUT_DIR="${REPO_ROOT}/outputs/${RUN_NAME}"
 HONEST_VAL_EVERY="5000"
+MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 LOG_FILE="${OUTPUT_DIR}/train.log"
 CONFIG_FILE="${OUTPUT_DIR}/config.json"
 PID_FILE="${OUTPUT_DIR}/train.pid"
@@ -39,6 +40,7 @@ cat > "${CONFIG_FILE}" <<EOF
   "project_name": "${PROJECT_NAME}",
   "run_name": "${RUN_NAME}",
   "output_dir": "${OUTPUT_DIR}",
+  "mixed_precision": "${MIXED_PRECISION}",
   "honest_val_every": ${HONEST_VAL_EVERY},
   "log_file": "${LOG_FILE}"
 }
@@ -46,7 +48,7 @@ EOF
 
 cd "${REPO_ROOT}"
 
-nohup env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES_VALUE}" PREPARE_NUM_WORKERS="${PREPARE_NUM_WORKERS}" \
+nohup env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES_VALUE}" PREPARE_NUM_WORKERS="${PREPARE_NUM_WORKERS}" MIXED_PRECISION="${MIXED_PRECISION}" \
   "${PYTHON_BIN}" "${REPO_ROOT}/scripts/run_dual_branch_fm.py" \
   --dataset "${DATASET}" \
   --batch_size "${BATCH_SIZE}" \

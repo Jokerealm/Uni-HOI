@@ -207,7 +207,7 @@ dual_branch_fm:
     output_root: outputs
     project_name: dual-branch-fm
     log_with: wandb
-    mixed_precision: "no"
+    mixed_precision: "bf16"
     seed: 42
 
   dist:
@@ -240,7 +240,7 @@ dual_branch_fm:
     human_gaussian_source: smpl_mesh
     seed: 42
     log_with: wandb
-    mixed_precision: "no"
+    mixed_precision: "bf16"
     resume_checkpoint: ""
     batch_size: 4
     max_steps: 200000

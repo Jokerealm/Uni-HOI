@@ -25,6 +25,7 @@ import random
 import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+import warnings
 
 import numpy as np
 import torch
@@ -268,6 +269,83 @@ def configure_torch_runtime() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
+    if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+        torch.backends.cuda.enable_flash_sdp(True)
+    if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+    if hasattr(torch.backends.cuda, "enable_math_sdp"):
+        torch.backends.cuda.enable_math_sdp(True)
+
+
+def resolve_mixed_precision_dtype(mixed_precision: str) -> Optional[torch.dtype]:
+    if mixed_precision == "fp16":
+        return torch.float16
+    if mixed_precision == "bf16":
+        return torch.bfloat16
+    return None
+
+
+def probe_flash_attention(
+    *,
+    device: torch.device,
+    mixed_precision: str,
+    hidden_dim: int,
+    num_heads: int,
+) -> tuple[bool, str]:
+    if device.type != "cuda":
+        return False, "cuda_required"
+    if hidden_dim % num_heads != 0:
+        return False, f"hidden_dim_not_divisible_by_num_heads:{hidden_dim}/{num_heads}"
+    dtype = resolve_mixed_precision_dtype(mixed_precision)
+    if dtype is None:
+        return False, "mixed_precision=no"
+    if not hasattr(torch.backends, "cuda"):
+        return False, "torch.backends.cuda_unavailable"
+    if hasattr(torch.backends.cuda, "is_flash_attention_available") and not torch.backends.cuda.is_flash_attention_available():
+        return False, "flash_attention_backend_unavailable"
+    if not hasattr(torch.backends.cuda, "sdp_kernel"):
+        return False, "sdp_kernel_api_unavailable"
+
+    head_dim = hidden_dim // num_heads
+    q = torch.randn(2, num_heads, 256, head_dim, device=device, dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+                F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        torch.cuda.synchronize()
+        return True, f"dtype={dtype} head_dim={head_dim}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def report_attention_runtime(args: argparse.Namespace, accelerator: Accelerator) -> None:
+    if not accelerator.is_main_process:
+        return
+    flash_available = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "is_flash_attention_available"):
+        flash_available = bool(torch.backends.cuda.is_flash_attention_available())
+    flash_ok, detail = probe_flash_attention(
+        device=accelerator.device,
+        mixed_precision=args.mixed_precision,
+        hidden_dim=args.hidden_dim,
+        num_heads=args.num_heads,
+    )
+    print(
+        "[train_dual_branch_fm] attention runtime "
+        f"| mixed_precision={args.mixed_precision} "
+        f"| flash_available={int(flash_available)} "
+        f"| flash_probe={int(flash_ok)} "
+        f"| detail={detail}",
+        flush=True,
+    )
+    if args.mixed_precision == "no":
+        print(
+            "[train_dual_branch_fm] warning: mixed_precision=no disables FlashAttention-compatible dtypes.",
+            flush=True,
+        )
 
 
 def render_object_branch(
@@ -1022,7 +1100,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project_name", type=str, default="dual-branch-fm")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_with", type=str, default="tensorboard", choices=("tensorboard", "wandb", "none"))
-    parser.add_argument("--mixed_precision", type=str, default="no", choices=("no", "fp16", "bf16"))
+    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=("no", "fp16", "bf16"))
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--resume_checkpoint", type=str, default="")
     parser.add_argument("--resume_model_only", action=argparse.BooleanOptionalAction, default=False)
@@ -1148,6 +1226,7 @@ def main() -> None:
     )
     wandb_enabled = log_with == "wandb"
     set_seed(args.seed, device_specific=True)
+    report_attention_runtime(args, accelerator)
     if accelerator.is_main_process and log_with is not None:
         init_kwargs = {"wandb": {"name": Path(args.output_dir).name}} if wandb_enabled else {}
         accelerator.init_trackers(args.project_name, config=vars(args), init_kwargs=init_kwargs)

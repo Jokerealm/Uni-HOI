@@ -254,6 +254,10 @@ def _apply_cli_overrides(resolved_cfg: dict[str, Any], args: argparse.Namespace)
         runtime["project_name"] = str(args.project_name)
         train["project_name"] = str(args.project_name)
 
+    if args.mixed_precision is not None:
+        runtime["mixed_precision"] = str(args.mixed_precision)
+        train["mixed_precision"] = str(args.mixed_precision)
+
     if args.split_key is not None:
         dataset["split_key"] = str(args.split_key)
 
@@ -450,6 +454,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--python_bin", type=str, default=None)
     parser.add_argument("--run_name", "--task_name", dest="run_name", type=str, default=None)
     parser.add_argument("--project_name", type=str, default=None)
+    parser.add_argument("--mixed_precision", type=str, choices=("no", "fp16", "bf16"), default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
@@ -502,6 +507,7 @@ def main() -> None:
     print(f"  Prepared root  : {dataset['prepared_root']}")
     print(f"  Output dir     : {train['output_dir']}")
     print(f"  Logging        : {train['log_with']}")
+    print(f"  Mixed precision: {train['mixed_precision']}")
     print(f"  Max steps / LR : {train['max_steps']} / {train['lr']}")
     print("============================================================")
 
