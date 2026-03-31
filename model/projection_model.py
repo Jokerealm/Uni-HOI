@@ -100,7 +100,7 @@ class PointCloudProjectionModel(ModelMixin):
 
         self.in_channels = self.add_extra_input_chennels(self.in_channels)
 
-        if self.model_name in ['pc2-diff-ho-sepsegm', 'diff-ho-attn']:
+        if self.model_name == 'pc2-diff-ho-sepsegm':
             self.in_channels += 2 if self.use_distance_transform else 1
 
         # Output size

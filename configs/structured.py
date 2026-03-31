@@ -137,16 +137,6 @@ class PointCloudDiffusionModelConfig(PointCloudProjectionModelConfig):
     dataset_type: str = '${dataset.type}'
 
 @dataclass
-class CrossAttnHOModelConfig(PointCloudDiffusionModelConfig):
-    model_name: str = 'diff-ho-attn'
-
-    attn_type: str = 'coord3d+posenc-learnable'
-    attn_weight: float = 1.0
-    point_visible_test: str = 'combine'  # To compute point visibility: use all points or only human/object points
-
-
-
-@dataclass
 class PointCloudColoringModelConfig(PointCloudProjectionModelConfig):
     # Projection arguments
     predict_shape: bool = False
@@ -473,7 +463,7 @@ class ProjectConfig:
         'custom_hydra_run_dir',
         {'run': 'default'},
         {'logging': 'default'},
-        {'model': 'ho-attn'},
+        {'model': 'flow-matching'},
         # {'dataset': 'co3d'},
         {'dataset': 'behave'},
         {'augmentations': 'default'},
@@ -492,7 +482,6 @@ cs.store(group='run', name='default', node=RunConfig)
 cs.store(group='logging', name='default', node=LoggingConfig)
 cs.store(group='model', name='diffrec', node=PointCloudDiffusionModelConfig)
 cs.store(group='model', name='coloring_model', node=PointCloudColoringModelConfig)
-cs.store(group='model', name='ho-attn', node=CrossAttnHOModelConfig)
 cs.store(group='model', name='pvcnn-ae', node=PVCNNAEModelConfig)
 cs.store(group='model', name='flow-matching', node=FlowMatchingModelConfig)
 cs.store(group='model', name='joint-3dgs', node=Joint3DGSModelConfig)

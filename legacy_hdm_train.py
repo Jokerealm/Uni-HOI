@@ -107,45 +107,9 @@ class TrainerBinarySegm(TrainerBehave):
         return metric_logger
 
 
-class TrainerCrossAttnHO(TrainerBinarySegm):
-    def logging_addition(self, log_dict: dict):
-        log_dict["train_loss_hum"] = self.loss_sep[0]
-        log_dict["train_loss_obj"] = self.loss_sep[1]
-        return log_dict
-
-    def add_log_item(self, metric_logger):
-        metric_logger.add_meter(
-            "train_loss_hum",
-            training_utils.SmoothedValue(window_size=1, fmt="{value:.6f}"),
-        )
-        metric_logger.add_meter(
-            "train_loss_obj",
-            training_utils.SmoothedValue(window_size=1, fmt="{value:.6f}"),
-        )
-        metric_logger.add_meter(
-            "val_loss_hum",
-            training_utils.SmoothedValue(window_size=1, fmt="{value:.6f}"),
-        )
-        metric_logger.add_meter(
-            "val_loss_obj",
-            training_utils.SmoothedValue(window_size=1, fmt="{value:.6f}"),
-        )
-        return metric_logger
-
-    def get_input_image(self, batch, i):
-        return batch["images_fullcrop"][i]
-
-    def get_gt_pclouds(self, batch, i):
-        pc_h = batch["pclouds"][i] * 2 * batch["radius_hum"][i] + batch["cent_hum"][i]
-        pc_o = batch["pclouds_obj"][i] * 2 * batch["radius_obj"][i] + batch["cent_obj"][i]
-        return Pointclouds([torch.cat([pc_h, pc_o], 0).to("cuda")])
-
-
 @hydra.main(config_path="configs", config_name="configs", version_base="1.1")
 def main(cfg: ProjectConfig):
-    if cfg.model.model_name == "diff-ho-attn":
-        trainer = TrainerCrossAttnHO(cfg)
-    elif cfg.model.predict_binary:
+    if cfg.model.predict_binary:
         trainer = TrainerBinarySegm(cfg)
     else:
         trainer = TrainerBehave(cfg)

@@ -64,13 +64,12 @@ In case of a headless remote server, you can run `python app.py run.share=True` 
 
 **Command line demo**:
 
-Alternatively, you can run the demo given image path:
+The old `demo.py` entrypoint depended on the removed PVCNN dual-branch diffusion stack and is no longer supported.
+Use the current dual-branch FM scripts instead:
 ```shell
-python demo.py run.image_path=<RGB image path> dataset.std_coverage=<optional, a value between 3.0 and 3.8> 
+python scripts/run_dual_branch_fm.py --help
+python infer_dual_branch_fm.py --help
 ```
-For example: `python demo.py run.image_path=$PWD/examples/017450/k1.color.jpg dataset.std_coverage=3.0`
-
-Similar to running `app.py`, you can speed up inference by appending `run.diffusion_scheduler=ddim run.num_inference_steps=100` to the end of the command. 
 
 [//]: # (### Hugging face demo: [HDM 🤗]&#40;&#41;)
 
