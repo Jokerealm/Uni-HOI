@@ -341,6 +341,19 @@ def _subsample_tokens(tokens: Tensor, num_tokens: int) -> Tensor:
     return tokens.index_select(0, indices)
 
 
+def _sort_gaussian_tokens_by_xyz(tokens: Tensor) -> Tensor:
+    if tokens.ndim != 2 or tokens.shape[-1] < 3:
+        raise ValueError(f"`tokens` must have shape [N, C>=3], got {tuple(tokens.shape)}.")
+    if tokens.shape[0] <= 1:
+        return tokens
+    # Stabilize token ordering across sequences so state-token learning is not
+    # dominated by arbitrary surface-sampling permutations.
+    xyz = tokens[:, :3].detach().cpu().numpy()
+    order = np.lexsort((xyz[:, 2], xyz[:, 1], xyz[:, 0]))
+    order_t = torch.from_numpy(order.astype(np.int64)).to(device=tokens.device)
+    return tokens.index_select(0, order_t)
+
+
 def _maybe_load_gaussians(sequence_dir: Path, gs_subdir: str, filename: str) -> Optional[Tensor]:
     path = sequence_dir / gs_subdir / filename
     if path.is_file():
@@ -921,6 +934,7 @@ def load_dual_branch_sequence_bundle(
         keypoints_2d = _normalize_keypoints_2d_targets(keypoints_npz["keypoints"], num_joints)
 
     human_gaussians: Optional[Tensor] = None
+    human_vertices: Optional[Tensor] = None
     with np.load(processed_dir / "smpl_params.npz") as smpl_params:
         joints_3d = _resolve_joint_targets_from_smpl_params(smpl_params, num_joints)
         body_pose = torch.from_numpy(_normalize_pose_dim(smpl_params["body_pose"].astype(np.float32), target_dim=144))
@@ -928,6 +942,8 @@ def load_dual_branch_sequence_bundle(
             cam_t = torch.from_numpy(smpl_params["cam_t"].astype(np.float32))
         else:
             cam_t = torch.zeros(body_pose.shape[0], 3, dtype=torch.float32)
+        if "vertices" in smpl_params:
+            human_vertices = torch.from_numpy(smpl_params["vertices"].astype(np.float32))
         if human_gaussian_source == "smpl_mesh":
             human_gaussians = _maybe_load_gaussians(sequence_path, gs_subdir, SMPL_HUMAN_GAUSSIANS_FILENAME)
             if human_gaussians is None:
@@ -953,6 +969,7 @@ def load_dual_branch_sequence_bundle(
         joints_3d.shape[0],
         body_pose.shape[0],
         cam_t.shape[0],
+        human_vertices.shape[0] if human_vertices is not None else 10**9,
     )
     rgb_paths = rgb_paths[:num_frames]
     masks_human = masks_human[:num_frames]
@@ -966,6 +983,8 @@ def load_dual_branch_sequence_bundle(
     joints_3d = joints_3d[:num_frames]
     body_pose = body_pose[:num_frames]
     cam_t = cam_t[:num_frames]
+    if human_vertices is not None:
+        human_vertices = human_vertices[:num_frames]
     object_poses = load_object_pose_sequence(sequence_path, num_frames, processed_subdir=processed_subdir)
 
     if human_gaussian_source == "teacher":
@@ -985,10 +1004,12 @@ def load_dual_branch_sequence_bundle(
         human_gaussians = _placeholder_gaussian_tokens(num_human_gaussians)
     else:
         human_gaussians = _subsample_tokens(human_gaussians, num_human_gaussians)
+        human_gaussians = _sort_gaussian_tokens_by_xyz(human_gaussians)
     if object_gaussians is None:
         object_gaussians = _placeholder_gaussian_tokens(num_object_gaussians)
     else:
         object_gaussians = _subsample_tokens(object_gaussians, num_object_gaussians)
+        object_gaussians = _sort_gaussian_tokens_by_xyz(object_gaussians)
 
     precomputed_targets = _maybe_load_precomputed_dual_branch_targets(
         sequence_path,
@@ -1029,6 +1050,7 @@ def load_dual_branch_sequence_bundle(
         "joints_3d": joints_3d,
         "body_pose": body_pose,
         "cam_t": cam_t,
+        "human_vertices": human_vertices,
         "object_poses": object_poses[:num_frames],
         "contact_signature": contact_signature,
         "human_gaussians": human_gaussians,
@@ -1298,6 +1320,7 @@ class DualBranchHOIDataset(Dataset):
         depth = bundle["depth"][start:end].clone()
         keypoints_2d = bundle["keypoints_2d"][start:end].clone()
         joints_3d = bundle["joints_3d"][start:end].clone()
+        human_vertices = bundle["human_vertices"][start:end].clone() if bundle.get("human_vertices") is not None else None
         object_poses = bundle["object_poses"][start:end].clone()
         camera_intrinsics = bundle["intrinsics"][start:end].clone()
         human_gaussians = bundle["human_gaussians"].clone()
@@ -1320,6 +1343,7 @@ class DualBranchHOIDataset(Dataset):
             "keypoints_2d": keypoints_2d,
             "keypoint_heatmaps": keypoint_heatmaps,
             "joints_3d": joints_3d,
+            "human_vertices": human_vertices,
             "camera_intrinsics": camera_intrinsics,
             "object_poses": object_poses,
             "contact_signature": contact_signature,

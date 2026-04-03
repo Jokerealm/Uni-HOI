@@ -273,15 +273,16 @@ dual_branch_fm:
     num_object_gaussians: 750
     num_joints: 22
     contact_dim: 4
-    loss_preset: full
+    loss_preset: reconstruction_first
     lambda_video_fm: 1.0
     lambda_state_fm: 1.0
     lambda_video_latent: 0.1
     lambda_state_latent: 0.1
     lambda_human_visible: 1.0
+    lambda_human_temporal: 0.25
     lambda_object_video: 1.0
     lambda_object_render: 1.0
-    lambda_branch_coupling: 0.25
+    lambda_branch_coupling: 0.1
     lambda_human_gaussian: 1.0
     lambda_object_gaussian: 1.0
     lambda_joints: 1.0
@@ -291,8 +292,16 @@ dual_branch_fm:
     lambda_object_silhouette: 0.5
     lambda_object_depth: 0.25
     lambda_geometry_distill: 0.05
-    curriculum_fusion_start_ratio: 0.05
-    curriculum_full_start_ratio: 0.2
+    human_visible_region_weight: 1.0
+    human_completion_region_weight: 1.5
+    num_human_video_points: 1024
+    human_proxy_gaussian_scale: 0.012
+    object_visible_region_weight: 1.0
+    object_primary_region_weight: 0.3
+    object_secondary_region_weight: 0.05
+    reconstruction_warmup_ratio: 0.2
+    curriculum_fusion_start_ratio: 0.2
+    curriculum_full_start_ratio: 0.45
     freeze_video_backbone: false
     video_unfreeze_start_ratio: -1.0
     video_stage2_num_top_blocks: 2

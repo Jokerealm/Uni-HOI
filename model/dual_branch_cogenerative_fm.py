@@ -950,19 +950,25 @@ class DualBranchFusionBlock(nn.Module):
         global_video_context: Tensor,
         dynamic_video_context: Tensor,
         state_codec: HOIStateCodec,
+        cross_branch_scale: Optional[float] = None,
+        state_to_video_scale: float = 1.0,
+        video_to_state_scale: float = 1.0,
     ) -> Tuple[Tensor, Tensor]:
+        if cross_branch_scale is not None:
+            state_to_video_scale = float(cross_branch_scale)
+            video_to_state_scale = float(cross_branch_scale)
         video_tokens = self.video_block(video_tokens)
         state_tokens = self.state_block(state_tokens)
 
         video_tokens = video_tokens + self.video_from_condition(video_tokens, condition_tokens)
-        video_tokens = video_tokens + self.video_from_geometry(video_tokens, geometry_tokens)
-        video_tokens = video_tokens + self.video_from_state(video_tokens, state_tokens)
+        video_tokens = video_tokens + float(state_to_video_scale) * self.video_from_geometry(video_tokens, geometry_tokens)
+        video_tokens = video_tokens + float(state_to_video_scale) * self.video_from_state(video_tokens, state_tokens)
 
         global_tokens, dynamic_tokens = state_codec.split_global_dynamic(state_tokens)
-        global_tokens = global_tokens + self.global_gate(global_tokens) * global_video_context
-        dynamic_tokens = dynamic_tokens + self.dynamic_gate(dynamic_tokens) * dynamic_video_context
+        global_tokens = global_tokens + float(video_to_state_scale) * self.global_gate(global_tokens) * global_video_context
+        dynamic_tokens = dynamic_tokens + float(video_to_state_scale) * self.dynamic_gate(dynamic_tokens) * dynamic_video_context
         state_tokens = state_codec.merge_global_dynamic(global_tokens, dynamic_tokens)
-        state_tokens = state_tokens + self.state_from_video(state_tokens, video_tokens)
+        state_tokens = state_tokens + float(video_to_state_scale) * self.state_from_video(state_tokens, video_tokens)
         return video_tokens, state_tokens
 
 
@@ -1111,6 +1117,9 @@ class DualBranchCoGenerativeFlowMatching(nn.Module):
         timesteps: Tensor,
         condition_video: Tensor,
         camera_intrinsics: Tensor,
+        cross_branch_scale: Optional[float] = None,
+        state_to_video_scale: float = 1.0,
+        video_to_state_scale: float = 1.0,
     ) -> DualBranchFMOutput:
         if video_xt.ndim != 3:
             raise ValueError(f"`video_xt` must have shape [B, L_v, D], got {tuple(video_xt.shape)}.")
@@ -1144,6 +1153,9 @@ class DualBranchCoGenerativeFlowMatching(nn.Module):
                 global_video_context=global_context,
                 dynamic_video_context=dynamic_context,
                 state_codec=self.state_codec,
+                cross_branch_scale=cross_branch_scale,
+                state_to_video_scale=float(state_to_video_scale),
+                video_to_state_scale=float(video_to_state_scale),
             )
             decoded_state = self.decode_state_tokens(state_tokens)
             geometry_aux = self.project_geometry(decoded_state, camera_intrinsics)

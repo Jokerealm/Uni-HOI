@@ -21,11 +21,16 @@ from train_dual_branch_fm import (
     SequencePrefetchBatchIterator,
     build_arg_parser as build_train_arg_parser,
     build_curriculum_loss_weights,
+    build_human_supervision_target,
+    build_object_supervision_target,
     build_teacher_state,
     compute_losses,
     configure_torch_runtime,
     infer_condition_channels,
+    render_human_proxy_branch,
     render_object_branch,
+    resolve_state_to_video_scale,
+    resolve_video_to_state_scale,
     resize_video_batch,
     scale_camera_intrinsics,
 )
@@ -170,6 +175,7 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
             depth = batch["depth"]
             camera_intrinsics = batch["camera_intrinsics"]
             object_poses = batch["object_poses"]
+            human_vertices = batch["human_vertices"]
             human_gaussians = batch["human_gaussians"]
             object_gaussians = batch["object_gaussians"]
             joints_3d = batch["joints_3d"]
@@ -241,13 +247,36 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
             )
             background = torch.full_like(rgb, checkpoint_args.background_value)
             object_visible = rgb * masks_object + background * (1.0 - masks_object)
+            human_proxy_render = render_human_proxy_branch(
+                renderer,
+                human_vertices,
+                camera_intrinsics_render,
+                num_points=int(getattr(checkpoint_args, "num_human_video_points", 1024)),
+                gaussian_scale=float(getattr(checkpoint_args, "human_proxy_gaussian_scale", 0.012)),
+            ).detach()
+            human_supervision_target, human_supervision_weights = build_human_supervision_target(
+                human_visible=human_visible,
+                masks_human=masks_human,
+                human_proxy_render=human_proxy_render,
+                visible_weight=float(getattr(checkpoint_args, "human_visible_region_weight", 1.0)),
+                completion_weight=float(getattr(checkpoint_args, "human_completion_region_weight", 1.5)),
+            )
             teacher_object_render = render_object_branch(
                 renderer,
                 object_gaussians,
                 object_poses,
                 camera_intrinsics_render,
             ).detach()
-            teacher_object_video = teacher_object_render * masks_human + object_visible * (1.0 - masks_human)
+            object_supervision_target, object_supervision_weights = build_object_supervision_target(
+                object_visible=object_visible,
+                teacher_object_render=teacher_object_render,
+                m_primary=m_primary,
+                m_secondary=m_secondary,
+                m_object_region=m_object_region,
+                visible_weight=float(getattr(checkpoint_args, "object_visible_region_weight", 1.0)),
+                primary_weight=float(getattr(checkpoint_args, "object_primary_region_weight", 0.3)),
+                secondary_weight=float(getattr(checkpoint_args, "object_secondary_region_weight", 0.05)),
+            )
             teacher_state = build_teacher_state(
                 {
                     "human_gaussians": human_gaussians,
@@ -258,7 +287,7 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
                 }
             )
 
-            video_target = torch.cat([human_visible, teacher_object_video], dim=2)
+            video_target = torch.cat([human_supervision_target, object_supervision_target], dim=2)
             video_target_tokens = model.encode_video_target(video_target)
             state_target_tokens = model.encode_state_target(
                 human_gaussians=human_gaussians,
@@ -277,12 +306,16 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
             video_velocity_target = video_target_tokens - video_noise
             state_velocity_target = state_target_tokens - state_noise
 
+            state_to_video_scale = resolve_state_to_video_scale(checkpoint_args, step)
+            video_to_state_scale = resolve_video_to_state_scale(checkpoint_args, step)
             output = model(
                 video_xt=video_xt,
                 state_xt=state_xt,
                 timesteps=timesteps,
                 condition_video=condition_video,
                 camera_intrinsics=camera_intrinsics_render,
+                state_to_video_scale=state_to_video_scale,
+                video_to_state_scale=video_to_state_scale,
             )
             _, metrics = compute_losses(
                 model=model,
@@ -292,9 +325,10 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
                 state_xt=state_xt,
                 state_velocity_target=state_velocity_target,
                 teacher_state=teacher_state,
-                teacher_object_render=teacher_object_render,
-                teacher_object_video=teacher_object_video,
-                human_visible_target=human_visible,
+                human_supervision_target=human_supervision_target,
+                human_supervision_weights=human_supervision_weights,
+                object_supervision_target=object_supervision_target,
+                object_supervision_weights=object_supervision_weights,
                 masks_human=masks_human,
                 masks_object=masks_object,
                 keypoint_heatmaps=keypoint_heatmaps,
