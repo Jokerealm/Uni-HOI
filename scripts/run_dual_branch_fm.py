@@ -72,6 +72,26 @@ def _append_bool_flag(cmd: list[str], value: bool, positive_flag: str, negative_
     cmd.append(positive_flag if bool(value) else negative_flag)
 
 
+def _auto_train_dataloader_workers(num_processes: int, cpu_count: int | None = None) -> int:
+    cpu_total = int(cpu_count or os.cpu_count() or 8)
+    process_count = max(int(num_processes), 1)
+    if cpu_total <= 2:
+        return 1
+    per_rank_budget = max(cpu_total // max(process_count * 2, 1), 1)
+    return max(1, min(4, per_rank_budget))
+
+
+def _resolve_train_dataloader_num_workers(value: Any, *, num_processes: int) -> int:
+    if value is None:
+        return _auto_train_dataloader_workers(num_processes)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if not text or text == "auto":
+            return _auto_train_dataloader_workers(num_processes)
+        return int(text)
+    return int(value)
+
+
 def _finalize_resolved_config(resolved_cfg: dict[str, Any]) -> None:
     runtime = resolved_cfg["runtime"]
     dataset = resolved_cfg["dataset"]
@@ -100,6 +120,18 @@ def _finalize_resolved_config(resolved_cfg: dict[str, Any]) -> None:
             f"CUDA_VISIBLE_DEVICES={os.getenv('CUDA_VISIBLE_DEVICES')!r}: "
             f"{dist['num_processes']} > {len(visible_devices)}."
         )
+
+    train["dataloader_num_workers"] = _resolve_train_dataloader_num_workers(
+        train.get("dataloader_num_workers"),
+        num_processes=int(dist["num_processes"]),
+    )
+    train["dataloader_pin_memory"] = bool(train.get("dataloader_pin_memory", True))
+    train["dataloader_persistent_workers"] = bool(train.get("dataloader_persistent_workers", True))
+    train["dataloader_prefetch_factor"] = int(train.get("dataloader_prefetch_factor", 2))
+    train["batch_sampler_mode"] = str(train.get("batch_sampler_mode", "global_clip_shuffle"))
+    train["sequence_batch_interleave_window"] = int(train.get("sequence_batch_interleave_window", 0))
+    train["sequence_batch_burst"] = int(train.get("sequence_batch_burst", 1))
+    train["wan_pad_to_compatible_frames"] = bool(train.get("wan_pad_to_compatible_frames", True))
 
 
 def _apply_env_overrides(resolved_cfg: dict[str, Any]) -> None:
@@ -152,6 +184,21 @@ def _apply_env_overrides(resolved_cfg: dict[str, Any]) -> None:
     resume_model_only = _env_bool("RESUME_MODEL_ONLY")
     if resume_model_only is not None:
         train["resume_model_only"] = resume_model_only
+    init_checkpoint = _env_text("INIT_CHECKPOINT")
+    if init_checkpoint is not None:
+        train["init_checkpoint"] = _resolve_repo_path(init_checkpoint) if not init_checkpoint.startswith("/") else init_checkpoint
+    init_checkpoint_strict = _env_bool("INIT_CHECKPOINT_STRICT")
+    if init_checkpoint_strict is not None:
+        train["init_checkpoint_strict"] = init_checkpoint_strict
+    training_stage = _env_text("TRAINING_STAGE")
+    if training_stage is not None:
+        train["training_stage"] = training_stage
+    loss_preset = _env_text("LOSS_PRESET")
+    if loss_preset is not None:
+        train["loss_preset"] = loss_preset
+    freeze_video_backbone = _env_bool("FREEZE_VIDEO_BACKBONE")
+    if freeze_video_backbone is not None:
+        train["freeze_video_backbone"] = freeze_video_backbone
 
     for env_name, key, caster in (
         ("BATCH_SIZE", "batch_size", int),
@@ -284,10 +331,28 @@ def _apply_cli_overrides(resolved_cfg: dict[str, Any], args: argparse.Namespace)
     if args.resume_model_only is not None:
         train["resume_model_only"] = bool(args.resume_model_only)
 
-    for attr in ("batch_size", "max_steps", "lr"):
+    for attr in (
+        "batch_size",
+        "max_steps",
+        "lr",
+        "dataloader_num_workers",
+        "dataloader_prefetch_factor",
+        "sequence_batch_interleave_window",
+        "sequence_batch_burst",
+    ):
         value = getattr(args, attr)
         if value is not None:
             train[attr] = value
+
+    for attr in ("dataloader_pin_memory", "dataloader_persistent_workers"):
+        value = getattr(args, attr)
+        if value is not None:
+            train[attr] = bool(value)
+
+    if args.batch_sampler_mode is not None:
+        train["batch_sampler_mode"] = str(args.batch_sampler_mode)
+    if args.wan_pad_to_compatible_frames is not None:
+        train["wan_pad_to_compatible_frames"] = bool(args.wan_pad_to_compatible_frames)
 
     for attr in ("honest_val_every", "honest_val_num_ode_steps"):
         value = getattr(args, attr)
@@ -296,6 +361,16 @@ def _apply_cli_overrides(resolved_cfg: dict[str, Any], args: argparse.Namespace)
 
     if args.honest_val_sequence is not None:
         train["honest_val_sequence"] = str(args.honest_val_sequence)
+    if args.training_stage is not None:
+        train["training_stage"] = str(args.training_stage)
+    if args.loss_preset is not None:
+        train["loss_preset"] = str(args.loss_preset)
+    if args.init_checkpoint is not None:
+        train["init_checkpoint"] = _resolve_repo_path(args.init_checkpoint)
+    if args.init_checkpoint_strict is not None:
+        train["init_checkpoint_strict"] = bool(args.init_checkpoint_strict)
+    if args.freeze_video_backbone is not None:
+        train["freeze_video_backbone"] = bool(args.freeze_video_backbone)
 
     if args.raw_root is not None:
         dataset["raw_root"] = _resolve_repo_path(args.raw_root)
@@ -339,6 +414,41 @@ def _prepare_command(resolved_cfg: dict[str, Any]) -> list[str]:
     ]
 
 
+def _build_h5_cache_command(
+    resolved_cfg: dict[str, Any],
+    *,
+    max_sequences: int | None,
+    chunk_frames: int | None,
+    overwrite: bool,
+    continue_on_error: bool,
+) -> list[str]:
+    train = resolved_cfg["train"]
+    resolved_max_sequences = int(train["max_sequences"]) if max_sequences is None else int(max_sequences)
+    resolved_chunk_frames = int(chunk_frames) if chunk_frames is not None else 16
+    cmd = [
+        resolved_cfg["python_bin"],
+        str(REPO_ROOT / "scripts" / "build_dual_branch_h5_cache.py"),
+        "--data_root", train["data_root"],
+        "--processed_subdir", train["processed_subdir"],
+        "--gs_subdir", train["gs_subdir"],
+        "--human_gaussian_source", train["human_gaussian_source"],
+        "--split_file", train["split_file"],
+        "--split_key", train["split_key"],
+        "--num_human_gaussians", str(train["num_human_gaussians"]),
+        "--num_object_gaussians", str(train["num_object_gaussians"]),
+        "--num_joints", str(train["num_joints"]),
+        "--contact_dim", str(train["contact_dim"]),
+        "--chunk_frames", str(resolved_chunk_frames),
+    ]
+    if resolved_max_sequences > 0:
+        cmd.extend(["--max_sequences", str(resolved_max_sequences)])
+    if overwrite:
+        cmd.append("--overwrite")
+    if continue_on_error:
+        cmd.append("--continue_on_error")
+    return cmd
+
+
 def _train_entry(resolved_cfg: dict[str, Any]) -> list[str]:
     train = resolved_cfg["train"]
     cmd = [
@@ -354,6 +464,7 @@ def _train_entry(resolved_cfg: dict[str, Any]) -> list[str]:
         "--seed", str(train["seed"]),
         "--log_with", train["log_with"],
         "--mixed_precision", train["mixed_precision"],
+        "--training_stage", str(train.get("training_stage", "stage1")),
         "--batch_size", str(train["batch_size"]),
         "--max_steps", str(train["max_steps"]),
         "--save_every", str(train["save_every"]),
@@ -370,21 +481,49 @@ def _train_entry(resolved_cfg: dict[str, Any]) -> list[str]:
         "--dataset_cache_sequences", str(train["dataset_cache_sequences"]),
         "--rgb_cache_max_frames", str(train["rgb_cache_max_frames"]),
         "--index_progress_every", str(train["index_progress_every"]),
+        "--dataloader_num_workers", str(train.get("dataloader_num_workers", 0)),
+        "--dataloader_prefetch_factor", str(train.get("dataloader_prefetch_factor", 2)),
+        "--batch_sampler_mode", str(train.get("batch_sampler_mode", "global_clip_shuffle")),
+        "--sequence_batch_interleave_window", str(train.get("sequence_batch_interleave_window", 0)),
+        "--sequence_batch_burst", str(train.get("sequence_batch_burst", 1)),
         "--background_value", str(train["background_value"]),
         "--image_height", str(train["image_height"]),
         "--image_width", str(train["image_width"]),
         "--patch_size", str(train["patch_size"]),
+        "--condition_patch_size", str(train["condition_patch_size"]),
         "--hidden_dim", str(train["hidden_dim"]),
         "--depth", str(train["depth"]),
         "--num_heads", str(train["num_heads"]),
         "--mlp_ratio", str(train["mlp_ratio"]),
         "--dropout", str(train["dropout"]),
+        "--video_backend", str(train["video_backend"]),
         "--video_channels", str(train["video_channels"]),
+        "--wan_model_id", str(train["wan_model_id"]),
+        "--wan_dtype", str(train["wan_dtype"]),
+        "--wan_hidden_dim", str(train["wan_hidden_dim"]),
+        "--wan_prompt_max_sequence_length", str(train["wan_prompt_max_sequence_length"]),
+        "--wan_prompt_override", str(train["wan_prompt_override"]),
         "--num_human_gaussians", str(train["num_human_gaussians"]),
         "--num_object_gaussians", str(train["num_object_gaussians"]),
         "--num_joints", str(train["num_joints"]),
         "--contact_dim", str(train["contact_dim"]),
+        "--human_shape_dim", str(train.get("human_shape_dim", 10)),
+        "--human_pose_dim", str(train.get("human_pose_dim", 72)),
         "--loss_preset", train["loss_preset"],
+        "--lambda_fm", str(train.get("lambda_fm", 1.0)),
+        "--lambda_geo_joint_heat", str(train.get("lambda_geo_joint_heat", 1.0)),
+        "--lambda_geo_object_silhouette", str(train.get("lambda_geo_object_silhouette", 0.5)),
+        "--lambda_geo_depth", str(train.get("lambda_geo_depth", 1.0)),
+        "--lambda_reg_pose", str(train.get("lambda_reg_pose", 1.0)),
+        "--lambda_reg_shape", str(train.get("lambda_reg_shape", 0.25)),
+        "--lambda_reg_translation", str(train.get("lambda_reg_translation", 1.0)),
+        "--lambda_reg_object_pose", str(train.get("lambda_reg_object_pose", 1.0)),
+        "--lambda_reg_contact", str(train.get("lambda_reg_contact", 0.25)),
+        "--lambda_depth", str(train.get("lambda_depth", 1.0)),
+        "--lambda_temp_object", str(train.get("lambda_temp_object", 0.1)),
+        "--lambda_temp_contact", str(train.get("lambda_temp_contact", 0.1)),
+        "--lambda_phys_contact", str(train.get("lambda_phys_contact", 0.05)),
+        "--lambda_phys_penetration", str(train.get("lambda_phys_penetration", 0.05)),
         "--lambda_video_fm", str(train["lambda_video_fm"]),
         "--lambda_state_fm", str(train["lambda_state_fm"]),
         "--lambda_video_latent", str(train["lambda_video_latent"]),
@@ -421,16 +560,85 @@ def _train_entry(resolved_cfg: dict[str, Any]) -> list[str]:
         "--honest_val_sequence", str(train["honest_val_sequence"]),
     ]
     _append_bool_flag(cmd, bool(train["cache_rgb"]), "--cache_rgb", "--no-cache_rgb")
+    _append_bool_flag(
+        cmd,
+        bool(train.get("dataloader_pin_memory", True)),
+        "--dataloader_pin_memory",
+        "--no-dataloader_pin_memory",
+    )
+    _append_bool_flag(
+        cmd,
+        bool(train.get("dataloader_persistent_workers", True)),
+        "--dataloader_persistent_workers",
+        "--no-dataloader_persistent_workers",
+    )
+    _append_bool_flag(
+        cmd,
+        bool(train.get("wan_pad_to_compatible_frames", True)),
+        "--wan_pad_to_compatible_frames",
+        "--no-wan_pad_to_compatible_frames",
+    )
     _append_bool_flag(cmd, bool(train["freeze_video_backbone"]), "--freeze_video_backbone", "--no-freeze_video_backbone")
     if str(train.get("resume_checkpoint", "")).strip():
         _append_flag(cmd, "--resume_checkpoint", train["resume_checkpoint"])
+    if str(train.get("init_checkpoint", "")).strip():
+        _append_flag(cmd, "--init_checkpoint", train["init_checkpoint"])
     if bool(train.get("resume_model_only", False)):
         cmd.append("--resume_model_only")
+    if bool(train.get("init_checkpoint_strict", False)):
+        cmd.append("--init_checkpoint_strict")
     return cmd
 
 
 def _run_command(cmd: list[str], *, env: dict[str, str]) -> None:
     subprocess.run(cmd, env=env, check=True)
+
+
+def _read_live_pid(pid_file: Path) -> int | None:
+    if not pid_file.is_file():
+        return None
+    try:
+        pid = int(pid_file.read_text().strip())
+    except Exception:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def _launch_detached_h5_cache_builder(
+    cmd: list[str],
+    *,
+    env: dict[str, str],
+    log_path: Path,
+    pid_path: Path,
+) -> int:
+    existing_pid = _read_live_pid(pid_path)
+    if existing_pid is not None:
+        print(
+            f"[run_dual_branch_fm] H5 cache builder already running | pid={existing_pid} | log={log_path}",
+            flush=True,
+        )
+        return existing_pid
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("ab") as handle:
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    pid_path.write_text(f"{process.pid}\n")
+    print(
+        f"[run_dual_branch_fm] launched H5 cache builder | pid={process.pid} | log={log_path}",
+        flush=True,
+    )
+    return process.pid
 
 
 def _launch_detached_prepare(cmd: list[str], *, env: dict[str, str], status_dir: Path, python_bin: str) -> None:
@@ -457,6 +665,8 @@ def _launch_detached_prepare(cmd: list[str], *, env: dict[str, str], status_dir:
 
 
 def parse_args() -> argparse.Namespace:
+    h5_cache_max_sequences_env = _env_text("H5_CACHE_MAX_SEQUENCES")
+    h5_cache_chunk_frames_env = _env_text("H5_CACHE_CHUNK_FRAMES")
     parser = argparse.ArgumentParser(description="Run ProciGen dual-branch FM training from the unified config.")
     parser.add_argument("--config", type=str, default=os.getenv("CONFIG_FILE", str(DEFAULT_CONFIG_PATH)))
     parser.add_argument("--dataset", type=str, default=_env_text("DATASET"))
@@ -467,6 +677,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--dataloader_num_workers", type=int, default=None)
+    parser.add_argument("--dataloader_pin_memory", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--dataloader_persistent_workers", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--dataloader_prefetch_factor", type=int, default=None)
+    parser.add_argument(
+        "--batch_sampler_mode",
+        type=str,
+        choices=("global_clip_shuffle", "sequence_grouped"),
+        default=None,
+    )
+    parser.add_argument("--sequence_batch_interleave_window", type=int, default=None)
+    parser.add_argument("--sequence_batch_burst", type=int, default=None)
     parser.add_argument("--raw_root", type=str, default=None)
     parser.add_argument("--prepared_root", "--data_root", dest="prepared_root", type=str, default=None)
     parser.add_argument("--split_file", "--split", dest="split_file", type=str, default=None)
@@ -478,12 +700,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--node_rank", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--resume_checkpoint", type=str, default=None)
+    parser.add_argument("--init_checkpoint", type=str, default=None)
     parser.add_argument("--honest_val_every", type=int, default=None)
     parser.add_argument("--honest_val_num_ode_steps", type=int, default=None)
     parser.add_argument("--honest_val_sequence", type=str, default=None)
+    parser.add_argument("--training_stage", type=str, choices=("stage1", "stage2"), default=None)
+    parser.add_argument("--loss_preset", type=str, default=None)
+    parser.add_argument("--wan_pad_to_compatible_frames", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--build_h5_cache", action=argparse.BooleanOptionalAction, default=_env_bool("BUILD_H5_CACHE"))
+    parser.add_argument(
+        "--h5_cache_continue_on_error",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("H5_CACHE_CONTINUE_ON_ERROR"),
+    )
+    parser.add_argument(
+        "--h5_cache_overwrite",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("H5_CACHE_OVERWRITE"),
+    )
+    parser.add_argument(
+        "--h5_cache_max_sequences",
+        type=int,
+        default=int(h5_cache_max_sequences_env) if h5_cache_max_sequences_env is not None else None,
+    )
+    parser.add_argument(
+        "--h5_cache_chunk_frames",
+        type=int,
+        default=int(h5_cache_chunk_frames_env) if h5_cache_chunk_frames_env is not None else None,
+    )
+    parser.add_argument("--h5_cache_log", type=str, default=_env_text("H5_CACHE_LOG"))
     parser.add_argument("--prepare", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--resume_model_only", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--init_checkpoint_strict", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--freeze_video_backbone", action=argparse.BooleanOptionalAction, default=None)
     return parser.parse_args()
 
 
@@ -517,7 +767,10 @@ def main() -> None:
     print(f"  Output dir     : {train['output_dir']}")
     print(f"  Logging        : {train['log_with']}")
     print(f"  Mixed precision: {train['mixed_precision']}")
+    print(f"  Data workers   : {train['dataloader_num_workers']} / rank")
+    print(f"  Sampler mode   : {train['batch_sampler_mode']}")
     print(f"  Max steps / LR : {train['max_steps']} / {train['lr']}")
+    print(f"  Build H5 Cache : {int(bool(args.build_h5_cache))}")
     print("============================================================")
 
     env = os.environ.copy()
@@ -539,6 +792,28 @@ def main() -> None:
     if prepare["only"]:
         print("[run_dual_branch_fm] PREPARE_ONLY=1, exiting after preprocessing.")
         return
+
+    build_h5_cache = bool(args.build_h5_cache)
+    h5_cache_continue_on_error = True if args.h5_cache_continue_on_error is None else bool(args.h5_cache_continue_on_error)
+    h5_cache_overwrite = bool(args.h5_cache_overwrite) if args.h5_cache_overwrite is not None else False
+    if build_h5_cache:
+        h5_log_path = Path(args.h5_cache_log).expanduser() if args.h5_cache_log else Path(train["output_dir"]) / "h5_cache_builder.log"
+        if not h5_log_path.is_absolute():
+            h5_log_path = (REPO_ROOT / h5_log_path).resolve()
+        h5_pid_path = h5_log_path.parent / "h5_cache_builder.pid"
+        h5_cache_cmd = _build_h5_cache_command(
+            resolved,
+            max_sequences=args.h5_cache_max_sequences,
+            chunk_frames=args.h5_cache_chunk_frames,
+            overwrite=h5_cache_overwrite,
+            continue_on_error=h5_cache_continue_on_error,
+        )
+        _launch_detached_h5_cache_builder(
+            h5_cache_cmd,
+            env=env,
+            log_path=h5_log_path,
+            pid_path=h5_pid_path,
+        )
 
     train_entry = _train_entry(resolved)
     visible_devices = env.get("CUDA_VISIBLE_DEVICES")

@@ -15,9 +15,17 @@ import torch
 from PIL import Image
 
 from dataset.dual_branch_fm_dataset import _build_keypoint_heatmaps, load_dual_branch_sequence_bundle, load_rgb_image
-from model.dual_branch_cogenerative_fm import DecodedHOIState, DualBranchCoGenerativeFlowMatching
-from train_dual_branch_fm import resize_video_batch, scale_camera_intrinsics
-from train_dual_branch_fm import build_arg_parser as build_train_arg_parser
+from model.dual_branch_cogenerative_fm import DecodedHOIState
+from train_dual_branch_fm import (
+    broadcast_timesteps_like,
+    build_arg_parser as build_train_arg_parser,
+    build_model_from_args,
+    filter_video_teacher_state_dict,
+    model_uses_wan_teacher,
+    resize_video_batch,
+    sample_video_prior_latents,
+    scale_camera_intrinsics,
+)
 
 
 def resolve_video_dir(input_dir: str, video_name: str) -> Path:
@@ -38,6 +46,9 @@ def resolve_video_dir(input_dir: str, video_name: str) -> Path:
 def namespace_from_checkpoint_args(checkpoint_args: Dict[str, object]) -> argparse.Namespace:
     parser = build_train_arg_parser()
     defaults = parser.parse_args([])
+    if "video_backend" not in checkpoint_args:
+        defaults.video_backend = "legacy_codec"
+        defaults.video_channels = 6
     for key, value in checkpoint_args.items():
         setattr(defaults, key, value)
     return defaults
@@ -75,6 +86,8 @@ def load_inference_clip(
         num_joints=num_joints,
         contact_dim=contact_dim,
         require_gaussian_targets=False,
+        include_human_vertices=False,
+        include_keypoint_heatmaps=False,
     )
 
     rgb = torch.stack([load_rgb_image(str(path)) for path in bundle["rgb_paths"]], dim=0)
@@ -127,6 +140,7 @@ def load_inference_clip(
         "masks_object": masks_object.unsqueeze(0),
         "camera_intrinsics": camera_intrinsics.unsqueeze(0),
         "sequence_name": bundle["sequence_name"],
+        "object_category": bundle.get("object_category", "object"),
         "teacher_human_gaussians": bundle.get("human_gaussians"),
         "teacher_object_gaussians": bundle.get("object_gaussians"),
         "teacher_object_pose_frame0": bundle.get("object_poses")[0] if bundle.get("object_poses") is not None else None,
@@ -137,7 +151,7 @@ def save_video_branch(video: torch.Tensor, branch_dir: Path, *, save_frames: boo
     import imageio.v2 as imageio
 
     branch_dir.mkdir(parents=True, exist_ok=True)
-    video = video.detach().clamp(0.0, 1.0).cpu()
+    video = video.detach().float().clamp(0.0, 1.0).cpu()
     frames_uint8 = []
     frames_dir = branch_dir / "frames"
     if save_frames:
@@ -173,6 +187,11 @@ def save_combined_state(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = {
+        "smpl": {
+            "shape": decoded_state.human_shape.squeeze(0).cpu(),
+            "pose": decoded_state.human_pose.squeeze(0).cpu(),
+            "translation": decoded_state.human_translation.squeeze(0).cpu(),
+        },
         "G_h": {
             "raw": decoded_state.human_gaussians.squeeze(0).cpu(),
         },
@@ -454,24 +473,16 @@ def run_dual_branch_inference(args: argparse.Namespace) -> Dict[str, Path]:
     )
     condition_channels = int(inputs["condition_video"].shape[2])
 
-    model = DualBranchCoGenerativeFlowMatching(
-        hidden_dim=checkpoint_args.hidden_dim,
-        num_heads=checkpoint_args.num_heads,
-        depth=checkpoint_args.depth,
-        mlp_ratio=checkpoint_args.mlp_ratio,
-        dropout=checkpoint_args.dropout,
-        condition_channels=condition_channels,
-        video_channels=checkpoint_args.video_channels,
-        patch_size=checkpoint_args.patch_size,
-        num_frames=checkpoint_args.clip_length,
-        image_height=checkpoint_args.image_height,
-        image_width=checkpoint_args.image_width,
-        num_human_gaussians=checkpoint_args.num_human_gaussians,
-        num_object_gaussians=checkpoint_args.num_object_gaussians,
-        num_joints=checkpoint_args.num_joints,
-        contact_dim=checkpoint_args.contact_dim,
-    )
-    model.load_state_dict(checkpoint["model"], strict=False)
+    model = build_model_from_args(checkpoint_args, condition_channels=condition_channels)
+    incompatible = model.load_state_dict(filter_video_teacher_state_dict(checkpoint["model"]), strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        print(
+            "[infer_dual_branch_fm] warning: checkpoint/model mismatch detected during inference "
+            f"| missing={incompatible.missing_keys[:10]} "
+            f"| unexpected={incompatible.unexpected_keys[:10]} "
+            "| continuing because Uni-HOI stage handoff uses strict=False.",
+            flush=True,
+        )
     model.to(device=device).eval()
     condition_video = inputs["condition_video"].to(device)
     masks_human = inputs["masks_human"].to(device)
@@ -513,12 +524,29 @@ def run_dual_branch_inference(args: argparse.Namespace) -> Dict[str, Path]:
             target_size=(checkpoint_args.image_height, checkpoint_args.image_width),
         )
 
-    video_latents = torch.randn(
-        1,
-        model.video_codec.num_frames * model.video_codec.num_patches_per_frame,
-        checkpoint_args.hidden_dim,
-        device=device,
-    ) * args.prior_noise_std
+    use_wan_teacher = model_uses_wan_teacher(model)
+    condition_latents = model.encode_video_target(condition_video[:, :, :3]) if use_wan_teacher else None
+    if use_wan_teacher:
+        human_video_latents = sample_video_prior_latents(
+            model,
+            batch_size=1,
+            generator=None,
+            device=device,
+        ) * args.prior_noise_std
+        object_video_latents = sample_video_prior_latents(
+            model,
+            batch_size=1,
+            generator=None,
+            device=device,
+        ) * args.prior_noise_std
+        video_latents = human_video_latents
+    else:
+        video_latents = sample_video_prior_latents(
+            model,
+            batch_size=1,
+            generator=None,
+            device=device,
+        ) * args.prior_noise_std
     state_latents = torch.randn(
         1,
         model.state_codec.total_tokens,
@@ -531,36 +559,77 @@ def run_dual_branch_inference(args: argparse.Namespace) -> Dict[str, Path]:
         for step_idx in range(args.num_ode_steps):
             t_cur = times[step_idx].expand(1)
             dt = times[step_idx + 1] - times[step_idx]
+            forward_kwargs = {}
+            if use_wan_teacher:
+                forward_kwargs = {
+                    "condition_latents": condition_latents,
+                    "video_xt_human": human_video_latents,
+                    "video_xt_object": object_video_latents,
+                }
             output = model(
                 video_xt=video_latents,
                 state_xt=state_latents,
                 timesteps=t_cur,
                 condition_video=condition_video,
                 camera_intrinsics=camera_intrinsics,
+                sequence_names=[inputs["sequence_name"]],
+                object_categories=[str(inputs.get("object_category", "object"))],
+                **forward_kwargs,
             )
-            video_latents = video_latents + dt.view(1, 1, 1) * output.video_velocity
+            if use_wan_teacher:
+                human_velocity = output.human_video_velocity if output.human_video_velocity is not None else output.video_velocity
+                object_velocity = (
+                    output.object_video_velocity if output.object_video_velocity is not None else output.video_velocity
+                )
+                human_video_latents = human_video_latents + broadcast_timesteps_like(dt.view(1), human_video_latents) * human_velocity
+                object_video_latents = object_video_latents + broadcast_timesteps_like(dt.view(1), object_video_latents) * object_velocity
+                video_latents = human_video_latents
+            else:
+                video_latents = video_latents + broadcast_timesteps_like(dt.view(1), video_latents) * output.video_velocity
             state_latents = state_latents + dt.view(1, 1, 1) * output.state_velocity
 
-        decoded_video = model.decode_video_tokens(video_latents)
+        if use_wan_teacher:
+            decoded_human_video = model.decode_video_tokens(human_video_latents)
+            decoded_object_video = model.decode_video_tokens(object_video_latents)
+        else:
+            decoded_video = model.decode_video_tokens(video_latents)
         decoded_state = model.decode_state_tokens(state_latents)
-
-    pred_human = decoded_video[:, :, :3]
-    pred_object = decoded_video[:, :, 3:6]
-    if args.clamp_visible_rgb:
-        pred_human = pred_human * (1.0 - masks_human) + human_visible * masks_human
-        pred_object = pred_object * (1.0 - masks_object) + object_visible * masks_object
 
     amodal_dir = video_dir / args.output_subdir
     gs_output_dir = video_dir / args.gs_output_subdir
-    human_branch_dir = amodal_dir / "human_amodal"
-    object_branch_dir = amodal_dir / "object_amodal"
-    save_video_branch(pred_human.squeeze(0), human_branch_dir, save_frames=args.save_frames, fps=args.save_fps)
-    save_video_branch(pred_object.squeeze(0), object_branch_dir, save_frames=args.save_frames, fps=args.save_fps)
+    video_output_dirs: Dict[str, Path] = {}
+    if use_wan_teacher:
+        pred_human = decoded_human_video
+        pred_object = decoded_object_video
+        if args.clamp_visible_rgb:
+            observed_rgb = condition_video[:, :, :3]
+            pred_human = pred_human * masks_object + observed_rgb * (1.0 - masks_object)
+            pred_object = pred_object * masks_human + observed_rgb * (1.0 - masks_human)
+        human_branch_dir = amodal_dir / "human_amodal"
+        object_branch_dir = amodal_dir / "object_amodal"
+        save_video_branch(pred_human.squeeze(0), human_branch_dir, save_frames=args.save_frames, fps=args.save_fps)
+        save_video_branch(pred_object.squeeze(0), object_branch_dir, save_frames=args.save_frames, fps=args.save_fps)
+        video_output_dirs["human_amodal_dir"] = human_branch_dir
+        video_output_dirs["object_amodal_dir"] = object_branch_dir
+    else:
+        pred_human = decoded_video[:, :, :3]
+        pred_object = decoded_video[:, :, 3:6]
+        if args.clamp_visible_rgb:
+            pred_human = pred_human * (1.0 - masks_human) + human_visible * masks_human
+            pred_object = pred_object * (1.0 - masks_object) + object_visible * masks_object
+        human_branch_dir = amodal_dir / "human_amodal"
+        object_branch_dir = amodal_dir / "object_amodal"
+        save_video_branch(pred_human.squeeze(0), human_branch_dir, save_frames=args.save_frames, fps=args.save_fps)
+        save_video_branch(pred_object.squeeze(0), object_branch_dir, save_frames=args.save_frames, fps=args.save_fps)
+        video_output_dirs["human_amodal_dir"] = human_branch_dir
+        video_output_dirs["object_amodal_dir"] = object_branch_dir
 
     metadata = {
         "sequence_name": inputs["sequence_name"],
-        "num_frames": int(decoded_video.shape[1]),
+        "object_category": str(inputs.get("object_category", "object")),
+        "num_frames": int(decoded_state.joints_3d.shape[1]),
         "num_ode_steps": int(args.num_ode_steps),
+        "video_backend": getattr(model, "video_backend", "legacy_codec"),
     }
     save_gaussian_tokens(decoded_state.human_gaussians, gs_output_dir / "G_h.pt", metadata)
     save_gaussian_tokens(decoded_state.object_gaussians, gs_output_dir / "G_o.pt", metadata)
@@ -589,10 +658,9 @@ def run_dual_branch_inference(args: argparse.Namespace) -> Dict[str, Path]:
 
     return {
         "video_dir": video_dir,
-        "human_amodal_dir": human_branch_dir,
-        "object_amodal_dir": object_branch_dir,
         "gs_dir": gs_output_dir,
         "pointcloud_dir": next(iter(pointcloud_paths.values())).parent,
+        **video_output_dirs,
     }
 
 

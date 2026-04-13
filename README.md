@@ -25,7 +25,7 @@ Official implementation for the HDM model of the CVPR24 paper: Template Free Rec
 - [x] Evaluation code. 
 
 ### Updates
-- April 3, 2026. The current dual-branch FM recipe now defaults to a reconstruction-first curriculum: we first focus on person-centric interaction reconstruction, then progressively turn the model back into the previous dual-branch joint optimization setup for further refinement.
+- April 8, 2026. The mainline method spec is now a frozen-Wan-assisted dual-branch design with CoMoVi-style mutual feature interactions and 3D-2D cross-attention. The single source of truth is `design/model_method_reference.md`.
 - June 12, 2024. Add support for using DDIM for inference, the speed is now 10x faster, with minimum affects on performance! 
 
 ## Dependencies
@@ -114,16 +114,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 scripts/train.sh \
 
 All default values now live in `configs/config.yaml` under `dual_branch_fm`.
 
-Current training recipe summary:
+Current method note:
 
-- `loss_preset=reconstruction_first` is the default. The early stage emphasizes person-centric interaction reconstruction and stable state supervision before strong dual-branch coupling is introduced.
-- During the warmup window (`reconstruction_warmup_ratio`), the state branch and geometry/render supervision stay active, while the video-side FM, human visible/temporal, object-video, and branch-coupling terms are kept low.
-- From the end of warmup to `curriculum_full_start_ratio`, the video branch and state-to-video coupling are gradually ramped up, returning to the previous dual-branch co-training behavior for joint refinement.
-- The human video target now mixes observed human pixels with a lightweight proxy render from SMPL vertices, while the object video target uses visible-object regions plus rendered supervision in occluded regions.
+- The repository is being aligned to a frozen-Wan-assisted dual-branch method for 4D HOI reconstruction.
+- The intended architecture follows CoMoVi-style mutual feature interactions plus 3D-2D cross-attention while keeping the Wan backbone frozen.
+- The current method specification, including dual Wan amodal inpainting and GT-supervised structured state outputs, is documented in `design/Uni-HOI_method.md`.
 - `scripts/train.sh` will automatically reuse the latest checkpoint in the run directory unless `RESUME_CHECKPOINT` is set explicitly.
-
-Older CVPR'24 HDM training code is kept separately in `legacy_hdm_train.py`, and
-the older Step1-Step5 pipeline is kept in `legacy_pipeline.py`.
 
 ## Evaluation
 #### Pre-trained checkpoints

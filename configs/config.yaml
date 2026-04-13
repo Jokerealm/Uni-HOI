@@ -242,8 +242,11 @@ dual_branch_fm:
     log_with: wandb
     mixed_precision: "bf16"
     resume_checkpoint: ""
-    batch_size: 4
-    max_steps: 200000
+    init_checkpoint: ""
+    init_checkpoint_strict: false
+    training_stage: stage1
+    batch_size: 1
+    max_steps: 150000
     save_every: 1000
     log_every: 50
     print_every: 5000
@@ -252,46 +255,71 @@ dual_branch_fm:
     lr: 3e-4
     weight_decay: 1e-4
     warmup_steps: 300
-    clip_length: 16
+    clip_length: 9
     clip_stride: 8
     max_sequences: 0
     dataset_cache_sequences: 4
     cache_rgb: true
     rgb_cache_max_frames: 256
     index_progress_every: 10
+    batch_sampler_mode: global_clip_shuffle
     background_value: 1.0
     image_height: 256
     image_width: 256
     patch_size: 16
+    condition_patch_size: 64
     hidden_dim: 512
     depth: 8
     num_heads: 8
     mlp_ratio: 3.0
     dropout: 0.0
-    video_channels: 6
+    video_backend: wan_ti2v_5b
+    video_channels: 3
+    wan_model_id: Wan-AI/Wan2.2-TI2V-5B-Diffusers
+    wan_dtype: bf16
+    wan_hidden_dim: 3072
+    wan_prompt_max_sequence_length: 512
+    wan_prompt_override: ""
+    wan_pad_to_compatible_frames: true
     num_human_gaussians: 750
     num_object_gaussians: 750
     num_joints: 22
     contact_dim: 4
-    loss_preset: reconstruction_first
-    lambda_video_fm: 1.0
-    lambda_state_fm: 1.0
-    lambda_video_latent: 0.1
-    lambda_state_latent: 0.1
-    lambda_human_visible: 1.0
-    lambda_human_temporal: 0.25
-    lambda_object_video: 1.0
-    lambda_object_render: 1.0
-    lambda_branch_coupling: 0.1
+    human_shape_dim: 10
+    human_pose_dim: 72
+    loss_preset: stage1
+    lambda_fm: 1.0
+    lambda_geo_joint_heat: 1.0
+    lambda_geo_object_silhouette: 0.5
+    lambda_geo_depth: 1.0
+    lambda_reg_pose: 1.0
+    lambda_reg_shape: 0.25
+    lambda_reg_translation: 1.0
+    lambda_reg_object_pose: 1.0
+    lambda_reg_contact: 0.25
+    lambda_depth: 1.0
+    lambda_temp_object: 0.1
+    lambda_temp_contact: 0.1
+    lambda_phys_contact: 0.05
+    lambda_phys_penetration: 0.05
+    lambda_video_fm: 0.0
+    lambda_state_fm: 0.0
+    lambda_video_latent: 0.0
+    lambda_state_latent: 0.0
+    lambda_human_visible: 0.0
+    lambda_human_temporal: 0.0
+    lambda_object_video: 0.0
+    lambda_object_render: 0.0
+    lambda_branch_coupling: 0.0
     lambda_human_gaussian: 1.0
     lambda_object_gaussian: 1.0
     lambda_joints: 1.0
-    lambda_object_motion: 0.5
-    lambda_contact: 0.25
-    lambda_joint_heat: 0.5
-    lambda_object_silhouette: 0.5
-    lambda_object_depth: 0.25
-    lambda_geometry_distill: 0.05
+    lambda_object_motion: 0.0
+    lambda_contact: 0.0
+    lambda_joint_heat: 0.0
+    lambda_object_silhouette: 0.0
+    lambda_object_depth: 0.0
+    lambda_geometry_distill: 0.0
     human_visible_region_weight: 1.0
     human_completion_region_weight: 1.5
     num_human_video_points: 1024
@@ -299,10 +327,10 @@ dual_branch_fm:
     object_visible_region_weight: 1.0
     object_primary_region_weight: 0.3
     object_secondary_region_weight: 0.05
-    reconstruction_warmup_ratio: 0.2
-    curriculum_fusion_start_ratio: 0.2
-    curriculum_full_start_ratio: 0.45
-    freeze_video_backbone: false
+    reconstruction_warmup_ratio: 0.35
+    curriculum_fusion_start_ratio: 0.6
+    curriculum_full_start_ratio: 0.8
+    freeze_video_backbone: true
     video_unfreeze_start_ratio: -1.0
     video_stage2_num_top_blocks: 2
     honest_val_every: 5000

@@ -5,26 +5,27 @@ Train the dual-branch co-generative Flow Matching model for 4D HOI reconstructio
 The training graph is unified:
 
 - Video branch:
-  predicts latent velocities for human/object amodal video tokens.
+  defaults to a frozen Wan TI2V teacher that predicts RGB latent velocities.
 - State branch:
   predicts latent velocities for HOI state tokens
   (human/object Gaussians, joints, object motion, contact).
 - Cross-branch supervision:
-  object render consistency, 3D->2D geometry consistency, contact consistency.
+  object render consistency, 3D->2D geometry consistency, and late teacher coupling.
 """
 
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import Future, ThreadPoolExecutor
+import collections
 import importlib.util
 import json
 import math
 import os
 import random
+import socket
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 import warnings
 
 import numpy as np
@@ -35,82 +36,76 @@ from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration
 from torch import Tensor, nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data._utils.collate import default_collate
+from torch.utils.data import DataLoader, Sampler
 from tqdm.auto import tqdm
 
 from dataset.dual_branch_fm_dataset import DualBranchHOIDataset
 from model.dual_branch_cogenerative_fm import DecodedHOIState, DualBranchCoGenerativeFlowMatching
+from model.dual_branch_wan_teacher_fm import DualBranchWanTeacherFlowMatching
 from model.joint_renderer_loss import DiffRasterizationLayer
 
 LOSS_NAMES = (
-    "video_fm",
-    "state_fm",
-    "video_latent",
-    "state_latent",
-    "human_visible",
-    "human_temporal",
-    "object_video",
-    "object_render",
-    "branch_coupling",
+    "fm",
+    "geo_joint_heat",
+    "geo_object_silhouette",
+    "geo_depth",
     "human_gaussian",
     "object_gaussian",
     "joints",
-    "object_motion",
-    "contact",
-    "joint_heat",
-    "object_silhouette",
-    "object_depth",
-    "geometry_distill",
+    "reg_pose",
+    "reg_shape",
+    "reg_translation",
+    "reg_object_pose",
+    "reg_contact",
+    "depth",
+    "temp_object",
+    "temp_contact",
+    "phys_contact",
+    "phys_penetration",
 )
 
-RECONSTRUCTION_FIRST_LOSS_NAMES = (
-    "video_fm",
-    "state_fm",
-    "video_latent",
-    "state_latent",
-    "human_visible",
-    "human_temporal",
-    "object_video",
-    "object_render",
-    "branch_coupling",
-    "human_gaussian",
-    "object_gaussian",
-    "joints",
-    "object_motion",
-    "contact",
-    "joint_heat",
-    "object_silhouette",
-    "object_depth",
-    "geometry_distill",
-)
+VIDEO_TEACHER_STATE_PREFIXES = ("_video_teacher.",)
 
-CORE_LOSS_NAMES = (
-    "video_fm",
-    "state_fm",
-    "human_visible",
-    "human_temporal",
-    "object_video",
-    "joints",
-    "object_motion",
-)
+
+def filter_video_teacher_state_dict(state_dict: Dict[str, Tensor]) -> Dict[str, Tensor]:
+    return {
+        key: value
+        for key, value in state_dict.items()
+        if not key.startswith(VIDEO_TEACHER_STATE_PREFIXES)
+    }
 
 STAGE0_LOSS_NAMES = (
-    "video_fm",
-    "state_fm",
-    "video_latent",
-    "state_latent",
-    "human_visible",
-    "human_temporal",
-    "object_video",
+    "fm",
+    "geo_joint_heat",
+    "geo_object_silhouette",
+    "geo_depth",
+    "human_gaussian",
+    "object_gaussian",
     "joints",
-    "object_motion",
 )
 
+STAGE1_LOSS_NAMES = STAGE0_LOSS_NAMES
+
+STAGE2_EXTRA_LOSS_NAMES = (
+    "reg_pose",
+    "reg_shape",
+    "reg_translation",
+    "reg_object_pose",
+    "reg_contact",
+    "depth",
+    "temp_object",
+    "temp_contact",
+    "phys_contact",
+    "phys_penetration",
+)
+
+STAGE2_LOSS_NAMES = STAGE1_LOSS_NAMES + STAGE2_EXTRA_LOSS_NAMES
+
 LOSS_PRESETS: dict[str, tuple[str, ...]] = {
-    "core": CORE_LOSS_NAMES,
     "stage0": STAGE0_LOSS_NAMES,
+    "stage1": STAGE1_LOSS_NAMES,
+    "stage2": STAGE2_LOSS_NAMES,
     "full": LOSS_NAMES,
-    "reconstruction_first": RECONSTRUCTION_FIRST_LOSS_NAMES,
 }
 
 _HONEST_RENDER_MODULE = None
@@ -223,11 +218,234 @@ def count_parameters(parameters) -> int:
     return sum(parameter.numel() for parameter in parameters)
 
 
+def _json_safe(value):
+    if isinstance(value, Tensor):
+        detached = value.detach().cpu()
+        if detached.numel() == 1:
+            return float(detached.item())
+        return detached.reshape(-1).tolist()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def write_rank_debug_status(
+    status_path: Optional[Path],
+    *,
+    phase: str,
+    rank: int,
+    world_size: int,
+    step: int,
+    sequence_names: Optional[Sequence[str]] = None,
+    extra: Optional[Dict[str, object]] = None,
+) -> None:
+    if status_path is None:
+        return
+    payload = {
+        "timestamp_unix": time.time(),
+        "timestamp_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "rank": int(rank),
+        "world_size": int(world_size),
+        "phase": str(phase),
+        "global_step": int(step),
+    }
+    if sequence_names is not None:
+        payload["sequence_names"] = [str(name) for name in sequence_names]
+    if extra:
+        payload.update({str(key): _json_safe(value) for key, value in extra.items()})
+    try:
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = status_path.with_suffix(f"{status_path.suffix}.tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp_path, status_path)
+    except OSError:
+        return
+
+
+def reduce_scalar_metrics(accelerator: Accelerator, metrics: Dict[str, Tensor]) -> Dict[str, float]:
+    metric_items = list(metrics.items())
+    if not metric_items:
+        return {}
+
+    metric_names = []
+    metric_scalars = []
+    for name, value in metric_items:
+        scalar = value.detach()
+        if scalar.numel() != 1:
+            raise ValueError(f"Metric `{name}` must be scalar, got shape {tuple(scalar.shape)}.")
+        metric_names.append(name)
+        metric_scalars.append(scalar.to(device=accelerator.device, dtype=torch.float32).reshape(()))
+
+    reduced = accelerator.reduce(torch.stack(metric_scalars), reduction="mean")
+    return {
+        name: float(reduced[idx].item())
+        for idx, name in enumerate(metric_names)
+    }
+
+
+def build_wandb_loss_metrics(
+    reduced_metrics: Dict[str, float],
+    loss_weights: Dict[str, float],
+) -> Dict[str, float]:
+    metrics_to_log: Dict[str, float] = {}
+    if "loss_total" in reduced_metrics:
+        metrics_to_log["loss_total"] = float(reduced_metrics["loss_total"])
+    if "loss_video_fm" in reduced_metrics:
+        metrics_to_log["loss_video_fm"] = float(reduced_metrics["loss_video_fm"])
+
+    for loss_name, weight in loss_weights.items():
+        if float(weight) <= 0.0:
+            continue
+        metric_name = f"loss_{loss_name}"
+        if metric_name in reduced_metrics and metric_name not in metrics_to_log:
+            metrics_to_log[metric_name] = float(reduced_metrics[metric_name])
+
+    return metrics_to_log
+
+
 def infer_condition_channels(dataset: DualBranchHOIDataset) -> int:
     return int(dataset.condition_channels)
 
 
-class SequencePrefetchBatchIterator:
+def model_uses_wan_teacher(model_or_args) -> bool:
+    backend = getattr(model_or_args, "video_backend", None)
+    if backend is None:
+        backend = getattr(model_or_args, "video_backend", "legacy_codec")
+    return str(backend) == "wan_ti2v_5b"
+
+
+def resolve_wan_teacher_num_frames(*, clip_length: int, pad_to_compatible_frames: bool) -> int:
+    clip_length = int(clip_length)
+    if clip_length <= 0:
+        raise ValueError(f"`clip_length` must be > 0, got {clip_length}.")
+    if (clip_length - 1) % 4 == 0:
+        return clip_length
+    if not bool(pad_to_compatible_frames):
+        raise ValueError(
+            "`Wan-AI/Wan2.2-TI2V-5B` requires `clip_length = 4k + 1` unless "
+            "`--wan_pad_to_compatible_frames` is enabled. "
+            f"Got clip_length={clip_length}."
+        )
+    return ((clip_length - 1 + 3) // 4) * 4 + 1
+
+
+def build_model_from_args(
+    args: argparse.Namespace,
+    *,
+    condition_channels: int,
+):
+    if model_uses_wan_teacher(args):
+        teacher_num_frames = resolve_wan_teacher_num_frames(
+            clip_length=args.clip_length,
+            pad_to_compatible_frames=bool(getattr(args, "wan_pad_to_compatible_frames", True)),
+        )
+        return DualBranchWanTeacherFlowMatching(
+            hidden_dim=args.hidden_dim,
+            num_heads=args.num_heads,
+            depth=args.depth,
+            mlp_ratio=args.mlp_ratio,
+            dropout=args.dropout,
+            condition_channels=condition_channels,
+            patch_size=args.patch_size,
+            condition_patch_size=args.condition_patch_size,
+            num_frames=args.clip_length,
+            image_height=args.image_height,
+            image_width=args.image_width,
+            num_human_gaussians=args.num_human_gaussians,
+            num_object_gaussians=args.num_object_gaussians,
+            num_joints=args.num_joints,
+            contact_dim=args.contact_dim,
+            human_shape_dim=args.human_shape_dim,
+            human_pose_dim=args.human_pose_dim,
+            wan_model_id=args.wan_model_id,
+            wan_dtype=args.wan_dtype,
+            wan_prompt_max_sequence_length=args.wan_prompt_max_sequence_length,
+            wan_prompt_override=args.wan_prompt_override,
+            wan_local_files_only=args.wan_local_files_only,
+            wan_hidden_dim=args.wan_hidden_dim,
+            teacher_num_frames=teacher_num_frames,
+        )
+    return DualBranchCoGenerativeFlowMatching(
+        hidden_dim=args.hidden_dim,
+        num_heads=args.num_heads,
+        depth=args.depth,
+        mlp_ratio=args.mlp_ratio,
+        dropout=args.dropout,
+        condition_channels=condition_channels,
+        video_channels=args.video_channels,
+        patch_size=args.patch_size,
+        num_frames=args.clip_length,
+        image_height=args.image_height,
+        image_width=args.image_width,
+        num_human_gaussians=args.num_human_gaussians,
+        num_object_gaussians=args.num_object_gaussians,
+        num_joints=args.num_joints,
+        contact_dim=args.contact_dim,
+        human_shape_dim=args.human_shape_dim,
+        human_pose_dim=args.human_pose_dim,
+    )
+
+
+def ensure_video_teacher_ready(model, device: torch.device) -> None:
+    if model_uses_wan_teacher(model):
+        model.ensure_video_teacher(device)
+
+
+def sample_video_prior_latents(
+    model,
+    *,
+    batch_size: int,
+    generator: Optional[torch.Generator],
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+) -> Tensor:
+    if model_uses_wan_teacher(model):
+        return model.sample_video_prior(
+            batch_size,
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        )
+    if dtype is None:
+        dtype = next(model.parameters()).dtype
+    return torch.randn(
+        batch_size,
+        model.video_codec.num_frames * model.video_codec.num_patches_per_frame,
+        model.hidden_dim,
+        generator=generator,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def broadcast_timesteps_like(timesteps: Tensor, target: Tensor) -> Tensor:
+    if timesteps.ndim != 1:
+        raise ValueError(f"`timesteps` must have shape [B], got {tuple(timesteps.shape)}.")
+    if timesteps.shape[0] != target.shape[0]:
+        raise ValueError(
+            f"Batch size mismatch between timesteps and target, got {timesteps.shape[0]} and {target.shape[0]}."
+        )
+    return timesteps.float().view(timesteps.shape[0], *([1] * (target.ndim - 1)))
+
+
+def flow_match_sample(target: Tensor, noise: Tensor, timesteps: Tensor) -> Tuple[Tensor, Tensor]:
+    if target.shape != noise.shape:
+        raise ValueError(f"`target` and `noise` must share shape, got {tuple(target.shape)} and {tuple(noise.shape)}.")
+    t_view = broadcast_timesteps_like(timesteps, target).to(device=target.device, dtype=target.dtype)
+    xt = t_view * target + (1.0 - t_view) * noise
+    velocity = target - noise
+    return xt, velocity
+
+
+class SequenceBatchSampler(Sampler[list[int]]):
     def __init__(
         self,
         dataset: DualBranchHOIDataset,
@@ -235,17 +453,24 @@ class SequencePrefetchBatchIterator:
         batch_size: int,
         drop_last: bool,
         seed: int,
-        process_index: int = 0,
-        num_processes: int = 1,
+        shuffle: bool = True,
         warm_start_short_sequences: bool = True,
+        interleave_window: int = 1,
+        max_batches_per_sequence: int = 1,
     ) -> None:
         self.dataset = dataset
         self.batch_size = int(batch_size)
         self.drop_last = bool(drop_last)
         self.seed = int(seed)
-        self.process_index = max(int(process_index), 0)
-        self.num_processes = max(int(num_processes), 1)
+        self.shuffle = bool(shuffle)
         self.warm_start_short_sequences = bool(warm_start_short_sequences)
+        self.interleave_window = max(int(interleave_window), 1)
+        self.max_batches_per_sequence = int(max_batches_per_sequence)
+        if self.max_batches_per_sequence <= 0:
+            raise ValueError(
+                "`max_batches_per_sequence` must be > 0, "
+                f"got {self.max_batches_per_sequence}."
+            )
         self._epoch = 0
         self._all_sequence_dirs = [
             sequence_dir
@@ -255,23 +480,17 @@ class SequencePrefetchBatchIterator:
 
     def _ordered_sequence_dirs_for_epoch(self, epoch: int) -> list[str]:
         sequence_dirs = list(self._all_sequence_dirs)
-        if epoch == 0 and self.warm_start_short_sequences:
+        if self.shuffle and epoch == 0 and self.warm_start_short_sequences:
             sequence_dirs.sort(
                 key=lambda sequence_dir: (
                     self.dataset.sequence_frame_counts[sequence_dir],
                     sequence_dir,
                 )
             )
-        else:
+        elif self.shuffle:
             rng = random.Random(self.seed + epoch)
             rng.shuffle(sequence_dirs)
-        if self.num_processes > 1:
-            sequence_dirs = sequence_dirs[self.process_index :: self.num_processes]
         return sequence_dirs
-
-    @property
-    def local_sequence_count(self) -> int:
-        return len(self._ordered_sequence_dirs_for_epoch(self._epoch))
 
     def __len__(self) -> int:
         total = 0
@@ -283,46 +502,122 @@ class SequencePrefetchBatchIterator:
                 total += (num_samples + self.batch_size - 1) // self.batch_size
         return total
 
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = max(int(epoch), 0)
+
+    def _sequence_batches_for_epoch(
+        self,
+        epoch: int,
+        rng: random.Random,
+    ) -> list[tuple[str, list[list[int]]]]:
+        sequence_batches: list[tuple[str, list[list[int]]]] = []
+        for sequence_dir in self._ordered_sequence_dirs_for_epoch(epoch):
+            sample_indices = list(self.dataset.sequence_sample_indices[sequence_dir])
+            if self.shuffle:
+                rng.shuffle(sample_indices)
+            batches: list[list[int]] = []
+            for batch_start in range(0, len(sample_indices), self.batch_size):
+                batch_indices = sample_indices[batch_start : batch_start + self.batch_size]
+                if len(batch_indices) < self.batch_size and self.drop_last:
+                    continue
+                batches.append(batch_indices)
+            if batches:
+                sequence_batches.append((sequence_dir, batches))
+        return sequence_batches
+
+    def _iter_draining_sequence_batches(
+        self,
+        sequence_batches: Sequence[tuple[str, Sequence[list[int]]]],
+    ):
+        for _, batches in sequence_batches:
+            for batch_indices in batches:
+                yield batch_indices
+
+    def _iter_interleaved_sequence_batches(
+        self,
+        sequence_batches: Sequence[tuple[str, Sequence[list[int]]]],
+        rng: random.Random,
+    ):
+        # Keep only a bounded set of active sequences hot at once so we stagger
+        # large sequence bundle loads across ranks without destroying cache locality.
+        pending_entries = collections.deque(
+            {
+                "sequence_dir": sequence_dir,
+                "batches": list(batches),
+                "next_batch_index": 0,
+            }
+            for sequence_dir, batches in sequence_batches
+        )
+        active_entries: list[dict[str, object]] = []
+        while pending_entries and len(active_entries) < self.interleave_window:
+            active_entries.append(pending_entries.popleft())
+
+        round_index = 0
+        while active_entries:
+            if len(active_entries) > 1:
+                if self.shuffle:
+                    start_offset = rng.randrange(len(active_entries))
+                else:
+                    start_offset = round_index % len(active_entries)
+                ordered_entries = active_entries[start_offset:] + active_entries[:start_offset]
+            else:
+                ordered_entries = list(active_entries)
+
+            next_active_entries: list[dict[str, object]] = []
+            for entry in ordered_entries:
+                batches = entry["batches"]
+                next_batch_index = int(entry["next_batch_index"])
+                burst_count = 0
+                while next_batch_index < len(batches) and burst_count < self.max_batches_per_sequence:
+                    yield batches[next_batch_index]
+                    next_batch_index += 1
+                    burst_count += 1
+                if next_batch_index < len(batches):
+                    entry["next_batch_index"] = next_batch_index
+                    next_active_entries.append(entry)
+
+            while pending_entries and len(next_active_entries) < self.interleave_window:
+                next_active_entries.append(pending_entries.popleft())
+
+            active_entries = next_active_entries
+            round_index += 1
+
     def __iter__(self):
         epoch = self._epoch
-        sequence_dirs = self._ordered_sequence_dirs_for_epoch(epoch)
-        rng = random.Random(self.seed + epoch)
         self._epoch += 1
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sequence-prefetch")
-        prefetched_dir: Optional[str] = None
-        prefetched_future: Optional[Future] = None
-        try:
-            if sequence_dirs:
-                prefetched_dir = sequence_dirs[0]
-                prefetched_future = executor.submit(self.dataset.get_sequence_bundle, prefetched_dir)
+        rng = random.Random(self.seed + epoch)
+        sequence_batches = self._sequence_batches_for_epoch(epoch, rng)
+        if self.interleave_window <= 1 or len(sequence_batches) <= 1:
+            yield from self._iter_draining_sequence_batches(sequence_batches)
+            return
+        yield from self._iter_interleaved_sequence_batches(sequence_batches, rng)
 
-            for sequence_idx, sequence_dir in enumerate(sequence_dirs):
-                if prefetched_dir == sequence_dir and prefetched_future is not None:
-                    bundle = prefetched_future.result()
-                else:
-                    bundle = self.dataset.get_sequence_bundle(sequence_dir)
 
-                next_dir = sequence_dirs[sequence_idx + 1] if sequence_idx + 1 < len(sequence_dirs) else None
-                if next_dir is not None:
-                    prefetched_dir = next_dir
-                    prefetched_future = executor.submit(self.dataset.get_sequence_bundle, next_dir)
-                else:
-                    prefetched_dir = None
-                    prefetched_future = None
+def normalize_batch_sampler_mode(mode: str) -> str:
+    text = str(mode).strip().lower().replace("-", "_")
+    if text in {"global", "global_shuffle", "global_clip_shuffle", "clip_shuffle"}:
+        return "global_clip_shuffle"
+    if text in {"sequence", "sequence_grouped", "sequence_batch"}:
+        return "sequence_grouped"
+    raise ValueError(
+        "`batch_sampler_mode` must be one of "
+        "`global_clip_shuffle` or `sequence_grouped`, "
+        f"got {mode!r}."
+    )
 
-                sample_indices = list(self.dataset.sequence_sample_indices[sequence_dir])
-                rng.shuffle(sample_indices)
-                for batch_start in range(0, len(sample_indices), self.batch_size):
-                    batch_indices = sample_indices[batch_start : batch_start + self.batch_size]
-                    if len(batch_indices) < self.batch_size and self.drop_last:
-                        continue
-                    samples = [
-                        self.dataset.get_sample_by_index(sample_index, bundle=bundle)
-                        for sample_index in batch_indices
-                    ]
-                    yield default_collate(samples)
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+
+def resolve_sequence_batch_interleave_window(
+    requested_window: int,
+    *,
+    world_size: int,
+    cache_sequences: int,
+) -> int:
+    requested_window = int(requested_window)
+    if requested_window > 0:
+        return requested_window
+    if world_size <= 1:
+        return 1
+    return max(2, int(cache_sequences))
 
 
 def configure_torch_runtime() -> None:
@@ -473,6 +768,9 @@ def render_human_proxy_branch(
 
 def build_teacher_state(batch: Dict[str, Tensor]) -> DecodedHOIState:
     return DecodedHOIState(
+        human_shape=batch["human_shape"],
+        human_pose=batch["body_pose"],
+        human_translation=batch["cam_t"],
         human_gaussians=batch["human_gaussians"],
         object_gaussians=batch["object_gaussians"],
         joints_3d=batch["joints_3d"],
@@ -545,6 +843,78 @@ def compute_weighted_temporal_l1(prediction: Tensor, target: Tensor, weights: Te
     temporal_target = target[:, 1:] - target[:, :-1]
     temporal_weights = torch.maximum(weights[:, 1:], weights[:, :-1])
     return compute_weighted_l1(temporal_prediction, temporal_target, temporal_weights)
+
+
+def density_to_occupancy(density: Tensor) -> Tensor:
+    return 1.0 - torch.exp(-density.clamp(min=0.0))
+
+
+def transform_object_points(object_gaussians: Tensor, object_poses: Tensor) -> Tensor:
+    object_xyz = object_gaussians[..., :3]
+    object_h = torch.cat([object_xyz, torch.ones_like(object_xyz[..., :1])], dim=-1)
+    world = torch.matmul(object_poses.unsqueeze(2), object_h.unsqueeze(1).unsqueeze(-1)).squeeze(-1)[..., :3]
+    return world
+
+
+def compute_second_order_smoothness(points: Tensor) -> Tensor:
+    if points.shape[1] < 3:
+        return points.new_zeros(())
+    accel = points[:, 2:] - 2.0 * points[:, 1:-1] + points[:, :-2]
+    return accel.abs().mean()
+
+
+def contact_activation(contact_signature: Tensor) -> Tensor:
+    if contact_signature.shape[-1] >= 4:
+        return contact_signature[..., -2:].sigmoid().mean(dim=-1, keepdim=True)
+    return contact_signature.sigmoid().mean(dim=-1, keepdim=True)
+
+
+def compute_contact_relative_velocity_loss(
+    joints_3d: Tensor,
+    object_world_points: Tensor,
+    contact_signature: Tensor,
+) -> Tensor:
+    if joints_3d.shape[1] < 2:
+        return joints_3d.new_zeros(())
+    hand_span = min(4, joints_3d.shape[2])
+    hand_points = joints_3d[:, :, -hand_span:]
+    hand_center = hand_points.mean(dim=2)
+    object_center = object_world_points.mean(dim=2)
+    relative_velocity = (hand_center[:, 1:] - hand_center[:, :-1]) - (object_center[:, 1:] - object_center[:, :-1])
+    weights = torch.maximum(contact_activation(contact_signature)[:, 1:], contact_activation(contact_signature)[:, :-1])
+    return (relative_velocity.norm(dim=-1, keepdim=True) * weights).sum() / weights.sum().clamp(min=1.0)
+
+
+def compute_contact_distance_loss(
+    joints_3d: Tensor,
+    object_world_points: Tensor,
+    teacher_contact_signature: Tensor,
+) -> Tensor:
+    hand_span = min(4, joints_3d.shape[2])
+    hand_points = joints_3d[:, :, -hand_span:]
+    distances = torch.cdist(
+        hand_points.reshape(-1, hand_span, 3),
+        object_world_points.reshape(-1, object_world_points.shape[2], 3),
+    ).min(dim=-1).values
+    distances = distances.view(joints_3d.shape[0], joints_3d.shape[1], hand_span)
+    target_weights = contact_activation(teacher_contact_signature)
+    return (distances.mean(dim=-1, keepdim=True) * target_weights).sum() / target_weights.sum().clamp(min=1.0)
+
+
+def compute_penetration_loss(
+    joints_3d: Tensor,
+    object_world_points: Tensor,
+    *,
+    margin: float = 0.02,
+) -> Tensor:
+    non_hand_count = max(joints_3d.shape[2] - min(4, joints_3d.shape[2]), 1)
+    body_points = joints_3d[:, :, :non_hand_count]
+    distances = torch.cdist(
+        body_points.reshape(-1, non_hand_count, 3),
+        object_world_points.reshape(-1, object_world_points.shape[2], 3),
+    ).min(dim=-1).values
+    penetration = torch.relu(float(margin) - distances)
+    return penetration.mean()
 
 
 def compute_point_set_chamfer(prediction_xyz: Tensor, target_xyz: Tensor) -> Tensor:
@@ -674,6 +1044,11 @@ def _save_validation_combined_state(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = {
+        "smpl": {
+            "shape": decoded_state.human_shape.squeeze(0).detach().cpu(),
+            "pose": decoded_state.human_pose.squeeze(0).detach().cpu(),
+            "translation": decoded_state.human_translation.squeeze(0).detach().cpu(),
+        },
         "G_h": {"raw": decoded_state.human_gaussians.squeeze(0).detach().cpu()},
         "G_o": {"raw": decoded_state.object_gaussians.squeeze(0).detach().cpu()},
         "motion": {
@@ -693,7 +1068,7 @@ def _save_validation_combined_state(
 @torch.no_grad()
 def run_honest_3d_validation(
     *,
-    model: DualBranchCoGenerativeFlowMatching,
+    model,
     dataset: DualBranchHOIDataset,
     sequence_dir: str,
     device: torch.device,
@@ -701,6 +1076,7 @@ def run_honest_3d_validation(
     step: int,
     args: argparse.Namespace,
     wandb_enabled: bool,
+    wandb_run: Optional[object] = None,
 ) -> Dict[str, float]:
     render_module = _load_honest_render_module()
     render_args = argparse.Namespace(
@@ -776,13 +1152,30 @@ def run_honest_3d_validation(
     generator = torch.Generator(device=device)
     generator.manual_seed(int(args.seed) + int(step))
 
-    video_latents = torch.randn(
-        1,
-        model.video_codec.num_frames * model.video_codec.num_patches_per_frame,
-        args.hidden_dim,
-        generator=generator,
-        device=device,
-    ) * float(args.honest_val_prior_noise_std)
+    use_wan_teacher = model_uses_wan_teacher(model)
+    condition_latents = None
+    if use_wan_teacher:
+        condition_latents = model.encode_video_target(rgb)
+        human_video_latents = sample_video_prior_latents(
+            model,
+            batch_size=1,
+            generator=generator,
+            device=device,
+        ) * float(args.honest_val_prior_noise_std)
+        object_video_latents = sample_video_prior_latents(
+            model,
+            batch_size=1,
+            generator=generator,
+            device=device,
+        ) * float(args.honest_val_prior_noise_std)
+        video_latents = human_video_latents
+    else:
+        video_latents = sample_video_prior_latents(
+            model,
+            batch_size=1,
+            generator=generator,
+            device=device,
+        ) * float(args.honest_val_prior_noise_std)
     state_latents = torch.randn(
         1,
         model.state_codec.total_tokens,
@@ -806,16 +1199,35 @@ def run_honest_3d_validation(
         for ode_step in range(int(args.honest_val_num_ode_steps)):
             t_cur = times[ode_step].expand(1)
             dt = times[ode_step + 1] - times[ode_step]
+            forward_kwargs = {}
+            if use_wan_teacher:
+                forward_kwargs = {
+                    "condition_latents": condition_latents,
+                    "video_xt_human": human_video_latents,
+                    "video_xt_object": object_video_latents,
+                }
             output = model(
                 video_xt=video_latents,
                 state_xt=state_latents,
                 timesteps=t_cur,
                 condition_video=condition_video,
                 camera_intrinsics=camera_intrinsics,
+                sequence_names=[sequence_name],
+                object_categories=[str(sample.get("object_category", "object"))],
                 state_to_video_scale=state_to_video_scale,
                 video_to_state_scale=video_to_state_scale,
+                **forward_kwargs,
             )
-            video_latents = video_latents + dt.view(1, 1, 1) * output.video_velocity
+            if use_wan_teacher:
+                human_velocity = output.human_video_velocity if output.human_video_velocity is not None else output.video_velocity
+                object_velocity = (
+                    output.object_video_velocity if output.object_video_velocity is not None else output.video_velocity
+                )
+                human_video_latents = human_video_latents + broadcast_timesteps_like(dt.view(1), human_video_latents) * human_velocity
+                object_video_latents = object_video_latents + broadcast_timesteps_like(dt.view(1), object_video_latents) * object_velocity
+                video_latents = human_video_latents
+            else:
+                video_latents = video_latents + broadcast_timesteps_like(dt.view(1), video_latents) * output.video_velocity
             state_latents = state_latents + dt.view(1, 1, 1) * output.state_velocity
         decoded_state = model.decode_state_tokens(state_latents)
     finally:
@@ -905,7 +1317,11 @@ def run_honest_3d_validation(
         try:
             import wandb
 
-            wandb.log(
+            active_wandb_run = wandb_run if wandb_run is not None else getattr(wandb, "run", None)
+            if active_wandb_run is None:
+                raise RuntimeError("No active wandb run is available for honest 3D validation upload.")
+
+            active_wandb_run.log(
                 {
                     "honest3d/sequence_name": sequence_name,
                     "honest3d/human_canonical_pred_vs_gt_video": wandb.Video(
@@ -985,6 +1401,8 @@ def resolve_video_backbone_unfreeze_step(args: argparse.Namespace) -> int:
     if ratio < 0.0:
         if args.loss_preset == "reconstruction_first":
             ratio = args.reconstruction_warmup_ratio
+        elif args.loss_preset == "geometry_then_video":
+            ratio = args.curriculum_fusion_start_ratio
         else:
             ratio = args.curriculum_fusion_start_ratio
     if not 0.0 <= ratio <= 1.0:
@@ -993,11 +1411,9 @@ def resolve_video_backbone_unfreeze_step(args: argparse.Namespace) -> int:
 
 
 def resolve_state_to_video_scale(args: argparse.Namespace, step: int) -> float:
-    if args.loss_preset != "reconstruction_first":
-        return 1.0
-    reconstruction_end = resolve_reconstruction_warmup_step(args)
-    _, full_start = resolve_curriculum_boundaries(args)
-    return linear_ramp(step, reconstruction_end, full_start)
+    if model_uses_wan_teacher(args):
+        return 0.0
+    return 0.0 if bool(getattr(args, "freeze_video_backbone", False)) else 1.0
 
 
 def resolve_video_to_state_scale(args: argparse.Namespace, step: int) -> float:
@@ -1007,6 +1423,60 @@ def resolve_video_to_state_scale(args: argparse.Namespace, step: int) -> float:
 def set_module_requires_grad(module: nn.Module, requires_grad: bool) -> None:
     for parameter in module.parameters():
         parameter.requires_grad = requires_grad
+
+
+def set_named_modules_requires_grad(holder: nn.Module, module_names: tuple[str, ...], requires_grad: bool) -> None:
+    for name in module_names:
+        set_module_requires_grad(getattr(holder, name), requires_grad)
+
+
+def set_named_modules_train_mode(holder: nn.Module, module_names: tuple[str, ...], training: bool) -> None:
+    for name in module_names:
+        getattr(holder, name).train(training)
+
+
+VIDEO_TEACHER_ROOT_MODULE_NAMES = (
+    "video_codec",
+    "condition_encoder",
+    "video_sampler",
+    "video_norm",
+    "video_velocity_head",
+)
+VIDEO_TEACHER_BLOCK_MODULE_NAMES = (
+    "video_block",
+    "video_from_condition",
+    "video_from_geometry",
+    "video_from_state",
+)
+VIDEO_STATE_CONSUMER_BLOCK_MODULE_NAMES = (
+    "state_from_video",
+    "global_gate",
+    "dynamic_gate",
+)
+
+
+def set_video_teacher_requires_grad(model: DualBranchCoGenerativeFlowMatching, requires_grad: bool) -> None:
+    set_named_modules_requires_grad(model, VIDEO_TEACHER_ROOT_MODULE_NAMES, requires_grad)
+
+
+def set_video_teacher_train_mode(model: DualBranchCoGenerativeFlowMatching, training: bool) -> None:
+    set_named_modules_train_mode(model, VIDEO_TEACHER_ROOT_MODULE_NAMES, training)
+
+
+def set_fusion_block_video_teacher_requires_grad(block: nn.Module, requires_grad: bool) -> None:
+    set_named_modules_requires_grad(block, VIDEO_TEACHER_BLOCK_MODULE_NAMES, requires_grad)
+
+
+def set_fusion_block_video_teacher_train_mode(block: nn.Module, training: bool) -> None:
+    set_named_modules_train_mode(block, VIDEO_TEACHER_BLOCK_MODULE_NAMES, training)
+
+
+def set_fusion_block_video_state_consumer_requires_grad(block: nn.Module, requires_grad: bool) -> None:
+    set_named_modules_requires_grad(block, VIDEO_STATE_CONSUMER_BLOCK_MODULE_NAMES, requires_grad)
+
+
+def set_fusion_block_video_state_consumer_train_mode(block: nn.Module, training: bool) -> None:
+    set_named_modules_train_mode(block, VIDEO_STATE_CONSUMER_BLOCK_MODULE_NAMES, training)
 
 
 def set_fusion_block_video_requires_grad(block: nn.Module, requires_grad: bool) -> None:
@@ -1023,21 +1493,36 @@ def set_fusion_block_video_requires_grad(block: nn.Module, requires_grad: bool) 
 
 
 def apply_video_backbone_schedule(
-    model: DualBranchCoGenerativeFlowMatching,
+    model,
     args: argparse.Namespace,
     step: int,
 ) -> Dict[str, float]:
+    if model_uses_wan_teacher(model) or model_uses_wan_teacher(args):
+        return {
+            "video_optim_stage": 0.0,
+            "video_unfrozen_blocks": 0.0,
+            "video_unfreeze_progress": 0.0,
+            "video_teacher_frozen": 1.0,
+            "state_to_video_scale": 0.0,
+            "video_to_state_scale": resolve_video_to_state_scale(args, step),
+        }
+    fixed_video_teacher = bool(args.freeze_video_backbone)
     total_blocks = len(model.blocks)
     if total_blocks == 0:
         return {
             "video_optim_stage": 1.0,
             "video_unfrozen_blocks": 0.0,
             "video_unfreeze_progress": 1.0,
+            "video_teacher_frozen": 1.0 if fixed_video_teacher else 0.0,
             "state_to_video_scale": resolve_state_to_video_scale(args, step),
             "video_to_state_scale": resolve_video_to_state_scale(args, step),
         }
 
-    if not args.freeze_video_backbone:
+    if fixed_video_teacher:
+        num_unfrozen_blocks = 0
+        stage = 0.0
+        progress = 0.0
+    elif not args.freeze_video_backbone:
         num_unfrozen_blocks = total_blocks
         stage = 1.0
         progress = 1.0
@@ -1050,21 +1535,23 @@ def apply_video_backbone_schedule(
         else:
             num_unfrozen_blocks = min(max(args.video_stage2_num_top_blocks, 0), total_blocks)
             stage = 1.0
-
-    set_module_requires_grad(model.video_codec, num_unfrozen_blocks > 0)
-    set_module_requires_grad(model.condition_encoder, num_unfrozen_blocks > 0)
-    set_module_requires_grad(model.video_sampler, num_unfrozen_blocks > 0)
-    set_module_requires_grad(model.video_norm, num_unfrozen_blocks > 0)
-    set_module_requires_grad(model.video_velocity_head, num_unfrozen_blocks > 0)
+    teacher_trainable = num_unfrozen_blocks > 0
+    set_video_teacher_requires_grad(model, teacher_trainable)
+    set_video_teacher_train_mode(model, teacher_trainable)
 
     frozen_prefix = total_blocks - num_unfrozen_blocks
     for block_idx, block in enumerate(model.blocks):
-        set_fusion_block_video_requires_grad(block, block_idx >= frozen_prefix)
+        video_trainable = teacher_trainable and block_idx >= frozen_prefix
+        set_fusion_block_video_teacher_requires_grad(block, video_trainable)
+        set_fusion_block_video_teacher_train_mode(block, video_trainable)
+        set_fusion_block_video_state_consumer_requires_grad(block, True)
+        set_fusion_block_video_state_consumer_train_mode(block, True)
 
     return {
         "video_optim_stage": stage,
         "video_unfrozen_blocks": float(num_unfrozen_blocks),
         "video_unfreeze_progress": progress,
+        "video_teacher_frozen": 1.0 if fixed_video_teacher else 0.0,
         "state_to_video_scale": resolve_state_to_video_scale(args, step),
         "video_to_state_scale": resolve_video_to_state_scale(args, step),
     }
@@ -1079,7 +1566,10 @@ def linear_ramp(step: int, start: int, end: int) -> float:
 
 
 def resolve_active_loss_names(args: argparse.Namespace) -> tuple[str, ...]:
-    return LOSS_PRESETS[args.loss_preset]
+    stage_key = str(getattr(args, "training_stage", "stage1")).strip().lower()
+    if stage_key in LOSS_PRESETS:
+        return LOSS_PRESETS[stage_key]
+    return LOSS_PRESETS["stage1"]
 
 
 def build_curriculum_loss_weights(args: argparse.Namespace, step: int) -> Tuple[Dict[str, float], Dict[str, float]]:
@@ -1088,80 +1578,12 @@ def build_curriculum_loss_weights(args: argparse.Namespace, step: int) -> Tuple[
         name: float(getattr(args, f"lambda_{name}")) if name in active_loss_names else 0.0
         for name in LOSS_NAMES
     }
-
-    if args.loss_preset == "full":
-        fusion_start, full_start = resolve_curriculum_boundaries(args)
-        fusion_progress = linear_ramp(step, fusion_start, full_start)
-        full_progress = linear_ramp(step, full_start, args.max_steps)
-        multipliers = {
-            "video_fm": 1.0,
-            "state_fm": 1.0,
-            "video_latent": 1.0,
-            "state_latent": 1.0,
-            "human_visible": 1.0,
-            "human_temporal": 1.0,
-            "object_video": 1.0,
-            "joints": 1.0,
-            "object_motion": 1.0,
-            "object_render": fusion_progress,
-            "branch_coupling": fusion_progress,
-            "human_gaussian": fusion_progress,
-            "object_gaussian": fusion_progress,
-            "joint_heat": fusion_progress,
-            "object_silhouette": fusion_progress,
-            "geometry_distill": fusion_progress,
-            "contact": full_progress,
-            "object_depth": full_progress,
-        }
-    elif args.loss_preset == "reconstruction_first":
-        reconstruction_end = resolve_reconstruction_warmup_step(args)
-        _, full_start = resolve_curriculum_boundaries(args)
-        video_progress = linear_ramp(step, reconstruction_end, full_start)
-        full_progress = linear_ramp(step, full_start, args.max_steps)
-        multipliers = {
-            "video_fm": video_progress,
-            "state_fm": 1.0,
-            "video_latent": video_progress,
-            "state_latent": 1.0,
-            "human_visible": video_progress,
-            "human_temporal": video_progress,
-            "object_video": video_progress,
-            "object_render": 1.0,
-            "branch_coupling": video_progress,
-            "human_gaussian": 1.0,
-            "object_gaussian": 1.0,
-            "joints": 1.0,
-            "object_motion": 1.0,
-            "contact": 1.0,
-            "joint_heat": 1.0,
-            "object_silhouette": 1.0,
-            "object_depth": 1.0,
-            "geometry_distill": full_progress,
-        }
-    else:
-        fusion_progress = 0.0
-        full_progress = 0.0
-        multipliers = {name: 1.0 for name in LOSS_NAMES}
-
-    weights = {name: base_weights[name] * multipliers.get(name, 1.0) for name in LOSS_NAMES}
-    stage = 0.0
-    if args.loss_preset == "full":
-        if fusion_progress > 0.0:
-            stage = 1.0
-        if full_progress > 0.0:
-            stage = 2.0
-    elif args.loss_preset == "reconstruction_first":
-        reconstruction_end = resolve_reconstruction_warmup_step(args)
-        if step >= reconstruction_end:
-            stage = 1.0
-        if full_progress > 0.0:
-            stage = 2.0
+    weights = {name: base_weights[name] for name in LOSS_NAMES}
+    stage = 1.0 if str(getattr(args, "training_stage", "stage1")).lower() == "stage1" else 2.0
     metrics = {
         "curriculum_stage": stage,
-        "curriculum_fusion_progress": fusion_progress if args.loss_preset == "full" else (
-            video_progress if args.loss_preset == "reconstruction_first" else 0.0
-        ),
-        "curriculum_full_progress": full_progress,
+        "curriculum_fusion_progress": 0.0,
+        "curriculum_full_progress": 1.0 if stage >= 2.0 else 0.0,
         "loss_active_count": float(sum(weight > 0.0 for weight in weights.values())),
     }
     return weights, metrics
@@ -1169,17 +1591,17 @@ def build_curriculum_loss_weights(args: argparse.Namespace, step: int) -> Tuple[
 
 def compute_losses(
     *,
-    model: DualBranchCoGenerativeFlowMatching,
+    model,
     output,
     video_xt: Tensor,
     video_velocity_target: Tensor,
     state_xt: Tensor,
     state_velocity_target: Tensor,
     teacher_state: DecodedHOIState,
-    human_supervision_target: Tensor,
-    human_supervision_weights: Tensor,
-    object_supervision_target: Tensor,
-    object_supervision_weights: Tensor,
+    human_supervision_target: Optional[Tensor],
+    human_supervision_weights: Optional[Tensor],
+    object_supervision_target: Optional[Tensor],
+    object_supervision_weights: Optional[Tensor],
     masks_human: Tensor,
     masks_object: Tensor,
     keypoint_heatmaps: Tensor,
@@ -1190,157 +1612,111 @@ def compute_losses(
     video_target_tokens: Tensor,
     state_target_tokens: Tensor,
     weights: Dict[str, float],
+    video_teacher_is_frozen: bool = False,
 ) -> Tuple[Tensor, Dict[str, Tensor]]:
-    t_view = timesteps.float().view(timesteps.shape[0], 1, 1)
-    video_xt = video_xt.float()
+    state_t_view = broadcast_timesteps_like(timesteps, state_xt)
     state_xt = state_xt.float()
-    video_velocity_target = video_velocity_target.float()
     state_velocity_target = state_velocity_target.float()
-    video_target_tokens = video_target_tokens.float()
-    state_target_tokens = state_target_tokens.float()
-    human_supervision_target = human_supervision_target.float()
-    human_supervision_weights = human_supervision_weights.float()
-    object_supervision_target = object_supervision_target.float()
-    object_supervision_weights = object_supervision_weights.float()
     masks_human = masks_human.float()
     masks_object = masks_object.float()
     keypoint_heatmaps = keypoint_heatmaps.float()
     depth = depth.float()
     camera_intrinsics_render = camera_intrinsics_render.float()
 
-    video_velocity = output.video_velocity.float()
     state_velocity = output.state_velocity.float()
-
-    video_x1_hat = video_xt + (1.0 - t_view) * video_velocity
-    state_x1_hat = state_xt + (1.0 - t_view) * state_velocity
-    decoded_video = model.decode_video_tokens(video_x1_hat)
+    state_x1_hat = state_xt + (1.0 - state_t_view) * state_velocity
     decoded_state = model.decode_state_tokens(state_x1_hat)
+    zero = state_xt.new_zeros(())
+    pred_geometry = model.project_geometry(decoded_state, camera_intrinsics_render)
+    teacher_geometry = model.project_geometry(teacher_state, camera_intrinsics_render)
+    token_hw = pred_geometry["geometry_maps"].shape[-2:]
+    target_keypoint_maps = downsample_spatial_map(keypoint_heatmaps, size=token_hw)
+    target_depth = downsample_spatial_map(depth, size=token_hw)
+    target_object_mask = downsample_spatial_map(masks_object, size=token_hw).clamp(min=0.0, max=1.0)
+    target_joint_mask = density_to_occupancy(target_keypoint_maps)
+    teacher_object_mask = teacher_geometry["geometry_maps"][:, :, 2:3].clamp(min=0.0, max=1.0)
+    pred_joint_mask = density_to_occupancy(pred_geometry["geometry_maps"][:, :, 0:1])
 
-    pred_human_video = decoded_video[:, :, :3].float()
-    pred_object_video = decoded_video[:, :, 3:6].float()
-    zero = video_xt.new_zeros(())
-    human_focus_weights = human_supervision_weights.clamp(min=0.0)
-    object_focus_weights = object_supervision_weights.clamp(min=0.0)
+    object_world_points = transform_object_points(decoded_state.object_gaussians, decoded_state.object_transforms)
 
-    render_active = weights["object_render"] > 0.0 or weights["branch_coupling"] > 0.0
-    if render_active:
-        pred_object_render = render_object_branch(
-            renderer,
-            decoded_state.object_gaussians,
-            decoded_state.object_transforms,
-            camera_intrinsics_render,
-        ).float()
-    else:
-        pred_object_render = None
-
-    geometry_active = any(
-        weights[name] > 0.0
-        for name in ("joint_heat", "object_silhouette", "object_depth", "geometry_distill")
+    loss_fm = F.mse_loss(state_velocity, state_velocity_target)
+    loss_video_fm = F.mse_loss(output.video_velocity.float(), video_velocity_target.float())
+    loss_geo_joint_heat = F.l1_loss(
+        pred_joint_mask,
+        target_joint_mask,
     )
-    if geometry_active:
-        teacher_geometry = model.project_geometry(teacher_state, camera_intrinsics_render)
-        pred_geometry = model.project_geometry(decoded_state, camera_intrinsics_render)
-        token_hw = teacher_geometry["geometry_maps"].shape[-2:]
-        target_keypoint_maps = downsample_spatial_map(keypoint_heatmaps, size=token_hw)
-        target_depth = downsample_spatial_map(depth, size=token_hw)
-        target_object_mask = downsample_spatial_map(masks_object, size=token_hw)
-    else:
-        teacher_geometry = None
-        pred_geometry = None
-        target_keypoint_maps = None
-        target_depth = None
-        target_object_mask = None
-
-    loss_video_fm = F.mse_loss(video_velocity, video_velocity_target)
-    loss_state_fm = F.mse_loss(state_velocity, state_velocity_target)
-    loss_video_latent_recon = F.smooth_l1_loss(video_x1_hat, video_target_tokens)
-    loss_state_latent_recon = F.smooth_l1_loss(state_x1_hat, state_target_tokens)
-    loss_human_visible = compute_weighted_l1(pred_human_video, human_supervision_target, human_focus_weights)
-    loss_human_temporal = compute_weighted_temporal_l1(pred_human_video, human_supervision_target, human_focus_weights)
-    loss_object_video = compute_weighted_l1(pred_object_video, object_supervision_target, object_focus_weights)
-    loss_object_render = (
-        compute_weighted_l1(pred_object_render, object_supervision_target, object_focus_weights)
-        if pred_object_render is not None
-        else zero
+    loss_geo_object_silhouette = F.l1_loss(
+        pred_geometry["geometry_maps"][:, :, 2:3],
+        target_object_mask,
     )
-    loss_branch_coupling = (
-        compute_weighted_l1(pred_object_video, pred_object_render.detach(), object_focus_weights)
-        if pred_object_render is not None
-        else zero
-    )
-
-    loss_human_gaussian_attr = compute_gaussian_attr_nn_loss(
-        decoded_state.human_gaussians,
-        teacher_state.human_gaussians,
+    loss_geo_depth = compute_masked_l1(
+        pred_geometry["geometry_maps"][:, :, 3:4],
+        teacher_geometry["geometry_maps"][:, :, 3:4],
+        teacher_object_mask,
     )
     loss_human_gaussian = compute_point_set_chamfer(
         decoded_state.human_gaussians[..., :3],
-        teacher_state.human_gaussians[..., :3],
-    ) + 0.25 * loss_human_gaussian_attr
-    loss_object_gaussian_attr = compute_gaussian_attr_nn_loss(
-        decoded_state.object_gaussians,
-        teacher_state.object_gaussians,
+        teacher_state.human_gaussians.float()[..., :3],
+    ) + 0.1 * compute_gaussian_attr_nn_loss(
+        decoded_state.human_gaussians,
+        teacher_state.human_gaussians.float(),
     )
     loss_object_gaussian = compute_point_set_chamfer(
         decoded_state.object_gaussians[..., :3],
-        teacher_state.object_gaussians[..., :3],
-    ) + 0.25 * loss_object_gaussian_attr
-    loss_joints = F.smooth_l1_loss(decoded_state.joints_3d, teacher_state.joints_3d)
-    loss_object_motion_translation = F.smooth_l1_loss(
+        teacher_state.object_gaussians.float()[..., :3],
+    ) + 0.1 * compute_gaussian_attr_nn_loss(
+        decoded_state.object_gaussians,
+        teacher_state.object_gaussians.float(),
+    )
+    loss_joints = F.smooth_l1_loss(decoded_state.joints_3d, teacher_state.joints_3d.float())
+    loss_reg_pose = F.mse_loss(decoded_state.human_pose, teacher_state.human_pose.float())
+    loss_reg_shape = F.mse_loss(decoded_state.human_shape, teacher_state.human_shape.float())
+    loss_reg_translation = F.mse_loss(decoded_state.human_translation, teacher_state.human_translation.float())
+    loss_reg_object_pose_translation = F.smooth_l1_loss(
         decoded_state.object_transforms[..., :3, 3],
-        teacher_state.object_transforms[..., :3, 3],
+        teacher_state.object_transforms[..., :3, 3].float(),
     )
-    loss_object_motion_rotation = rotation_geodesic_loss(
+    loss_reg_object_pose_rotation = rotation_geodesic_loss(
         decoded_state.object_transforms[..., :3, :3],
-        teacher_state.object_transforms[..., :3, :3],
+        teacher_state.object_transforms[..., :3, :3].float(),
     )
-    loss_object_motion = loss_object_motion_translation + loss_object_motion_rotation
-    loss_contact = F.smooth_l1_loss(decoded_state.contact_signature, teacher_state.contact_signature)
-
-    loss_joint_heat = (
-        F.l1_loss(pred_geometry["geometry_maps"][:, :, 0:1], target_keypoint_maps)
-        if pred_geometry is not None
-        else zero
+    loss_reg_object_pose = loss_reg_object_pose_translation + loss_reg_object_pose_rotation
+    loss_reg_contact = F.smooth_l1_loss(decoded_state.contact_signature, teacher_state.contact_signature.float())
+    loss_depth = 0.5 * (
+        compute_masked_l1(pred_geometry["geometry_maps"][:, :, 1:2], target_depth, target_joint_mask)
+        + compute_masked_l1(pred_geometry["geometry_maps"][:, :, 3:4], target_depth, target_object_mask)
     )
-    loss_object_silhouette = (
-        F.l1_loss(pred_geometry["geometry_maps"][:, :, 2:3], target_object_mask)
-        if pred_geometry is not None
-        else zero
+    loss_temp_object = compute_second_order_smoothness(object_world_points)
+    loss_temp_contact = compute_contact_relative_velocity_loss(
+        decoded_state.joints_3d,
+        object_world_points,
+        decoded_state.contact_signature,
     )
-    loss_object_depth = (
-        compute_masked_l1(
-            pred_geometry["geometry_maps"][:, :, 3:4],
-            target_depth,
-            target_object_mask.clamp(min=0.0, max=1.0),
-        )
-        if pred_geometry is not None
-        else zero
+    loss_phys_contact = compute_contact_distance_loss(
+        decoded_state.joints_3d,
+        object_world_points,
+        teacher_state.contact_signature.float(),
     )
-    loss_geometry_distill = (
-        F.l1_loss(pred_geometry["geometry_maps"], teacher_geometry["geometry_maps"])
-        if pred_geometry is not None and teacher_geometry is not None
-        else zero
-    )
+    loss_phys_penetration = compute_penetration_loss(decoded_state.joints_3d, object_world_points)
 
     losses = {
-        "video_fm": loss_video_fm,
-        "state_fm": loss_state_fm,
-        "video_latent": loss_video_latent_recon,
-        "state_latent": loss_state_latent_recon,
-        "human_visible": loss_human_visible,
-        "human_temporal": loss_human_temporal,
-        "object_video": loss_object_video,
-        "object_render": loss_object_render,
-        "branch_coupling": loss_branch_coupling,
+        "fm": loss_fm,
+        "geo_joint_heat": loss_geo_joint_heat,
+        "geo_object_silhouette": loss_geo_object_silhouette,
+        "geo_depth": loss_geo_depth,
         "human_gaussian": loss_human_gaussian,
         "object_gaussian": loss_object_gaussian,
         "joints": loss_joints,
-        "object_motion": loss_object_motion,
-        "contact": loss_contact,
-        "joint_heat": loss_joint_heat,
-        "object_silhouette": loss_object_silhouette,
-        "object_depth": loss_object_depth,
-        "geometry_distill": loss_geometry_distill,
+        "reg_pose": loss_reg_pose,
+        "reg_shape": loss_reg_shape,
+        "reg_translation": loss_reg_translation,
+        "reg_object_pose": loss_reg_object_pose,
+        "reg_contact": loss_reg_contact,
+        "depth": loss_depth,
+        "temp_object": loss_temp_object,
+        "temp_contact": loss_temp_contact,
+        "phys_contact": loss_phys_contact,
+        "phys_penetration": loss_phys_penetration,
     }
     total_loss = zero
     for name, loss_value in losses.items():
@@ -1348,17 +1724,27 @@ def compute_losses(
 
     metrics = {"loss_total": total_loss.detach()}
     metrics.update({f"loss_{name}": loss_value.detach() for name, loss_value in losses.items()})
-    metrics["loss_human_gaussian_attr"] = loss_human_gaussian_attr.detach()
-    metrics["loss_object_gaussian_attr"] = loss_object_gaussian_attr.detach()
-    metrics["loss_object_motion_translation"] = loss_object_motion_translation.detach()
-    metrics["loss_object_motion_rotation"] = loss_object_motion_rotation.detach()
+    metrics["loss_geo_aux"] = (loss_geo_joint_heat + loss_geo_object_silhouette + loss_geo_depth).detach()
+    metrics["loss_reg"] = (
+        loss_reg_pose + loss_reg_shape + loss_reg_translation + loss_reg_object_pose + loss_reg_contact
+    ).detach()
+    metrics["loss_temp"] = (loss_temp_object + loss_temp_contact).detach()
+    metrics["loss_phys"] = (loss_phys_contact + loss_phys_penetration).detach()
+    metrics["loss_reg_object_pose_translation"] = loss_reg_object_pose_translation.detach()
+    metrics["loss_reg_object_pose_rotation"] = loss_reg_object_pose_rotation.detach()
+    metrics["loss_video_fm"] = loss_video_fm.detach()
+    metrics["loss_state_fm"] = loss_fm.detach()
+    metrics["loss_object_render"] = loss_geo_object_silhouette.detach()
+    metrics["loss_joint_heat"] = loss_geo_joint_heat.detach()
+    metrics["loss_joints_3d"] = loss_joints.detach()
+    metrics["loss_joints"] = loss_joints.detach()
     return total_loss, metrics
 
 
 def save_checkpoint(
     *,
     accelerator: Accelerator,
-    model: DualBranchCoGenerativeFlowMatching,
+    model,
     optimizer: AdamW,
     scheduler: LambdaLR,
     step: int,
@@ -1368,9 +1754,10 @@ def save_checkpoint(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     path = checkpoint_dir / f"checkpoint_{step:07d}.pt"
     raw_scheduler = _unwrap_scheduler(scheduler)
+    model_state = filter_video_teacher_state_dict(accelerator.unwrap_model(model).state_dict())
     accelerator.save(
         {
-            "model": accelerator.unwrap_model(model).state_dict(),
+            "model": model_state,
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "step": int(step),
@@ -1388,14 +1775,15 @@ def save_checkpoint(
 def resume_if_available(
     *,
     args: argparse.Namespace,
-    model: DualBranchCoGenerativeFlowMatching,
+    model,
     optimizer: AdamW,
     scheduler: LambdaLR,
 ) -> int:
     if not args.resume_checkpoint:
         return 0
     checkpoint = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False)
-    incompatible = model.load_state_dict(checkpoint["model"], strict=False)
+    model_state = filter_video_teacher_state_dict(checkpoint["model"])
+    incompatible = model.load_state_dict(model_state, strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         raise RuntimeError(
             "Checkpoint/model mismatch detected while resuming. "
@@ -1426,6 +1814,28 @@ def resume_if_available(
     return resume_step
 
 
+def load_init_checkpoint_if_available(
+    *,
+    args: argparse.Namespace,
+    model,
+) -> int:
+    init_checkpoint = str(getattr(args, "init_checkpoint", "")).strip()
+    if not init_checkpoint:
+        return 0
+    checkpoint = torch.load(init_checkpoint, map_location="cpu", weights_only=False)
+    model_state = filter_video_teacher_state_dict(checkpoint["model"])
+    incompatible = model.load_state_dict(model_state, strict=bool(getattr(args, "init_checkpoint_strict", False)))
+    if bool(getattr(args, "init_checkpoint_strict", False)) and (
+        incompatible.missing_keys or incompatible.unexpected_keys
+    ):
+        raise RuntimeError(
+            "Strict init checkpoint load failed. "
+            f"Missing keys: {incompatible.missing_keys[:10]} "
+            f"| Unexpected keys: {incompatible.unexpected_keys[:10]}"
+        )
+    return int(checkpoint.get("step", 0))
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train dual-branch co-generative Flow Matching for 4D HOI.")
     parser.add_argument("--data_root", type=str, default="sample_data/behave_1pct/sequences")
@@ -1447,6 +1857,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--resume_checkpoint", type=str, default="")
     parser.add_argument("--resume_model_only", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--init_checkpoint", type=str, default="")
+    parser.add_argument("--init_checkpoint_strict", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--training_stage", type=str, default="stage1", choices=("stage1", "stage2"))
 
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=10000)
@@ -1459,54 +1872,94 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--warmup_steps", type=int, default=500)
 
-    parser.add_argument("--clip_length", type=int, default=8)
+    parser.add_argument("--clip_length", type=int, default=20)
     parser.add_argument("--clip_stride", type=int, default=4)
     parser.add_argument("--max_sequences", type=int, default=0)
     parser.add_argument("--dataset_cache_sequences", type=int, default=2)
     parser.add_argument("--cache_rgb", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rgb_cache_max_frames", type=int, default=256)
     parser.add_argument("--index_progress_every", type=int, default=10)
+    parser.add_argument("--dataloader_num_workers", type=int, default=0)
+    parser.add_argument("--dataloader_pin_memory", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dataloader_persistent_workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dataloader_prefetch_factor", type=int, default=2)
+    parser.add_argument(
+        "--batch_sampler_mode",
+        type=str,
+        default="global_clip_shuffle",
+        choices=("global_clip_shuffle", "sequence_grouped"),
+    )
+    parser.add_argument("--sequence_batch_interleave_window", type=int, default=0)
+    parser.add_argument("--sequence_batch_burst", type=int, default=1)
     parser.add_argument("--background_value", type=float, default=1.0)
 
     parser.add_argument("--image_height", type=int, default=256)
     parser.add_argument("--image_width", type=int, default=256)
     parser.add_argument("--patch_size", type=int, default=16)
+    parser.add_argument("--condition_patch_size", type=int, default=64)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--depth", type=int, default=8)
     parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--mlp_ratio", type=float, default=4.0)
     parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--video_channels", type=int, default=6)
+    parser.add_argument("--video_backend", type=str, default="wan_ti2v_5b", choices=("wan_ti2v_5b", "legacy_codec"))
+    parser.add_argument("--video_channels", type=int, default=3)
+    parser.add_argument("--wan_model_id", type=str, default="Wan-AI/Wan2.2-TI2V-5B-Diffusers")
+    parser.add_argument("--wan_dtype", type=str, default="bf16", choices=("bf16", "fp16", "fp32"))
+    parser.add_argument("--wan_hidden_dim", type=int, default=3072)
+    parser.add_argument("--wan_prompt_max_sequence_length", type=int, default=512)
+    parser.add_argument("--wan_prompt_override", type=str, default="")
+    parser.add_argument("--wan_local_files_only", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--wan_pad_to_compatible_frames", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num_human_gaussians", type=int, default=1024)
     parser.add_argument("--num_object_gaussians", type=int, default=1024)
     parser.add_argument("--num_joints", type=int, default=22)
     parser.add_argument("--contact_dim", type=int, default=4)
+    parser.add_argument("--human_shape_dim", type=int, default=10)
+    parser.add_argument("--human_pose_dim", type=int, default=72)
 
     parser.add_argument(
         "--loss_preset",
         type=str,
-        default="core",
-        choices=tuple(LOSS_PRESETS.keys()),
-        help="`core` keeps only the main optimization targets, `stage0` enables the original base losses, `full` enables the full curriculum.",
+        default="stage1",
+        choices=tuple(LOSS_PRESETS.keys()) + ("geometry_then_video", "reconstruction_first", "core"),
+        help=(
+            "Legacy compatibility flag. Uni-HOI training now follows `--training_stage stage1|stage2`; "
+            "`--loss_preset` is ignored unless older tooling still populates it."
+        ),
     )
-    parser.add_argument("--lambda_video_fm", type=float, default=1.0)
+    parser.add_argument("--lambda_fm", type=float, default=1.0)
+    parser.add_argument("--lambda_geo_joint_heat", type=float, default=1.0)
+    parser.add_argument("--lambda_geo_object_silhouette", type=float, default=0.5)
+    parser.add_argument("--lambda_geo_depth", type=float, default=1.0)
+    parser.add_argument("--lambda_reg_pose", type=float, default=1.0)
+    parser.add_argument("--lambda_reg_shape", type=float, default=0.25)
+    parser.add_argument("--lambda_reg_translation", type=float, default=1.0)
+    parser.add_argument("--lambda_reg_object_pose", type=float, default=1.0)
+    parser.add_argument("--lambda_reg_contact", type=float, default=0.25)
+    parser.add_argument("--lambda_depth", type=float, default=1.0)
+    parser.add_argument("--lambda_temp_object", type=float, default=0.1)
+    parser.add_argument("--lambda_temp_contact", type=float, default=0.1)
+    parser.add_argument("--lambda_phys_contact", type=float, default=0.05)
+    parser.add_argument("--lambda_phys_penetration", type=float, default=0.05)
+    parser.add_argument("--lambda_video_fm", type=float, default=0.0)
     parser.add_argument("--lambda_state_fm", type=float, default=1.0)
-    parser.add_argument("--lambda_video_latent", type=float, default=0.1)
-    parser.add_argument("--lambda_state_latent", type=float, default=0.1)
-    parser.add_argument("--lambda_human_visible", type=float, default=1.0)
-    parser.add_argument("--lambda_human_temporal", type=float, default=0.25)
-    parser.add_argument("--lambda_object_video", type=float, default=1.0)
+    parser.add_argument("--lambda_video_latent", type=float, default=0.0)
+    parser.add_argument("--lambda_state_latent", type=float, default=0.0)
+    parser.add_argument("--lambda_human_visible", type=float, default=0.0)
+    parser.add_argument("--lambda_human_temporal", type=float, default=0.0)
+    parser.add_argument("--lambda_object_video", type=float, default=0.0)
     parser.add_argument("--lambda_object_render", type=float, default=1.0)
     parser.add_argument("--lambda_branch_coupling", type=float, default=0.25)
     parser.add_argument("--lambda_human_gaussian", type=float, default=1.0)
     parser.add_argument("--lambda_object_gaussian", type=float, default=1.0)
     parser.add_argument("--lambda_joints", type=float, default=1.0)
     parser.add_argument("--lambda_object_motion", type=float, default=0.5)
-    parser.add_argument("--lambda_contact", type=float, default=0.25)
-    parser.add_argument("--lambda_joint_heat", type=float, default=0.5)
+    parser.add_argument("--lambda_contact", type=float, default=0.0)
+    parser.add_argument("--lambda_joint_heat", type=float, default=0.0)
     parser.add_argument("--lambda_object_silhouette", type=float, default=0.5)
-    parser.add_argument("--lambda_object_depth", type=float, default=0.25)
-    parser.add_argument("--lambda_geometry_distill", type=float, default=0.05)
+    parser.add_argument("--lambda_object_depth", type=float, default=0.0)
+    parser.add_argument("--lambda_geometry_distill", type=float, default=0.0)
     parser.add_argument("--human_visible_region_weight", type=float, default=1.0)
     parser.add_argument("--human_completion_region_weight", type=float, default=1.5)
     parser.add_argument("--num_human_video_points", type=int, default=1024)
@@ -1514,10 +1967,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object_visible_region_weight", type=float, default=1.0)
     parser.add_argument("--object_primary_region_weight", type=float, default=0.3)
     parser.add_argument("--object_secondary_region_weight", type=float, default=0.05)
-    parser.add_argument("--reconstruction_warmup_ratio", type=float, default=0.15)
-    parser.add_argument("--curriculum_fusion_start_ratio", type=float, default=0.2)
-    parser.add_argument("--curriculum_full_start_ratio", type=float, default=0.6)
-    parser.add_argument("--freeze_video_backbone", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--reconstruction_warmup_ratio", type=float, default=0.35)
+    parser.add_argument("--curriculum_fusion_start_ratio", type=float, default=0.6)
+    parser.add_argument("--curriculum_full_start_ratio", type=float, default=0.8)
+    parser.add_argument("--freeze_video_backbone", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--video_unfreeze_start_ratio", type=float, default=-1.0)
     parser.add_argument("--video_stage2_num_top_blocks", type=int, default=2)
     parser.add_argument("--honest_val_every", type=int, default=5000)
@@ -1558,10 +2011,31 @@ def main() -> None:
         raise ValueError(
             f"Image size {(args.image_height, args.image_width)} must be divisible by patch_size={args.patch_size}."
         )
+    if args.image_height % args.condition_patch_size != 0 or args.image_width % args.condition_patch_size != 0:
+        raise ValueError(
+            "Image size must be divisible by condition_patch_size. "
+            f"Got image={(args.image_height, args.image_width)} and condition_patch_size={args.condition_patch_size}."
+        )
     if args.video_stage2_num_top_blocks < 0:
         raise ValueError(f"`video_stage2_num_top_blocks` must be >= 0, got {args.video_stage2_num_top_blocks}.")
     if args.batch_size <= 0:
         raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}.")
+    if args.dataloader_num_workers < 0:
+        raise ValueError(
+            f"`dataloader_num_workers` must be >= 0, got {args.dataloader_num_workers}."
+        )
+    if args.dataloader_prefetch_factor <= 0:
+        raise ValueError(
+            f"`dataloader_prefetch_factor` must be > 0, got {args.dataloader_prefetch_factor}."
+        )
+    args.batch_sampler_mode = normalize_batch_sampler_mode(args.batch_sampler_mode)
+    if args.sequence_batch_interleave_window < 0:
+        raise ValueError(
+            "`sequence_batch_interleave_window` must be >= 0 so 0 can mean auto. "
+            f"Got {args.sequence_batch_interleave_window}."
+        )
+    if args.sequence_batch_burst <= 0:
+        raise ValueError(f"`sequence_batch_burst` must be > 0, got {args.sequence_batch_burst}.")
     if args.clip_length <= 0:
         raise ValueError(f"`clip_length` must be > 0, got {args.clip_length}.")
     if args.max_steps <= 0:
@@ -1572,6 +2046,28 @@ def main() -> None:
         raise ValueError(f"`honest_val_every` must be >= 0, got {args.honest_val_every}.")
     if args.honest_val_num_ode_steps <= 0:
         raise ValueError(f"`honest_val_num_ode_steps` must be > 0, got {args.honest_val_num_ode_steps}.")
+    if model_uses_wan_teacher(args):
+        if not args.freeze_video_backbone:
+            raise ValueError("`--video_backend wan_ti2v_5b` requires `--freeze_video_backbone`.")
+        resolve_wan_teacher_num_frames(
+            clip_length=args.clip_length,
+            pad_to_compatible_frames=bool(args.wan_pad_to_compatible_frames),
+        )
+        useless_teacher_only_losses = (
+            "video_fm",
+            "video_latent",
+            "human_visible",
+            "human_temporal",
+            "object_video",
+        )
+        enabled_teacher_only_losses = [
+            name for name in useless_teacher_only_losses if float(getattr(args, f"lambda_{name}")) > 0.0
+        ]
+        if enabled_teacher_only_losses:
+            raise ValueError(
+                "Frozen Wan teacher mode does not backpropagate through teacher-only video losses. "
+                f"Disable these lambdas instead: {', '.join(enabled_teacher_only_losses)}."
+            )
     resolve_video_backbone_unfreeze_step(args)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     configure_torch_runtime()
@@ -1594,6 +2090,7 @@ def main() -> None:
         kwargs_handlers=[DistributedDataParallelKwargs(static_graph=True)],
     )
     wandb_enabled = log_with == "wandb"
+    wandb_run = None
     set_seed(args.seed, device_specific=True)
     report_attention_runtime(args, accelerator)
     if accelerator.is_main_process and log_with is not None:
@@ -1625,6 +2122,15 @@ def main() -> None:
                 wandb_enabled = False
             else:
                 raise
+    if accelerator.is_main_process and wandb_enabled:
+        try:
+            wandb_run = accelerator.get_tracker("wandb", unwrap=True)
+        except Exception as exc:
+            print(
+                "[train_dual_branch_fm] warning: failed to access active wandb run "
+                f"| error={exc}",
+                flush=True,
+            )
     if accelerator.is_main_process:
         print(
             f"[train_dual_branch_fm] accelerator ready "
@@ -1658,6 +2164,7 @@ def main() -> None:
             flush=True,
         )
 
+    require_human_vertices = args.lambda_human_visible > 0.0 or args.lambda_human_temporal > 0.0
     dataset = DualBranchHOIDataset(
         data_root=args.data_root,
         clip_length=args.clip_length,
@@ -1678,6 +2185,9 @@ def main() -> None:
         index_progress_callback=report_dataset_index_progress if accelerator.is_main_process else None,
         split_file=args.split_file,
         split_key=args.split_key,
+        prefer_h5_cache=True,
+        include_human_vertices=require_human_vertices,
+        include_keypoint_heatmaps=False,
     )
     if accelerator.is_main_process:
         print(
@@ -1708,8 +2218,8 @@ def main() -> None:
     if accelerator.is_main_process:
         print(f"[train_dual_branch_fm] condition channels ready | channels={condition_channels}", flush=True)
         print(
-            "[train_dual_branch_fm] loss preset ready "
-            f"| preset={args.loss_preset} "
+            "[train_dual_branch_fm] Uni-HOI stage ready "
+            f"| training_stage={args.training_stage} "
             f"| active={','.join(resolve_active_loss_names(args))}",
             flush=True,
         )
@@ -1721,61 +2231,99 @@ def main() -> None:
                 f"| ode_steps={args.honest_val_num_ode_steps}",
                 flush=True,
             )
-
-    model = DualBranchCoGenerativeFlowMatching(
-        hidden_dim=args.hidden_dim,
-        num_heads=args.num_heads,
-        depth=args.depth,
-        mlp_ratio=args.mlp_ratio,
-        dropout=args.dropout,
-        condition_channels=condition_channels,
-        video_channels=args.video_channels,
-        patch_size=args.patch_size,
-        num_frames=args.clip_length,
-        image_height=args.image_height,
-        image_width=args.image_width,
-        num_human_gaussians=args.num_human_gaussians,
-        num_object_gaussians=args.num_object_gaussians,
-        num_joints=args.num_joints,
-        contact_dim=args.contact_dim,
-    )
+    model = build_model_from_args(args, condition_channels=condition_channels)
+    init_checkpoint_step = load_init_checkpoint_if_available(args=args, model=model)
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = build_scheduler(optimizer, warmup_steps=args.warmup_steps, total_steps=args.max_steps)
     global_step = resume_if_available(args=args, model=model, optimizer=optimizer, scheduler=scheduler)
     video_schedule_metrics = apply_video_backbone_schedule(model, args, global_step)
     trainable_parameters = collect_trainable_parameters(model)
-
-    train_iterator = SequencePrefetchBatchIterator(
-        dataset,
-        batch_size=args.batch_size,
-        drop_last=True,
-        seed=args.seed,
-        process_index=accelerator.process_index,
-        num_processes=accelerator.num_processes,
-    )
-    num_batches = len(train_iterator)
-    if num_batches == 0:
+    resolved_sequence_batch_interleave_window = 1
+    train_batch_sampler = None
+    global_num_batches = len(dataset) // args.batch_size
+    if global_num_batches == 0:
         raise ValueError(
-            "Sequence iterator has zero local batches. "
-            f"clips={len(dataset)}, batch_size={args.batch_size}, drop_last=True, "
-            f"process_index={accelerator.process_index}, world_size={accelerator.num_processes}. "
+            "Training dataloader would produce zero global batches. "
+            f"clips={len(dataset)}, batch_size={args.batch_size}, drop_last=True. "
             "Lower the batch size or provide more training clips."
         )
-    if accelerator.is_main_process:
-        if accelerator.num_processes == 1:
-            iterator_mode = "sequence-prefetch"
-        else:
-            iterator_mode = "sequence-shard"
-        print(
-            f"[train_dual_branch_fm] {iterator_mode} iterator ready "
-            f"| batch_size_per_device={args.batch_size} "
-            f"| cache_sequences={args.dataset_cache_sequences} "
-            f"| rgb_cache_max_frames={args.rgb_cache_max_frames} "
-            f"| world_size={accelerator.num_processes}"
-            ,
-            flush=True,
+    dataloader_kwargs = {
+        "num_workers": int(args.dataloader_num_workers),
+        "pin_memory": bool(args.dataloader_pin_memory and not args.cpu),
+    }
+    if args.dataloader_num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = bool(args.dataloader_persistent_workers)
+        dataloader_kwargs["prefetch_factor"] = int(args.dataloader_prefetch_factor)
+    if args.batch_sampler_mode == "sequence_grouped":
+        resolved_sequence_batch_interleave_window = resolve_sequence_batch_interleave_window(
+            args.sequence_batch_interleave_window,
+            world_size=accelerator.num_processes,
+            cache_sequences=args.dataset_cache_sequences,
         )
+        train_batch_sampler = SequenceBatchSampler(
+            dataset,
+            batch_size=args.batch_size,
+            drop_last=True,
+            seed=args.seed,
+            shuffle=True,
+            interleave_window=resolved_sequence_batch_interleave_window,
+            max_batches_per_sequence=args.sequence_batch_burst,
+        )
+        global_num_batches = len(train_batch_sampler)
+        dataloader_kwargs["batch_sampler"] = train_batch_sampler
+    else:
+        dataloader_kwargs["batch_size"] = int(args.batch_size)
+        dataloader_kwargs["shuffle"] = True
+        dataloader_kwargs["drop_last"] = True
+    train_dataloader = DataLoader(dataset, **dataloader_kwargs)
+    if accelerator.is_main_process:
+        if init_checkpoint_step > 0:
+            print(
+                "[train_dual_branch_fm] initialized model weights "
+                f"| init_checkpoint={args.init_checkpoint} "
+                f"| checkpoint_step={init_checkpoint_step:07d} "
+                f"| strict={int(bool(args.init_checkpoint_strict))}",
+                flush=True,
+            )
+        if model_uses_wan_teacher(args):
+            teacher_num_frames = resolve_wan_teacher_num_frames(
+                clip_length=args.clip_length,
+                pad_to_compatible_frames=bool(args.wan_pad_to_compatible_frames),
+            )
+            print(
+                "[train_dual_branch_fm] Wan teacher frame setup "
+                f"| clip_length={args.clip_length} "
+                f"| teacher_frames={teacher_num_frames} "
+                f"| pad_enabled={int(bool(args.wan_pad_to_compatible_frames))}",
+                flush=True,
+            )
+        if args.batch_sampler_mode == "sequence_grouped":
+            print(
+                "[train_dual_branch_fm] sequence batch sampler ready "
+                f"| global_batches={global_num_batches} "
+                f"| batch_size_per_device={args.batch_size} "
+                f"| cache_sequences={args.dataset_cache_sequences} "
+                f"| rgb_cache_max_frames={args.rgb_cache_max_frames} "
+                f"| interleave_window={resolved_sequence_batch_interleave_window} "
+                f"| sequence_batch_burst={args.sequence_batch_burst} "
+                f"| num_workers={args.dataloader_num_workers} "
+                f"| pin_memory={int(bool(args.dataloader_pin_memory and not args.cpu))} "
+                f"| world_size={accelerator.num_processes}",
+                flush=True,
+            )
+        else:
+            print(
+                "[train_dual_branch_fm] global clip shuffle dataloader ready "
+                f"| global_batches={global_num_batches} "
+                f"| batch_size_per_device={args.batch_size} "
+                f"| cache_sequences={args.dataset_cache_sequences} "
+                f"| rgb_cache_max_frames={args.rgb_cache_max_frames} "
+                f"| num_workers={args.dataloader_num_workers} "
+                f"| pin_memory={int(bool(args.dataloader_pin_memory and not args.cpu))} "
+                f"| world_size={accelerator.num_processes}",
+                flush=True,
+            )
 
     renderer = DiffRasterizationLayer(
         image_height=args.image_height,
@@ -1785,24 +2333,81 @@ def main() -> None:
     if accelerator.is_main_process:
         print("[train_dual_branch_fm] renderer ready, preparing accelerator-wrapped modules...", flush=True)
 
-    model, optimizer, scheduler = accelerator.prepare(
+    model, optimizer, train_dataloader, scheduler = accelerator.prepare(
         model,
         optimizer,
+        train_dataloader,
         scheduler,
     )
+    num_batches = len(train_dataloader)
+    if num_batches == 0:
+        raise ValueError(
+            "Prepared train dataloader has zero local batches. "
+            f"global_batches={global_num_batches}, batch_size={args.batch_size}, "
+            f"process_index={accelerator.process_index}, world_size={accelerator.num_processes}. "
+            "Lower the batch size or provide more training clips."
+        )
+    raw_model = accelerator.unwrap_model(model)
+    ensure_video_teacher_ready(raw_model, accelerator.device)
     if accelerator.is_main_process:
         print("[train_dual_branch_fm] accelerator.prepare complete, entering training setup...", flush=True)
+        print(
+            f"[train_dual_branch_fm] prepared dataloader ready "
+            f"| local_batches_per_rank={num_batches} "
+            f"| global_batches={global_num_batches}",
+            flush=True,
+        )
+        if model_uses_wan_teacher(raw_model):
+            print(
+                f"[train_dual_branch_fm] frozen Wan teacher ready "
+                f"| requested={args.wan_model_id} "
+                f"| resolved={raw_model.resolved_wan_model_id}",
+                flush=True,
+            )
     all_parameters = tuple(model.parameters())
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
     start_time = time.time()
+    slow_step_threshold = 0.0
+    slow_step_threshold_raw = os.getenv("HDM_SLOW_STEP_LOG_THRESHOLD", "").strip()
+    if slow_step_threshold_raw:
+        try:
+            slow_step_threshold = max(float(slow_step_threshold_raw), 0.0)
+        except ValueError:
+            if accelerator.is_main_process:
+                print(
+                    "[train_dual_branch_fm] warning: invalid HDM_SLOW_STEP_LOG_THRESHOLD "
+                    f"| value={slow_step_threshold_raw!r}",
+                    flush=True,
+                )
+    rank_status_enabled = os.getenv("HDM_WRITE_RANK_STATUS", "1").strip().lower() not in {"0", "false", "no"}
+    rank_status_path = (
+        Path(args.output_dir) / "debug_status" / f"rank_{accelerator.process_index:02d}.json"
+        if rank_status_enabled
+        else None
+    )
     last_video_stage = None
     last_unfrozen_video_blocks = None
+    sampler_label = "sequence-batch"
+    if resolved_sequence_batch_interleave_window > 1:
+        sampler_label = "sequence-batch-interleaved"
     if accelerator.num_processes == 1:
-        loader_label = "sequence-prefetch"
+        loader_label = sampler_label
     else:
-        loader_label = f"sequence-shard:{accelerator.process_index}/{accelerator.num_processes}"
+        loader_label = f"{sampler_label}-shard:{accelerator.process_index}/{accelerator.num_processes}"
+    write_rank_debug_status(
+        rank_status_path,
+        phase="training_ready",
+        rank=accelerator.process_index,
+        world_size=accelerator.num_processes,
+        step=global_step,
+        extra={
+            "output_dir": args.output_dir,
+            "device": str(accelerator.device),
+            "loader": loader_label,
+        },
+    )
     checkpoint_progress_bar = None
     checkpoint_segment_end = None
 
@@ -1853,13 +2458,22 @@ def main() -> None:
             ,
             flush=True,
         )
+        if rank_status_path is not None:
+            print(
+                f"[train_dual_branch_fm] per-rank debug status "
+                f"| dir={rank_status_path.parent}",
+                flush=True,
+            )
         checkpoint_progress_bar, checkpoint_segment_end = create_checkpoint_progress_bar(global_step)
     last_video_stage = int(video_schedule_metrics["video_optim_stage"])
     last_unfrozen_video_blocks = int(video_schedule_metrics["video_unfrozen_blocks"])
+    batch_wait_start = time.time()
 
     try:
         while global_step < args.max_steps:
-            for batch in train_iterator:
+            for batch in train_dataloader:
+                batch_wait_sec = time.time() - batch_wait_start
+                step_compute_start = time.time()
                 raw_model = accelerator.unwrap_model(model)
                 video_schedule_metrics = apply_video_backbone_schedule(raw_model, args, global_step)
                 current_video_stage = int(video_schedule_metrics["video_optim_stage"])
@@ -1884,6 +2498,23 @@ def main() -> None:
                 last_unfrozen_video_blocks = current_unfrozen_video_blocks
 
                 with accelerator.accumulate(model):
+                    loss_weights, curriculum_metrics = build_curriculum_loss_weights(args, global_step)
+                    state_to_video_scale = resolve_state_to_video_scale(args, global_step)
+                    video_to_state_scale = resolve_video_to_state_scale(args, global_step)
+                    sequence_names = [str(name) for name in batch["sequence_name"]]
+                    write_rank_debug_status(
+                        rank_status_path,
+                        phase="batch_ready",
+                        rank=accelerator.process_index,
+                        world_size=accelerator.num_processes,
+                        step=global_step,
+                        sequence_names=sequence_names,
+                        extra={
+                            "target_step": global_step + 1,
+                            "video_stage": current_video_stage,
+                            "unfrozen_video_blocks": current_unfrozen_video_blocks,
+                        },
+                    )
                     rgb = batch["rgb"].to(accelerator.device, non_blocking=True)
                     human_visible = batch["human_visible"].to(accelerator.device, non_blocking=True)
                     masks_human = batch["masks_human"].to(accelerator.device, non_blocking=True)
@@ -1895,7 +2526,10 @@ def main() -> None:
                     depth = batch["depth"].to(accelerator.device, non_blocking=True)
                     camera_intrinsics = batch["camera_intrinsics"].to(accelerator.device, non_blocking=True)
                     object_poses = batch["object_poses"].to(accelerator.device, non_blocking=True)
-                    human_vertices = batch["human_vertices"].to(accelerator.device, non_blocking=True)
+                    human_shape = batch["human_shape"].to(accelerator.device, non_blocking=True)
+                    body_pose = batch["body_pose"].to(accelerator.device, non_blocking=True)
+                    cam_t = batch["cam_t"].to(accelerator.device, non_blocking=True)
+                    object_categories = [str(name) for name in batch["object_category"]]
                     human_gaussians = batch["human_gaussians"].to(accelerator.device, non_blocking=True)
                     object_gaussians = batch["object_gaussians"].to(accelerator.device, non_blocking=True)
                     joints_3d = batch["joints_3d"].to(accelerator.device, non_blocking=True)
@@ -1960,42 +2594,16 @@ def main() -> None:
                         ],
                         dim=2,
                     )
-
-                    background = torch.full_like(rgb, args.background_value)
-                    object_visible = rgb * masks_object + background * (1.0 - masks_object)
-                    human_proxy_render = render_human_proxy_branch(
-                        renderer,
-                        human_vertices,
-                        camera_intrinsics_render,
-                        num_points=args.num_human_video_points,
-                        gaussian_scale=args.human_proxy_gaussian_scale,
-                    ).detach()
-                    human_supervision_target, human_supervision_weights = build_human_supervision_target(
-                        human_visible=human_visible,
-                        masks_human=masks_human,
-                        human_proxy_render=human_proxy_render,
-                        visible_weight=args.human_visible_region_weight,
-                        completion_weight=args.human_completion_region_weight,
-                    )
-                    teacher_object_render = render_object_branch(
-                        renderer,
-                        object_gaussians,
-                        object_poses,
-                        camera_intrinsics_render,
-                    ).detach()
-                    object_supervision_target, object_supervision_weights = build_object_supervision_target(
-                        object_visible=object_visible,
-                        teacher_object_render=teacher_object_render,
-                        m_primary=m_primary,
-                        m_secondary=m_secondary,
-                        m_object_region=m_object_region,
-                        visible_weight=args.object_visible_region_weight,
-                        primary_weight=args.object_primary_region_weight,
-                        secondary_weight=args.object_secondary_region_weight,
-                    )
-                    video_target = torch.cat([human_supervision_target, object_supervision_target], dim=2)
+                    human_supervision_target = None
+                    human_supervision_weights = None
+                    object_supervision_target = None
+                    object_supervision_weights = None
+                    video_target = rgb
                     teacher_state = build_teacher_state(
                         {
+                            "human_shape": human_shape,
+                            "body_pose": body_pose,
+                            "cam_t": cam_t,
                             "human_gaussians": human_gaussians,
                             "object_gaussians": object_gaussians,
                             "joints_3d": joints_3d,
@@ -2007,6 +2615,9 @@ def main() -> None:
                     with torch.no_grad():
                         video_target_tokens = raw_model.encode_video_target(video_target)
                         state_target_tokens = raw_model.encode_state_target(
+                            human_shape=human_shape,
+                            human_pose=body_pose,
+                            human_translation=cam_t,
                             human_gaussians=human_gaussians,
                             object_gaussians=object_gaussians,
                             joints_3d=joints_3d,
@@ -2015,29 +2626,43 @@ def main() -> None:
                         )
 
                     batch_size = video_target_tokens.shape[0]
-                    timesteps = torch.rand(batch_size, device=accelerator.device, dtype=video_target_tokens.dtype)
-                    t_view = timesteps.view(batch_size, 1, 1)
+                    timesteps = torch.rand(batch_size, device=accelerator.device, dtype=torch.float32)
 
                     video_noise = torch.randn_like(video_target_tokens)
+                    if model_uses_wan_teacher(raw_model):
+                        video_noise = raw_model.apply_video_valid_mask(video_noise)
                     state_noise = torch.randn_like(state_target_tokens)
-                    video_xt = t_view * video_target_tokens + (1.0 - t_view) * video_noise
-                    state_xt = t_view * state_target_tokens + (1.0 - t_view) * state_noise
-                    video_velocity_target = video_target_tokens - video_noise
-                    state_velocity_target = state_target_tokens - state_noise
+                    video_xt, video_velocity_target = flow_match_sample(video_target_tokens, video_noise, timesteps)
+                    if model_uses_wan_teacher(raw_model):
+                        video_xt = raw_model.apply_video_valid_mask(video_xt)
+                        video_velocity_target = raw_model.apply_video_valid_mask(video_velocity_target)
+                    state_xt, state_velocity_target = flow_match_sample(state_target_tokens, state_noise, timesteps)
 
-                    state_to_video_scale = resolve_state_to_video_scale(args, global_step)
-                    video_to_state_scale = resolve_video_to_state_scale(args, global_step)
+                    write_rank_debug_status(
+                        rank_status_path,
+                        phase="forward",
+                        rank=accelerator.process_index,
+                        world_size=accelerator.num_processes,
+                        step=global_step,
+                        sequence_names=sequence_names,
+                        extra={"target_step": global_step + 1},
+                    )
+                    forward_kwargs = {}
+                    if model_uses_wan_teacher(raw_model):
+                        forward_kwargs["condition_latents"] = video_target_tokens
                     output = model(
                         video_xt=video_xt,
                         state_xt=state_xt,
                         timesteps=timesteps,
                         condition_video=condition_video,
                         camera_intrinsics=camera_intrinsics_render,
+                        sequence_names=sequence_names,
+                        object_categories=object_categories,
                         state_to_video_scale=state_to_video_scale,
                         video_to_state_scale=video_to_state_scale,
+                        **forward_kwargs,
                     )
 
-                    loss_weights, curriculum_metrics = build_curriculum_loss_weights(args, global_step)
                     loss, metrics = compute_losses(
                         model=raw_model,
                         output=output,
@@ -2060,11 +2685,25 @@ def main() -> None:
                         video_target_tokens=video_target_tokens,
                         state_target_tokens=state_target_tokens,
                         weights=loss_weights,
+                        video_teacher_is_frozen=bool(args.freeze_video_backbone),
                     )
                     metrics["state_to_video_scale"] = loss.new_tensor(state_to_video_scale)
                     metrics["video_to_state_scale"] = loss.new_tensor(video_to_state_scale)
-                    metrics["cross_branch_scale"] = loss.new_tensor(state_to_video_scale)
+                    effective_cross_scale = video_to_state_scale if args.freeze_video_backbone else state_to_video_scale
+                    metrics["cross_branch_scale"] = loss.new_tensor(effective_cross_scale)
 
+                    write_rank_debug_status(
+                        rank_status_path,
+                        phase="backward",
+                        rank=accelerator.process_index,
+                        world_size=accelerator.num_processes,
+                        step=global_step,
+                        sequence_names=sequence_names,
+                        extra={
+                            "target_step": global_step + 1,
+                            "loss_total": metrics["loss_total"],
+                        },
+                    )
                     accelerator.backward(loss)
                     if accelerator.sync_gradients and args.max_grad_norm is not None:
                         accelerator.clip_grad_norm_(all_parameters, args.max_grad_norm)
@@ -2072,20 +2711,59 @@ def main() -> None:
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
+                step_compute_sec = time.time() - step_compute_start
+                step_wall_sec = batch_wait_sec + step_compute_sec
+                batch_wait_start = time.time()
                 if not accelerator.sync_gradients:
                     continue
 
                 global_step += 1
-                reduced_metrics = {
-                    key: accelerator.reduce(value.to(accelerator.device), reduction="mean").item()
-                    for key, value in metrics.items()
-                }
+                write_rank_debug_status(
+                    rank_status_path,
+                    phase="metric_reduce",
+                    rank=accelerator.process_index,
+                    world_size=accelerator.num_processes,
+                    step=global_step,
+                    sequence_names=sequence_names,
+                )
+                reduced_metrics = reduce_scalar_metrics(accelerator, metrics)
                 reduced_metrics.update(curriculum_metrics)
                 reduced_metrics.update(video_schedule_metrics)
                 reduced_metrics["lr"] = scheduler.get_last_lr()[0]
+                reduced_metrics["batch_wait_sec"] = batch_wait_sec
+                reduced_metrics["step_compute_sec"] = step_compute_sec
+                reduced_metrics["step_wall_sec"] = step_wall_sec
                 reduced_metrics["trainable_params_m"] = (
                     count_parameters(collect_trainable_parameters(accelerator.unwrap_model(model))) / 1e6
                 )
+                write_rank_debug_status(
+                    rank_status_path,
+                    phase="step_complete",
+                    rank=accelerator.process_index,
+                    world_size=accelerator.num_processes,
+                    step=global_step,
+                    sequence_names=sequence_names,
+                    extra={
+                        "loss_total": reduced_metrics["loss_total"],
+                        "batch_wait_sec": batch_wait_sec,
+                        "step_compute_sec": step_compute_sec,
+                        "step_wall_sec": step_wall_sec,
+                    },
+                )
+                if slow_step_threshold > 0.0 and step_wall_sec >= slow_step_threshold:
+                    joined_sequences = ",".join(sequence_names[:4])
+                    if len(sequence_names) > 4:
+                        joined_sequences = f"{joined_sequences},..."
+                    print(
+                        f"[train_dual_branch_fm] slow step "
+                        f"| rank={accelerator.process_index} "
+                        f"| step={global_step:07d} "
+                        f"| duration={step_wall_sec:.2f}s "
+                        f"| wait={batch_wait_sec:.2f}s "
+                        f"| compute={step_compute_sec:.2f}s "
+                        f"| sequences={joined_sequences}",
+                        flush=True,
+                    )
 
                 if accelerator.is_main_process and checkpoint_progress_bar is not None:
                     checkpoint_progress_bar.update(1)
@@ -2098,7 +2776,10 @@ def main() -> None:
                     )
 
                 if global_step % args.log_every == 0 and accelerator.is_main_process and log_with is not None:
-                    accelerator.log(reduced_metrics, step=global_step)
+                    log_metrics = reduced_metrics
+                    if wandb_enabled:
+                        log_metrics = build_wandb_loss_metrics(reduced_metrics, loss_weights)
+                    accelerator.log(log_metrics, step=global_step)
 
                 if global_step % args.print_every == 0 and accelerator.is_main_process:
                     elapsed = time.time() - start_time
@@ -2113,12 +2794,18 @@ def main() -> None:
                         f"loss={reduced_metrics['loss_total']:.4f} "
                         f"vfm={reduced_metrics['loss_video_fm']:.4f} "
                         f"sfm={reduced_metrics['loss_state_fm']:.4f} "
-                        f"objR={reduced_metrics['loss_object_render']:.4f} "
-                        f"joints={reduced_metrics['loss_joints']:.4f} "
+                        f"hg={reduced_metrics['loss_human_gaussian']:.4f} "
+                        f"og={reduced_metrics['loss_object_gaussian']:.4f} "
+                        f"j3d={reduced_metrics['loss_joints_3d']:.4f} "
+                        f"jheat={reduced_metrics['loss_joint_heat']:.4f} "
+                        f"objSil={reduced_metrics['loss_geo_object_silhouette']:.4f} "
                         f"stage={int(reduced_metrics['curriculum_stage'])} "
                         f"video_stage={int(reduced_metrics['video_optim_stage'])} "
                         f"stv={reduced_metrics['state_to_video_scale']:.2f} "
+                        f"vts={reduced_metrics['video_to_state_scale']:.2f} "
                         f"unfrozen={int(reduced_metrics['video_unfrozen_blocks'])} "
+                        f"wait={reduced_metrics['batch_wait_sec']:.2f}s "
+                        f"compute={reduced_metrics['step_compute_sec']:.2f}s "
                         f"next_save={next_save:07d} "
                         f"next_honest={next_honest:07d} "
                         f"eta={eta / 3600.0:.2f}h"
@@ -2127,6 +2814,13 @@ def main() -> None:
                     )
 
                 if global_step % args.save_every == 0:
+                    write_rank_debug_status(
+                        rank_status_path,
+                        phase="checkpoint_barrier",
+                        rank=accelerator.process_index,
+                        world_size=accelerator.num_processes,
+                        step=global_step,
+                    )
                     if accelerator.is_main_process:
                         save_checkpoint(
                             accelerator=accelerator,
@@ -2138,6 +2832,13 @@ def main() -> None:
                         )
                     accelerator.wait_for_everyone()
                 if args.honest_val_every > 0 and global_step % args.honest_val_every == 0:
+                    write_rank_debug_status(
+                        rank_status_path,
+                        phase="honest_validation_barrier",
+                        rank=accelerator.process_index,
+                        world_size=accelerator.num_processes,
+                        step=global_step,
+                    )
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process and honest_val_sequence_dir is not None:
                         try:
@@ -2150,6 +2851,7 @@ def main() -> None:
                                 step=global_step,
                                 args=args,
                                 wandb_enabled=wandb_enabled,
+                                wandb_run=wandb_run,
                             )
                             if log_with is not None and not wandb_enabled:
                                 accelerator.log(honest_metrics, step=global_step)
@@ -2178,6 +2880,13 @@ def main() -> None:
                 if global_step >= args.max_steps:
                     break
     finally:
+        write_rank_debug_status(
+            rank_status_path,
+            phase="training_exit",
+            rank=accelerator.process_index,
+            world_size=accelerator.num_processes,
+            step=global_step,
+        )
         if checkpoint_progress_bar is not None:
             checkpoint_progress_bar.close()
     accelerator.wait_for_everyone()

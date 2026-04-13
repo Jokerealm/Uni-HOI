@@ -25,11 +25,13 @@ import hashlib
 import json
 import os
 import pickle
+import re
 import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import h5py
 import numpy as np
 import torch
 from PIL import Image
@@ -40,9 +42,16 @@ INDEX_CACHE_VERSION = 5
 VALID_HUMAN_GAUSSIAN_SOURCES = ("smpl_mesh", "teacher")
 DUAL_BRANCH_TARGET_CACHE_VERSION = 1
 DUAL_BRANCH_TARGETS_FILENAME = "dual_branch_targets.npz"
+DUAL_BRANCH_SEQUENCE_H5_CACHE_VERSION = 2
+DUAL_BRANCH_SEQUENCE_H5_CACHE_FILENAME = "dual_branch_clip_cache_v2.h5"
 SMPL_HUMAN_GAUSSIANS_FILENAME = "G_h_smpl.pt"
 DEFAULT_KEYPOINT_HEATMAP_SIGMA = 6.0
 DEFAULT_CONTACT_SIGNATURE_DIM = 4
+DEFAULT_HUMAN_POSE_DIM = 72
+DEFAULT_HUMAN_SHAPE_DIM = 10
+DEFAULT_SEQUENCE_H5_CHUNK_FRAMES = 16
+H5_SEQUENCE_BACKEND = "h5_lazy"
+LEGACY_SEQUENCE_BACKEND = "legacy_bundle"
 
 
 def load_rgb_image(path: str) -> Tensor:
@@ -65,7 +74,7 @@ def _sorted_image_paths(frame_dir: Path) -> List[Path]:
     return paths
 
 
-def _normalize_pose_dim(body_pose: np.ndarray, target_dim: int = 144) -> np.ndarray:
+def _normalize_pose_dim(body_pose: np.ndarray, target_dim: int = DEFAULT_HUMAN_POSE_DIM) -> np.ndarray:
     if body_pose.shape[1] == target_dim:
         return body_pose
     if body_pose.shape[1] > target_dim:
@@ -97,13 +106,113 @@ def _normalize_keypoints_2d_targets(keypoints_2d: np.ndarray, num_joints: int) -
     return keypoints
 
 
+def _resolve_num_frames_from_smpl_params(smpl_params: Dict[str, np.ndarray]) -> int:
+    for key in ("body_pose", "cam_t", "joints_3d", "keypoints_3d", "vertices", "shape", "betas", "beta"):
+        value = smpl_params.get(key)
+        if value is None:
+            continue
+        array = np.asarray(value)
+        if array.ndim == 0:
+            continue
+        return int(array.shape[0]) if array.ndim >= 2 else 1
+    return 1
+
+
+def _resolve_human_shape_targets_from_smpl_params(
+    smpl_params: Dict[str, np.ndarray],
+    shape_dim: int = DEFAULT_HUMAN_SHAPE_DIM,
+) -> Tensor:
+    num_frames = _resolve_num_frames_from_smpl_params(smpl_params)
+    shape_np = None
+    for key in ("shape", "betas", "beta"):
+        if key in smpl_params:
+            shape_np = np.asarray(smpl_params[key], dtype=np.float32)
+            break
+    if shape_np is None:
+        return torch.zeros(num_frames, shape_dim, dtype=torch.float32)
+    if shape_np.ndim == 1:
+        shape_np = np.broadcast_to(shape_np.reshape(1, -1), (num_frames, shape_np.shape[0]))
+    elif shape_np.ndim == 2 and shape_np.shape[0] == 1 and num_frames > 1:
+        shape_np = np.broadcast_to(shape_np, (num_frames, shape_np.shape[1]))
+    elif shape_np.ndim != 2:
+        raise ValueError(f"Expected human shape parameters with ndim 1/2, got {shape_np.ndim}.")
+    if shape_np.shape[1] > shape_dim:
+        shape_np = shape_np[:, :shape_dim]
+    elif shape_np.shape[1] < shape_dim:
+        padded = np.zeros((shape_np.shape[0], shape_dim), dtype=np.float32)
+        padded[:, : shape_np.shape[1]] = shape_np
+        shape_np = padded
+    if shape_np.shape[0] < num_frames:
+        pad = np.repeat(shape_np[-1:], num_frames - shape_np.shape[0], axis=0)
+        shape_np = np.concatenate([shape_np, pad], axis=0)
+    return torch.from_numpy(shape_np[:num_frames].astype(np.float32))
+
+
+def _sanitize_object_category(text: str) -> str:
+    raw = str(text).strip().lower().replace("-", "_")
+    parts = []
+    for token in raw.split("_"):
+        token = re.sub(r"[^a-z0-9]+", "", token)
+        if not token:
+            continue
+        if token.startswith("date") or token.startswith("sub") or token.startswith("synzv"):
+            continue
+        parts.append(token)
+    if not parts:
+        return "object"
+    return parts[0]
+
+
+def resolve_object_category(sequence_dir: str | Path, *, processed_subdir: str = "processed") -> str:
+    sequence_path = Path(sequence_dir)
+    meta_json_path = sequence_path / processed_subdir / "object_category.json"
+    if meta_json_path.is_file():
+        try:
+            payload = json.loads(meta_json_path.read_text(encoding="utf-8"))
+            for key in ("object_category", "object_name", "object_label"):
+                value = payload.get(key)
+                if value:
+                    return _sanitize_object_category(str(value))
+        except Exception:
+            pass
+
+    meta_npz_path = sequence_path / processed_subdir / "meta.npz"
+    if meta_npz_path.is_file():
+        try:
+            with np.load(meta_npz_path, allow_pickle=True) as meta_npz:
+                for key in ("object_category", "object_name", "object_label"):
+                    if key in meta_npz:
+                        value = meta_npz[key]
+                        if np.asarray(value).size > 0:
+                            return _sanitize_object_category(str(np.asarray(value).reshape(-1)[0]))
+        except Exception:
+            pass
+
+    sequence_name_category = _sanitize_object_category(sequence_path.name)
+    if sequence_name_category != "object":
+        return sequence_name_category
+
+    timestep_dirs = _discover_timestep_dirs(sequence_path)
+    for timestep_dir in timestep_dirs[:1]:
+        for child in sorted(timestep_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            name = child.name.strip().lower()
+            if name in {"person", "human"}:
+                continue
+            return _sanitize_object_category(name)
+    return "object"
+
+
 def _resolve_joint_targets_from_smpl_params(smpl_params: Dict[str, np.ndarray], num_joints: int) -> Tensor:
     if "joints_3d" in smpl_params:
         joints = torch.from_numpy(smpl_params["joints_3d"].astype(np.float32))
     elif "keypoints_3d" in smpl_params:
         joints = torch.from_numpy(smpl_params["keypoints_3d"].astype(np.float32))
     else:
-        body_pose = torch.from_numpy(_normalize_pose_dim(smpl_params["body_pose"].astype(np.float32), target_dim=144))
+        body_pose = torch.from_numpy(
+            _normalize_pose_dim(smpl_params["body_pose"].astype(np.float32), target_dim=DEFAULT_HUMAN_POSE_DIM)
+        )
         joints = body_pose.new_zeros(body_pose.shape[0], num_joints, 3)
     if joints.ndim != 3:
         raise ValueError(f"Expected joints tensor with shape [T, J, 3], got {tuple(joints.shape)}.")
@@ -615,6 +724,252 @@ def _maybe_load_precomputed_dual_branch_targets(
     }
 
 
+def _resolve_sequence_h5_chunks(shape: Sequence[int], *, chunk_frames: int) -> Optional[Tuple[int, ...]]:
+    if not shape:
+        return None
+    if int(shape[0]) <= 0:
+        return None
+    return (min(int(shape[0]), max(int(chunk_frames), 1)),) + tuple(int(dim) for dim in shape[1:])
+
+
+def _write_h5_dataset(
+    handle: h5py.File,
+    name: str,
+    data: np.ndarray,
+    *,
+    chunk_frames: Optional[int] = None,
+    compression: Optional[str] = "lzf",
+) -> None:
+    array = np.ascontiguousarray(data)
+    kwargs = {}
+    if array.ndim > 0 and chunk_frames is not None:
+        chunks = _resolve_sequence_h5_chunks(array.shape, chunk_frames=chunk_frames)
+        if chunks is not None:
+            kwargs["chunks"] = chunks
+            if compression:
+                kwargs["compression"] = compression
+            if array.dtype.kind in {"b", "f", "i", "u"}:
+                kwargs["shuffle"] = True
+    handle.create_dataset(name, data=array, **kwargs)
+
+
+def build_dual_branch_sequence_h5_cache(
+    sequence_dir: str,
+    *,
+    processed_subdir: str = "processed",
+    gs_subdir: str = "gs_init",
+    human_gaussian_source: str = "smpl_mesh",
+    num_human_gaussians: int = 1024,
+    num_object_gaussians: int = 1024,
+    num_joints: int = 22,
+    contact_dim: int = 4,
+    hand_joint_indices: Optional[Sequence[int]] = None,
+    overwrite: bool = False,
+    chunk_frames: int = DEFAULT_SEQUENCE_H5_CHUNK_FRAMES,
+) -> Path:
+    sequence_path = Path(sequence_dir)
+    human_gaussian_source = _normalize_human_gaussian_source(human_gaussian_source)
+    cache_path = _build_sequence_h5_cache_path(sequence_path, processed_subdir=processed_subdir)
+    if not overwrite:
+        cached_num_frames = _read_num_frames_from_sequence_h5_cache(
+            sequence_path,
+            processed_subdir=processed_subdir,
+        )
+        if cached_num_frames is not None:
+            return cache_path
+
+    processed_dir = sequence_path / processed_subdir
+    cropped_dir = processed_dir / "cropped"
+    rgb_paths = _sorted_image_paths(cropped_dir / "rgb")
+
+    with np.load(cropped_dir / "masks_raw.npz") as masks_npz:
+        masks_human = np.asarray(masks_npz["human"], dtype=np.float16)
+        masks_object = np.asarray(masks_npz["object"], dtype=np.float16)
+
+    with np.load(cropped_dir / "region_masks.npz") as region_npz:
+        m_primary = np.asarray(region_npz["M_p"], dtype=np.float16)
+        m_secondary = np.asarray(region_npz["M_s"], dtype=np.float16)
+        m_object_region = np.asarray(region_npz["M_object"], dtype=np.float16)
+
+    with np.load(cropped_dir / "depth_aligned.npz") as depth_npz:
+        depth = np.asarray(depth_npz["depth"], dtype=np.float32)
+
+    with np.load(cropped_dir / "meta.npz") as meta_npz:
+        fx = np.asarray(meta_npz["fx"], dtype=np.float32)
+        fy = np.asarray(meta_npz["fy"], dtype=np.float32)
+        cx = np.asarray(meta_npz["cx"], dtype=np.float32)
+        cy = np.asarray(meta_npz["cy"], dtype=np.float32)
+
+    intrinsics = np.zeros((len(fx), 3, 3), dtype=np.float32)
+    intrinsics[:, 0, 0] = fx
+    intrinsics[:, 1, 1] = fy
+    intrinsics[:, 0, 2] = cx
+    intrinsics[:, 1, 2] = cy
+    intrinsics[:, 2, 2] = 1.0
+
+    keypoints_path = cropped_dir / "keypoints_2d.npz"
+    if not keypoints_path.is_file():
+        raise FileNotFoundError(f"Missing required keypoints file: {keypoints_path}")
+    with np.load(keypoints_path) as keypoints_npz:
+        keypoints_2d = _normalize_keypoints_2d_targets(keypoints_npz["keypoints"], num_joints)
+
+    human_gaussians: Optional[Tensor] = None
+    human_vertices: Optional[Tensor] = None
+    with np.load(processed_dir / "smpl_params.npz") as smpl_params:
+        joints_3d = _resolve_joint_targets_from_smpl_params(smpl_params, num_joints)
+        human_shape_frames = _resolve_human_shape_targets_from_smpl_params(smpl_params)
+        body_pose = torch.from_numpy(
+            _normalize_pose_dim(smpl_params["body_pose"].astype(np.float32), target_dim=DEFAULT_HUMAN_POSE_DIM)
+        )
+        if "cam_t" in smpl_params:
+            cam_t = torch.from_numpy(smpl_params["cam_t"].astype(np.float32))
+        else:
+            cam_t = torch.zeros(body_pose.shape[0], 3, dtype=torch.float32)
+        if "vertices" in smpl_params:
+            human_vertices = torch.from_numpy(np.asarray(smpl_params["vertices"], dtype=np.float32))
+        if human_gaussian_source == "smpl_mesh":
+            human_gaussians = _maybe_load_gaussians(sequence_path, gs_subdir, SMPL_HUMAN_GAUSSIANS_FILENAME)
+            if human_gaussians is None:
+                if "vertices" in smpl_params and "faces" in smpl_params:
+                    human_gaussians = _build_human_gaussians_from_smpl_params(
+                        smpl_params,
+                        num_human_gaussians=num_human_gaussians,
+                    )
+                else:
+                    raise FileNotFoundError(
+                        f"Missing SMPL mesh geometry under {processed_dir / 'smpl_params.npz'}. "
+                        "Expected `vertices` and `faces` for `human_gaussian_source=smpl_mesh`."
+                    )
+
+    num_frames = min(
+        len(rgb_paths),
+        masks_human.shape[0],
+        masks_object.shape[0],
+        m_primary.shape[0],
+        m_secondary.shape[0],
+        m_object_region.shape[0],
+        depth.shape[0],
+        intrinsics.shape[0],
+        keypoints_2d.shape[0],
+        joints_3d.shape[0],
+        human_shape_frames.shape[0],
+        body_pose.shape[0],
+        cam_t.shape[0],
+        human_vertices.shape[0] if human_vertices is not None else 10**9,
+    )
+    if num_frames <= 0:
+        raise RuntimeError(f"No valid frames found for {sequence_path}.")
+
+    object_poses = load_object_pose_sequence(
+        sequence_path,
+        num_frames,
+        processed_subdir=processed_subdir,
+    )
+
+    if human_gaussian_source == "teacher":
+        human_gaussians = _maybe_load_gaussians(sequence_path, gs_subdir, "G_h.pt")
+    object_gaussians = _maybe_load_gaussians(sequence_path, gs_subdir, "G_o.pt")
+    if human_gaussians is None and human_gaussian_source == "teacher":
+        raise FileNotFoundError(
+            f"Missing human Gaussian teacher under {sequence_path / gs_subdir}. "
+            "Expected `G_h.pt` or `gs_init_combined.pt` with key `G_h`."
+        )
+    if object_gaussians is None:
+        raise FileNotFoundError(
+            f"Missing object Gaussian teacher under {sequence_path / gs_subdir}. "
+            "Expected `G_o.pt` or `gs_init_combined.pt` with key `G_o`."
+        )
+
+    human_gaussians = _sort_gaussian_tokens_by_xyz(_subsample_tokens(human_gaussians, num_human_gaussians))
+    object_gaussians = _sort_gaussian_tokens_by_xyz(_subsample_tokens(object_gaussians, num_object_gaussians))
+
+    rgb_paths = rgb_paths[:num_frames]
+    masks_human = masks_human[:num_frames]
+    masks_object = masks_object[:num_frames]
+    m_primary = m_primary[:num_frames]
+    m_secondary = m_secondary[:num_frames]
+    m_object_region = m_object_region[:num_frames]
+    depth = depth[:num_frames]
+    intrinsics = intrinsics[:num_frames]
+    keypoints_2d = keypoints_2d[:num_frames]
+    joints_3d = joints_3d[:num_frames]
+    human_shape_frames = human_shape_frames[:num_frames]
+    body_pose = body_pose[:num_frames]
+    cam_t = cam_t[:num_frames]
+    if human_vertices is not None:
+        human_vertices = human_vertices[:num_frames]
+
+    precomputed_targets = _maybe_load_precomputed_dual_branch_targets(
+        sequence_path,
+        processed_subdir=processed_subdir,
+        contact_dim=contact_dim,
+        hand_joint_indices=hand_joint_indices,
+    )
+    if precomputed_targets is not None:
+        contact_signature = precomputed_targets["contact_signature"][:num_frames]
+        if contact_signature.shape[0] < num_frames:
+            precomputed_targets = None
+    if precomputed_targets is None:
+        contact_signature = _compute_contact_signature(
+            joints_3d,
+            object_gaussians,
+            object_poses,
+            contact_dim=contact_dim,
+            hand_joint_indices=hand_joint_indices,
+        )
+
+    object_category = resolve_object_category(sequence_path, processed_subdir=processed_subdir)
+    first_rgb = np.asarray(Image.open(rgb_paths[0]).convert("RGB"), dtype=np.uint8)
+    rgb_shape = (num_frames,) + tuple(first_rgb.shape)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_suffix(f"{cache_path.suffix}.tmp")
+
+    with h5py.File(tmp_path, "w") as handle:
+        handle.attrs["cache_version"] = int(DUAL_BRANCH_SEQUENCE_H5_CACHE_VERSION)
+        handle.attrs["sequence_name"] = sequence_path.name
+        handle.attrs["num_frames"] = int(num_frames)
+        handle.attrs["num_joints"] = int(num_joints)
+        handle.attrs["contact_dim"] = int(contact_dim)
+        handle.attrs["image_height"] = int(first_rgb.shape[0])
+        handle.attrs["image_width"] = int(first_rgb.shape[1])
+        handle.attrs["human_gaussian_source"] = human_gaussian_source
+        handle.attrs["object_category"] = object_category
+
+        rgb_dataset = handle.create_dataset(
+            "rgb",
+            shape=rgb_shape,
+            dtype=np.uint8,
+            chunks=_resolve_sequence_h5_chunks(rgb_shape, chunk_frames=chunk_frames),
+            compression="lzf",
+            shuffle=True,
+        )
+        rgb_dataset[0] = first_rgb
+        for frame_idx, rgb_path in enumerate(rgb_paths[1:], start=1):
+            rgb_dataset[frame_idx] = np.asarray(Image.open(rgb_path).convert("RGB"), dtype=np.uint8)
+
+        _write_h5_dataset(handle, "masks_human", masks_human, chunk_frames=chunk_frames)
+        _write_h5_dataset(handle, "masks_object", masks_object, chunk_frames=chunk_frames)
+        _write_h5_dataset(handle, "m_primary", m_primary, chunk_frames=chunk_frames)
+        _write_h5_dataset(handle, "m_secondary", m_secondary, chunk_frames=chunk_frames)
+        _write_h5_dataset(handle, "m_object_region", m_object_region, chunk_frames=chunk_frames)
+        _write_h5_dataset(handle, "depth", depth, chunk_frames=chunk_frames)
+        _write_h5_dataset(handle, "intrinsics", intrinsics, chunk_frames=chunk_frames)
+        _write_h5_dataset(handle, "keypoints_2d", keypoints_2d.cpu().numpy(), chunk_frames=chunk_frames)
+        _write_h5_dataset(handle, "joints_3d", joints_3d.cpu().numpy(), chunk_frames=chunk_frames)
+        _write_h5_dataset(handle, "human_shape", human_shape_frames.cpu().numpy(), chunk_frames=chunk_frames)
+        _write_h5_dataset(handle, "body_pose", body_pose.cpu().numpy(), chunk_frames=chunk_frames)
+        _write_h5_dataset(handle, "cam_t", cam_t.cpu().numpy(), chunk_frames=chunk_frames)
+        if human_vertices is not None:
+            _write_h5_dataset(handle, "human_vertices", human_vertices.cpu().numpy(), chunk_frames=chunk_frames)
+        _write_h5_dataset(handle, "object_poses", object_poses.cpu().numpy(), chunk_frames=chunk_frames)
+        _write_h5_dataset(handle, "contact_signature", contact_signature.cpu().numpy(), chunk_frames=chunk_frames)
+        _write_h5_dataset(handle, "human_gaussians", human_gaussians.cpu().numpy(), chunk_frames=None)
+        _write_h5_dataset(handle, "object_gaussians", object_gaussians.cpu().numpy(), chunk_frames=None)
+
+    os.replace(tmp_path, cache_path)
+    return cache_path
+
+
 def _validate_mask_tensor(name: str, tensor: Tensor) -> None:
     if not torch.isfinite(tensor).all():
         raise ValueError(f"{name} contains non-finite values.")
@@ -635,6 +990,19 @@ def _validate_positive_intrinsics(intrinsics: Tensor) -> None:
         raise ValueError("Camera intrinsics contain non-positive fx values.")
     if not torch.all(intrinsics[:, 1, 1] > 0.0):
         raise ValueError("Camera intrinsics contain non-positive fy values.")
+
+
+def _load_h5_rgb_clip(handle: h5py.File, start: int, end: int) -> Tensor:
+    rgb = torch.from_numpy(np.asarray(handle["rgb"][start:end], dtype=np.uint8))
+    return rgb.permute(0, 3, 1, 2).contiguous().float().div(255.0)
+
+
+def _load_h5_map_clip(handle: h5py.File, name: str, start: int, end: int) -> Tensor:
+    return torch.from_numpy(np.asarray(handle[name][start:end], dtype=np.float32)).unsqueeze(1)
+
+
+def _load_h5_tensor_clip(handle: h5py.File, name: str, start: int, end: int) -> Tensor:
+    return torch.from_numpy(np.asarray(handle[name][start:end], dtype=np.float32))
 
 
 def _validate_sequence_bundle(bundle: Dict[str, object], *, num_frames: int, num_joints: int) -> None:
@@ -786,6 +1154,33 @@ def _build_index_cache_path(
     return root_path / ".dual_branch_index_cache" / f"{digest}.pkl"
 
 
+def _build_sequence_h5_cache_path(
+    sequence_dir: str | Path,
+    *,
+    processed_subdir: str = "processed",
+) -> Path:
+    sequence_path = Path(sequence_dir)
+    return sequence_path / processed_subdir / "cropped" / DUAL_BRANCH_SEQUENCE_H5_CACHE_FILENAME
+
+
+def _read_num_frames_from_sequence_h5_cache(
+    sequence_dir: str | Path,
+    *,
+    processed_subdir: str = "processed",
+) -> Optional[int]:
+    cache_path = _build_sequence_h5_cache_path(sequence_dir, processed_subdir=processed_subdir)
+    if not cache_path.is_file():
+        return None
+    try:
+        with h5py.File(cache_path, "r") as handle:
+            version = int(handle.attrs.get("cache_version", -1))
+            if version != DUAL_BRANCH_SEQUENCE_H5_CACHE_VERSION:
+                return None
+            return int(handle.attrs["num_frames"])
+    except Exception:
+        return None
+
+
 def inspect_sequence_num_frames(
     sequence_dir: str,
     *,
@@ -793,6 +1188,13 @@ def inspect_sequence_num_frames(
     gs_subdir: str = "gs_init",
     human_gaussian_source: str = "smpl_mesh",
 ) -> int:
+    cached_num_frames = _read_num_frames_from_sequence_h5_cache(
+        sequence_dir,
+        processed_subdir=processed_subdir,
+    )
+    if cached_num_frames is not None:
+        return int(cached_num_frames)
+
     sequence_path = Path(sequence_dir)
     human_gaussian_source = _normalize_human_gaussian_source(human_gaussian_source)
     processed_dir = sequence_path / processed_subdir
@@ -896,6 +1298,8 @@ def load_dual_branch_sequence_bundle(
     require_gaussian_targets: bool = True,
     preload_rgb: bool = False,
     validate_bundle: bool = False,
+    include_human_vertices: bool = True,
+    include_keypoint_heatmaps: bool = True,
 ) -> Dict[str, object]:
     sequence_path = Path(sequence_dir)
     human_gaussian_source = _normalize_human_gaussian_source(human_gaussian_source)
@@ -937,12 +1341,15 @@ def load_dual_branch_sequence_bundle(
     human_vertices: Optional[Tensor] = None
     with np.load(processed_dir / "smpl_params.npz") as smpl_params:
         joints_3d = _resolve_joint_targets_from_smpl_params(smpl_params, num_joints)
-        body_pose = torch.from_numpy(_normalize_pose_dim(smpl_params["body_pose"].astype(np.float32), target_dim=144))
+        human_shape_frames = _resolve_human_shape_targets_from_smpl_params(smpl_params)
+        body_pose = torch.from_numpy(
+            _normalize_pose_dim(smpl_params["body_pose"].astype(np.float32), target_dim=DEFAULT_HUMAN_POSE_DIM)
+        )
         if "cam_t" in smpl_params:
             cam_t = torch.from_numpy(smpl_params["cam_t"].astype(np.float32))
         else:
             cam_t = torch.zeros(body_pose.shape[0], 3, dtype=torch.float32)
-        if "vertices" in smpl_params:
+        if include_human_vertices and "vertices" in smpl_params:
             human_vertices = torch.from_numpy(smpl_params["vertices"].astype(np.float32))
         if human_gaussian_source == "smpl_mesh":
             human_gaussians = _maybe_load_gaussians(sequence_path, gs_subdir, SMPL_HUMAN_GAUSSIANS_FILENAME)
@@ -967,6 +1374,7 @@ def load_dual_branch_sequence_bundle(
         intrinsics.shape[0],
         keypoints_2d.shape[0],
         joints_3d.shape[0],
+        human_shape_frames.shape[0],
         body_pose.shape[0],
         cam_t.shape[0],
         human_vertices.shape[0] if human_vertices is not None else 10**9,
@@ -981,6 +1389,7 @@ def load_dual_branch_sequence_bundle(
     intrinsics = intrinsics[:num_frames]
     keypoints_2d = keypoints_2d[:num_frames]
     joints_3d = joints_3d[:num_frames]
+    human_shape_frames = human_shape_frames[:num_frames]
     body_pose = body_pose[:num_frames]
     cam_t = cam_t[:num_frames]
     if human_vertices is not None:
@@ -1017,17 +1426,20 @@ def load_dual_branch_sequence_bundle(
         contact_dim=contact_dim,
         hand_joint_indices=hand_joint_indices,
     )
+    keypoint_heatmaps: Optional[Tensor] = None
     if precomputed_targets is not None:
-        keypoint_heatmaps = precomputed_targets["keypoint_heatmaps"][:num_frames]
+        if include_keypoint_heatmaps:
+            keypoint_heatmaps = precomputed_targets["keypoint_heatmaps"][:num_frames]
         contact_signature = precomputed_targets["contact_signature"][:num_frames]
-        if keypoint_heatmaps.shape[0] < num_frames or contact_signature.shape[0] < num_frames:
+        if (keypoint_heatmaps is not None and keypoint_heatmaps.shape[0] < num_frames) or contact_signature.shape[0] < num_frames:
             precomputed_targets = None
     if precomputed_targets is None:
-        keypoint_heatmaps = _build_keypoint_heatmaps(
-            keypoints_2d,
-            height=depth.shape[-2],
-            width=depth.shape[-1],
-        )
+        if include_keypoint_heatmaps:
+            keypoint_heatmaps = _build_keypoint_heatmaps(
+                keypoints_2d,
+                height=depth.shape[-2],
+                width=depth.shape[-1],
+            )
         contact_signature = _compute_contact_signature(
             joints_3d,
             object_gaussians,
@@ -1048,6 +1460,7 @@ def load_dual_branch_sequence_bundle(
         "keypoints_2d": keypoints_2d,
         "keypoint_heatmaps": keypoint_heatmaps,
         "joints_3d": joints_3d,
+        "human_shape_frames": human_shape_frames,
         "body_pose": body_pose,
         "cam_t": cam_t,
         "human_vertices": human_vertices,
@@ -1057,6 +1470,7 @@ def load_dual_branch_sequence_bundle(
         "object_gaussians": object_gaussians,
         "num_frames": num_frames,
         "sequence_name": sequence_path.name,
+        "object_category": resolve_object_category(sequence_path, processed_subdir=processed_subdir),
     }
     if preload_rgb:
         bundle["rgb_uint8"] = torch.stack(
@@ -1093,6 +1507,9 @@ class DualBranchHOIDataset(Dataset):
         split_file: str = "",
         split_key: str = "train",
         validate_sequence_bundles: bool = False,
+        prefer_h5_cache: bool = True,
+        include_human_vertices: bool = True,
+        include_keypoint_heatmaps: bool = True,
     ) -> None:
         super().__init__()
         self.clip_length = int(clip_length)
@@ -1112,6 +1529,9 @@ class DualBranchHOIDataset(Dataset):
         self.index_progress_every = max(int(index_progress_every), 0)
         self.index_progress_callback = index_progress_callback
         self.validate_sequence_bundles = bool(validate_sequence_bundles)
+        self.prefer_h5_cache = bool(prefer_h5_cache)
+        self.include_human_vertices = bool(include_human_vertices)
+        self.include_keypoint_heatmaps = bool(include_keypoint_heatmaps)
         self.loaded_from_disk_cache = False
         self.index_cache_path = _build_index_cache_path(
             data_root=data_root,
@@ -1127,6 +1547,8 @@ class DualBranchHOIDataset(Dataset):
             split_sequence_names = _load_sequence_names_from_split_file(split_file, split_key)
         self._cache: "OrderedDict[str, Dict[str, object]]" = OrderedDict()
         self._cache_lock = threading.RLock()
+        self._h5_handles: "OrderedDict[str, h5py.File]" = OrderedDict()
+        self._max_open_h5_handles = max(self.cache_sequences, 2)
         self.sequence_frame_counts: Dict[str, int] = {}
         self.sequence_sample_indices: Dict[str, List[int]] = OrderedDict()
         self.samples: List[Tuple[str, int]] = []
@@ -1253,39 +1675,114 @@ class DualBranchHOIDataset(Dataset):
         except OSError:
             return
 
+    def _close_h5_handle(self, sequence_dir: str) -> None:
+        handle = self._h5_handles.pop(sequence_dir, None)
+        if handle is None:
+            return
+        try:
+            handle.close()
+        except Exception:
+            return
+
+    def _close_all_h5_handles(self) -> None:
+        for sequence_dir in list(self._h5_handles.keys()):
+            self._close_h5_handle(sequence_dir)
+
+    def _load_sequence_h5_metadata(self, sequence_dir: str, cache_path: Path) -> Dict[str, object]:
+        with h5py.File(cache_path, "r") as handle:
+            version = int(handle.attrs.get("cache_version", -1))
+            if version != DUAL_BRANCH_SEQUENCE_H5_CACHE_VERSION:
+                raise ValueError(
+                    f"H5 cache version mismatch for {cache_path}: "
+                    f"{version} != {DUAL_BRANCH_SEQUENCE_H5_CACHE_VERSION}."
+                )
+            human_gaussians = torch.from_numpy(np.asarray(handle["human_gaussians"], dtype=np.float32))
+            object_gaussians = torch.from_numpy(np.asarray(handle["object_gaussians"], dtype=np.float32))
+            num_frames = int(handle.attrs["num_frames"])
+            image_height = int(handle.attrs["image_height"])
+            image_width = int(handle.attrs["image_width"])
+            has_human_vertices = "human_vertices" in handle
+            object_category = str(handle.attrs.get("object_category", "object"))
+        return {
+            "backend": H5_SEQUENCE_BACKEND,
+            "h5_path": str(cache_path),
+            "num_frames": num_frames,
+            "image_height": image_height,
+            "image_width": image_width,
+            "has_human_vertices": bool(has_human_vertices),
+            "human_gaussians": human_gaussians,
+            "object_gaussians": object_gaussians,
+            "sequence_name": Path(sequence_dir).name,
+            "object_category": object_category,
+        }
+
+    def _get_h5_handle(self, sequence_dir: str, h5_path: str) -> h5py.File:
+        with self._cache_lock:
+            handle = self._h5_handles.get(sequence_dir)
+            if handle is not None:
+                self._h5_handles.move_to_end(sequence_dir)
+                return handle
+            handle = h5py.File(h5_path, "r")
+            self._h5_handles[sequence_dir] = handle
+            self._h5_handles.move_to_end(sequence_dir)
+            while len(self._h5_handles) > self._max_open_h5_handles:
+                stale_sequence_dir, stale_handle = self._h5_handles.popitem(last=False)
+                try:
+                    stale_handle.close()
+                except Exception:
+                    pass
+            return handle
+
     def _load_sequence_bundle(self, sequence_dir: str) -> Dict[str, object]:
         with self._cache_lock:
+            cache_path = _build_sequence_h5_cache_path(sequence_dir, processed_subdir=self.processed_subdir)
             if sequence_dir in self._cache:
+                cached_bundle = self._cache[sequence_dir]
+                if (
+                    self.prefer_h5_cache
+                    and cached_bundle.get("backend") != H5_SEQUENCE_BACKEND
+                    and cache_path.is_file()
+                ):
+                    cached_bundle = self._load_sequence_h5_metadata(sequence_dir, cache_path)
+                    self._cache[sequence_dir] = cached_bundle
                 self._cache.move_to_end(sequence_dir)
                 return self._cache[sequence_dir]
             num_frames = int(self.sequence_frame_counts.get(sequence_dir, 0))
-            preload_rgb = (
-                self.cache_rgb
-                and self.cache_sequences > 0
-                and (
-                    self.rgb_cache_max_frames == 0
-                    or (num_frames > 0 and num_frames <= self.rgb_cache_max_frames)
+            if self.prefer_h5_cache and cache_path.is_file():
+                bundle = self._load_sequence_h5_metadata(sequence_dir, cache_path)
+            else:
+                preload_rgb = (
+                    self.cache_rgb
+                    and self.cache_sequences > 0
+                    and (
+                        self.rgb_cache_max_frames == 0
+                        or (num_frames > 0 and num_frames <= self.rgb_cache_max_frames)
+                    )
                 )
-            )
-            bundle = load_dual_branch_sequence_bundle(
-                sequence_dir,
-                processed_subdir=self.processed_subdir,
-                gs_subdir=self.gs_subdir,
-                human_gaussian_source=self.human_gaussian_source,
-                num_human_gaussians=self.num_human_gaussians,
-                num_object_gaussians=self.num_object_gaussians,
-                num_joints=self.num_joints,
-                contact_dim=self.contact_dim,
-                hand_joint_indices=self.hand_joint_indices,
-                require_gaussian_targets=True,
-                preload_rgb=preload_rgb,
-                validate_bundle=self.validate_sequence_bundles,
-            )
+                bundle = load_dual_branch_sequence_bundle(
+                    sequence_dir,
+                    processed_subdir=self.processed_subdir,
+                    gs_subdir=self.gs_subdir,
+                    human_gaussian_source=self.human_gaussian_source,
+                    num_human_gaussians=self.num_human_gaussians,
+                    num_object_gaussians=self.num_object_gaussians,
+                    num_joints=self.num_joints,
+                    contact_dim=self.contact_dim,
+                    hand_joint_indices=self.hand_joint_indices,
+                    require_gaussian_targets=True,
+                    preload_rgb=preload_rgb,
+                    validate_bundle=self.validate_sequence_bundles,
+                    include_human_vertices=self.include_human_vertices,
+                    include_keypoint_heatmaps=False,
+                )
+                bundle["backend"] = LEGACY_SEQUENCE_BACKEND
             if self.cache_sequences > 0:
                 self._cache[sequence_dir] = bundle
                 self._cache.move_to_end(sequence_dir)
                 while len(self._cache) > self.cache_sequences:
-                    self._cache.popitem(last=False)
+                    stale_sequence_dir, stale_bundle = self._cache.popitem(last=False)
+                    if stale_bundle.get("backend") == H5_SEQUENCE_BACKEND:
+                        self._close_h5_handle(stale_sequence_dir)
             return bundle
 
     def get_sample_by_index(
@@ -1307,29 +1804,70 @@ class DualBranchHOIDataset(Dataset):
         if bundle is None:
             bundle = self._load_sequence_bundle(sequence_dir)
         end = start + self.clip_length
-
-        if "rgb_uint8" in bundle:
-            rgb = bundle["rgb_uint8"][start:end].float().div(255.0)
+        if bundle.get("backend") == H5_SEQUENCE_BACKEND:
+            handle = self._get_h5_handle(sequence_dir, str(bundle["h5_path"]))
+            rgb = _load_h5_rgb_clip(handle, start, end)
+            masks_human = _load_h5_map_clip(handle, "masks_human", start, end)
+            masks_object = _load_h5_map_clip(handle, "masks_object", start, end)
+            m_primary = _load_h5_map_clip(handle, "m_primary", start, end)
+            m_secondary = _load_h5_map_clip(handle, "m_secondary", start, end)
+            m_object_region = _load_h5_map_clip(handle, "m_object_region", start, end)
+            depth = _load_h5_map_clip(handle, "depth", start, end)
+            keypoints_2d = _load_h5_tensor_clip(handle, "keypoints_2d", start, end)
+            joints_3d = _load_h5_tensor_clip(handle, "joints_3d", start, end)
+            human_shape_frames = _load_h5_tensor_clip(handle, "human_shape", start, end)
+            body_pose = _load_h5_tensor_clip(handle, "body_pose", start, end)
+            cam_t = _load_h5_tensor_clip(handle, "cam_t", start, end)
+            if self.include_human_vertices and bool(bundle.get("has_human_vertices", False)):
+                human_vertices = _load_h5_tensor_clip(handle, "human_vertices", start, end)
+            else:
+                human_vertices = None
+            object_poses = _load_h5_tensor_clip(handle, "object_poses", start, end)
+            camera_intrinsics = _load_h5_tensor_clip(handle, "intrinsics", start, end)
+            human_gaussians = bundle["human_gaussians"].clone()
+            object_gaussians = bundle["object_gaussians"].clone()
+            contact_signature = _load_h5_tensor_clip(handle, "contact_signature", start, end)
+            keypoint_heatmaps = _build_keypoint_heatmaps(
+                keypoints_2d,
+                height=int(bundle["image_height"]),
+                width=int(bundle["image_width"]),
+            )
         else:
-            rgb = torch.stack([load_rgb_image(str(path)) for path in bundle["rgb_paths"][start:end]], dim=0)
-        masks_human = bundle["masks_human"][start:end].clone()
-        masks_object = bundle["masks_object"][start:end].clone()
-        m_primary = bundle["m_primary"][start:end].clone()
-        m_secondary = bundle["m_secondary"][start:end].clone()
-        m_object_region = bundle["m_object_region"][start:end].clone()
-        depth = bundle["depth"][start:end].clone()
-        keypoints_2d = bundle["keypoints_2d"][start:end].clone()
-        joints_3d = bundle["joints_3d"][start:end].clone()
-        human_vertices = bundle["human_vertices"][start:end].clone() if bundle.get("human_vertices") is not None else None
-        object_poses = bundle["object_poses"][start:end].clone()
-        camera_intrinsics = bundle["intrinsics"][start:end].clone()
-        human_gaussians = bundle["human_gaussians"].clone()
-        object_gaussians = bundle["object_gaussians"].clone()
-        keypoint_heatmaps = bundle["keypoint_heatmaps"][start:end].clone()
-        contact_signature = bundle["contact_signature"][start:end].clone()
+            if "rgb_uint8" in bundle:
+                rgb = bundle["rgb_uint8"][start:end].float().div(255.0)
+            else:
+                rgb = torch.stack([load_rgb_image(str(path)) for path in bundle["rgb_paths"][start:end]], dim=0)
+            masks_human = bundle["masks_human"][start:end].clone()
+            masks_object = bundle["masks_object"][start:end].clone()
+            m_primary = bundle["m_primary"][start:end].clone()
+            m_secondary = bundle["m_secondary"][start:end].clone()
+            m_object_region = bundle["m_object_region"][start:end].clone()
+            depth = bundle["depth"][start:end].clone()
+            keypoints_2d = bundle["keypoints_2d"][start:end].clone()
+            joints_3d = bundle["joints_3d"][start:end].clone()
+            human_shape_frames = bundle["human_shape_frames"][start:end].clone()
+            body_pose = bundle["body_pose"][start:end].clone()
+            cam_t = bundle["cam_t"][start:end].clone()
+            human_vertices = bundle["human_vertices"][start:end].clone() if bundle.get("human_vertices") is not None else None
+            object_poses = bundle["object_poses"][start:end].clone()
+            camera_intrinsics = bundle["intrinsics"][start:end].clone()
+            human_gaussians = bundle["human_gaussians"].clone()
+            object_gaussians = bundle["object_gaussians"].clone()
+            if bundle.get("keypoint_heatmaps") is not None:
+                keypoint_heatmaps = bundle["keypoint_heatmaps"][start:end].clone()
+            else:
+                keypoint_heatmaps = _build_keypoint_heatmaps(
+                    keypoints_2d,
+                    height=depth.shape[-2],
+                    width=depth.shape[-1],
+                )
+            contact_signature = bundle["contact_signature"][start:end].clone()
 
         background = torch.full_like(rgb, self.background_value)
         human_visible = rgb * masks_human + background * (1.0 - masks_human)
+        if human_vertices is None:
+            human_vertices = joints_3d.new_zeros((end - start, 0, 3))
+        human_shape = human_shape_frames.mean(dim=0)
 
         return {
             "rgb": rgb,
@@ -1343,6 +1881,9 @@ class DualBranchHOIDataset(Dataset):
             "keypoints_2d": keypoints_2d,
             "keypoint_heatmaps": keypoint_heatmaps,
             "joints_3d": joints_3d,
+            "human_shape": human_shape,
+            "body_pose": body_pose,
+            "cam_t": cam_t,
             "human_vertices": human_vertices,
             "camera_intrinsics": camera_intrinsics,
             "object_poses": object_poses,
@@ -1350,19 +1891,29 @@ class DualBranchHOIDataset(Dataset):
             "human_gaussians": human_gaussians,
             "object_gaussians": object_gaussians,
             "sequence_name": bundle["sequence_name"],
+            "object_category": str(bundle.get("object_category", "object")),
         }
 
     def __getitem__(self, index: int) -> Dict[str, Tensor]:
         return self.get_sample_by_index(index)
 
+    def __del__(self) -> None:
+        try:
+            self._close_all_h5_handles()
+        except Exception:
+            pass
+
 
 __all__ = [
     "DEFAULT_CONTACT_SIGNATURE_DIM",
     "DEFAULT_KEYPOINT_HEATMAP_SIGMA",
+    "DEFAULT_SEQUENCE_H5_CHUNK_FRAMES",
     "DUAL_BRANCH_TARGET_CACHE_VERSION",
+    "DUAL_BRANCH_SEQUENCE_H5_CACHE_FILENAME",
     "DUAL_BRANCH_TARGETS_FILENAME",
     "DualBranchHOIDataset",
     "SMPL_HUMAN_GAUSSIANS_FILENAME",
+    "build_dual_branch_sequence_h5_cache",
     "build_human_gaussian_raw_tokens_from_smpl_params",
     "build_keypoint_heatmaps",
     "compute_contact_signature",
