@@ -25,6 +25,7 @@ Official implementation for the HDM model of the CVPR24 paper: Template Free Rec
 - [x] Evaluation code. 
 
 ### Updates
+- April 8, 2026. The mainline method spec is now a frozen-Wan-assisted dual-branch design with CoMoVi-style mutual feature interactions and 3D-2D cross-attention. The single source of truth is `design/model_method_reference.md`.
 - June 12, 2024. Add support for using DDIM for inference, the speed is now 10x faster, with minimum affects on performance! 
 
 ## Dependencies
@@ -113,8 +114,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 scripts/train.sh \
 
 All default values now live in `configs/config.yaml` under `dual_branch_fm`.
 
-Older CVPR'24 HDM training code is kept separately in `legacy_hdm_train.py`, and
-the older Step1-Step5 pipeline is kept in `legacy_pipeline.py`.
+Current method note:
+
+- The repository is being aligned to a frozen-Wan-assisted dual-branch method for 4D HOI reconstruction.
+- The intended architecture follows CoMoVi-style mutual feature interactions plus 3D-2D cross-attention while keeping the Wan backbone frozen.
+- The current method specification, including dual Wan amodal inpainting and GT-supervised structured state outputs, is documented in `design/Uni-HOI_method.md`.
+- `scripts/train.sh` will automatically reuse the latest checkpoint in the run directory unless `RESUME_CHECKPOINT` is set explicitly.
 
 ## Evaluation
 #### Pre-trained checkpoints

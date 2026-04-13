@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -507,6 +507,9 @@ class PerFrameVideoStateCrossAdapter(nn.Module):
 
 @dataclass
 class DecodedHOIState:
+    human_shape: Tensor
+    human_pose: Tensor
+    human_translation: Tensor
     human_gaussians: Tensor
     object_gaussians: Tensor
     joints_3d: Tensor
@@ -524,6 +527,8 @@ class HOIStateCodec(nn.Module):
         num_frames: int,
         num_joints: int,
         contact_dim: int = 4,
+        human_shape_dim: int = 10,
+        human_pose_dim: int = 72,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -532,72 +537,104 @@ class HOIStateCodec(nn.Module):
         self.num_frames = int(num_frames)
         self.num_joints = int(num_joints)
         self.contact_dim = int(contact_dim)
-        self.num_joint_tokens = self.num_frames * self.num_joints
+        self.human_shape_dim = int(human_shape_dim)
+        self.human_pose_dim = int(human_pose_dim)
+        self.num_context_tokens = 1
+        self.num_shape_tokens = 1
+        self.num_pose_tokens = self.num_frames
+        self.num_translation_tokens = self.num_frames
         self.num_motion_tokens = self.num_frames
         self.num_contact_tokens = self.num_frames
 
-        self.human_in = nn.Linear(14, hidden_dim)
-        self.object_in = nn.Linear(14, hidden_dim)
-        self.joint_in = nn.Linear(3, hidden_dim)
+        self.shape_in = nn.Linear(self.human_shape_dim, hidden_dim)
+        self.pose_in = nn.Linear(self.human_pose_dim, hidden_dim)
+        self.translation_in = nn.Linear(3, hidden_dim)
         self.motion_in = nn.Linear(9, hidden_dim)
         self.contact_in = nn.Linear(self.contact_dim, hidden_dim)
 
-        self.human_out = nn.Linear(hidden_dim, 14)
-        self.object_out = nn.Linear(hidden_dim, 14)
-        self.joint_out = nn.Linear(hidden_dim, 3)
+        self.shape_out = nn.Linear(hidden_dim, self.human_shape_dim)
+        self.pose_out = nn.Linear(hidden_dim, self.human_pose_dim)
+        self.translation_out = nn.Linear(hidden_dim, 3)
         self.motion_out = nn.Linear(hidden_dim, 9)
         self.contact_out = nn.Linear(hidden_dim, self.contact_dim)
 
-        self.human_pos = nn.Parameter(torch.zeros(self.num_human_gaussians, hidden_dim))
-        self.object_pos = nn.Parameter(torch.zeros(self.num_object_gaussians, hidden_dim))
-        self.joint_pos = nn.Parameter(torch.zeros(self.num_joint_tokens, hidden_dim))
+        self.context_token = nn.Parameter(torch.zeros(self.num_context_tokens, hidden_dim))
+        self.shape_pos = nn.Parameter(torch.zeros(self.num_shape_tokens, hidden_dim))
+        self.pose_pos = nn.Parameter(torch.zeros(self.num_pose_tokens, hidden_dim))
+        self.translation_pos = nn.Parameter(torch.zeros(self.num_translation_tokens, hidden_dim))
         self.motion_pos = nn.Parameter(torch.zeros(self.num_motion_tokens, hidden_dim))
         self.contact_pos = nn.Parameter(torch.zeros(self.num_contact_tokens, hidden_dim))
+        self.human_aux_query = nn.Parameter(torch.zeros(self.num_human_gaussians, hidden_dim))
+        self.object_aux_query = nn.Parameter(torch.zeros(self.num_object_gaussians, hidden_dim))
+        self.joint_aux_query = nn.Parameter(torch.zeros(self.num_joints, hidden_dim))
         self.frame_embedding = nn.Parameter(torch.zeros(self.num_frames, hidden_dim))
-        self.joint_embedding = nn.Parameter(torch.zeros(self.num_joints, hidden_dim))
-        self.type_embedding = nn.Parameter(torch.zeros(5, hidden_dim))
-        nn.init.normal_(self.human_pos, std=0.02)
-        nn.init.normal_(self.object_pos, std=0.02)
-        nn.init.normal_(self.joint_pos, std=0.02)
+        self.type_embedding = nn.Parameter(torch.zeros(6, hidden_dim))
+
+        def make_aux_head(out_dim: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, out_dim),
+            )
+
+        self.human_gaussian_out = make_aux_head(14)
+        self.object_gaussian_out = make_aux_head(14)
+        self.joint_aux_out = make_aux_head(3)
+
+        nn.init.normal_(self.context_token, std=0.02)
+        nn.init.normal_(self.shape_pos, std=0.02)
+        nn.init.normal_(self.pose_pos, std=0.02)
+        nn.init.normal_(self.translation_pos, std=0.02)
         nn.init.normal_(self.motion_pos, std=0.02)
         nn.init.normal_(self.contact_pos, std=0.02)
+        nn.init.normal_(self.human_aux_query, std=0.02)
+        nn.init.normal_(self.object_aux_query, std=0.02)
+        nn.init.normal_(self.joint_aux_query, std=0.02)
         nn.init.normal_(self.frame_embedding, std=0.02)
-        nn.init.normal_(self.joint_embedding, std=0.02)
         nn.init.normal_(self.type_embedding, std=0.02)
 
     @property
     def total_tokens(self) -> int:
         return (
-            self.num_human_gaussians
-            + self.num_object_gaussians
-            + self.num_joint_tokens
+            self.num_context_tokens
+            + self.num_shape_tokens
+            + self.num_pose_tokens
+            + self.num_translation_tokens
             + self.num_motion_tokens
             + self.num_contact_tokens
         )
 
     @property
     def num_global_tokens(self) -> int:
-        return self.num_human_gaussians + self.num_object_gaussians
+        return self.num_context_tokens + self.num_shape_tokens
 
     @property
     def num_dynamic_tokens(self) -> int:
         return self.total_tokens - self.num_global_tokens
 
+    @property
+    def num_joint_tokens(self) -> int:
+        return self.num_frames * self.num_joints
+
     def _split(self, tokens: Tensor) -> Dict[str, Tensor]:
         offset = 0
-        human = tokens[:, offset : offset + self.num_human_gaussians]
-        offset += self.num_human_gaussians
-        obj = tokens[:, offset : offset + self.num_object_gaussians]
-        offset += self.num_object_gaussians
-        joints = tokens[:, offset : offset + self.num_joint_tokens]
-        offset += self.num_joint_tokens
+        context = tokens[:, offset : offset + self.num_context_tokens]
+        offset += self.num_context_tokens
+        shape = tokens[:, offset : offset + self.num_shape_tokens]
+        offset += self.num_shape_tokens
+        pose = tokens[:, offset : offset + self.num_pose_tokens]
+        offset += self.num_pose_tokens
+        translation = tokens[:, offset : offset + self.num_translation_tokens]
+        offset += self.num_translation_tokens
         motion = tokens[:, offset : offset + self.num_motion_tokens]
         offset += self.num_motion_tokens
         contact = tokens[:, offset : offset + self.num_contact_tokens]
         return {
-            "human": human,
-            "object": obj,
-            "joints": joints,
+            "context": context,
+            "shape": shape,
+            "pose": pose,
+            "translation": translation,
             "motion": motion,
             "contact": contact,
         }
@@ -605,23 +642,26 @@ class HOIStateCodec(nn.Module):
     def encode_targets(
         self,
         *,
-        human_gaussians: Tensor,
-        object_gaussians: Tensor,
-        joints_3d: Tensor,
+        human_shape: Tensor,
+        human_pose: Tensor,
+        human_translation: Tensor,
         object_transforms: Tensor,
         contact_signature: Tensor,
+        human_gaussians: Optional[Tensor] = None,
+        object_gaussians: Optional[Tensor] = None,
+        joints_3d: Optional[Tensor] = None,
     ) -> Tensor:
-        if human_gaussians.shape[1] != self.num_human_gaussians:
+        if human_shape.ndim != 2 or human_shape.shape[-1] != self.human_shape_dim:
             raise ValueError(
-                f"Expected {self.num_human_gaussians} human Gaussian tokens, got {human_gaussians.shape[1]}."
+                f"Expected human shape [B, {self.human_shape_dim}], got {tuple(human_shape.shape)}."
             )
-        if object_gaussians.shape[1] != self.num_object_gaussians:
+        if human_pose.shape[1:] != (self.num_frames, self.human_pose_dim):
             raise ValueError(
-                f"Expected {self.num_object_gaussians} object Gaussian tokens, got {object_gaussians.shape[1]}."
+                f"Expected human pose [B, {self.num_frames}, {self.human_pose_dim}], got {tuple(human_pose.shape)}."
             )
-        if joints_3d.shape[1:3] != (self.num_frames, self.num_joints):
+        if human_translation.shape[1:] != (self.num_frames, 3):
             raise ValueError(
-                f"Expected joints shape [B, {self.num_frames}, {self.num_joints}, 3], got {tuple(joints_3d.shape)}."
+                f"Expected human translation [B, {self.num_frames}, 3], got {tuple(human_translation.shape)}."
             )
         if object_transforms.shape[1] != self.num_frames:
             raise ValueError(
@@ -632,46 +672,71 @@ class HOIStateCodec(nn.Module):
                 f"Expected contact shape [B, {self.num_frames}, {self.contact_dim}], got {tuple(contact_signature.shape)}."
             )
 
-        batch_size = human_gaussians.shape[0]
-        joints_flat = joints_3d.reshape(batch_size, self.num_joint_tokens, 3)
+        batch_size = human_shape.shape[0]
         motion_flat = _flatten_object_transforms(object_transforms)
-
-        joint_frame_bias = self.frame_embedding.unsqueeze(1).expand(self.num_frames, self.num_joints, self.hidden_dim)
-        joint_frame_bias = joint_frame_bias.reshape(self.num_joint_tokens, self.hidden_dim)
-        joint_joint_bias = self.joint_embedding.unsqueeze(0).expand(self.num_frames, self.num_joints, self.hidden_dim)
-        joint_joint_bias = joint_joint_bias.reshape(self.num_joint_tokens, self.hidden_dim)
-
-        human_tokens = self.human_in(human_gaussians) + self.human_pos.unsqueeze(0) + self.type_embedding[0]
-        object_tokens = self.object_in(object_gaussians) + self.object_pos.unsqueeze(0) + self.type_embedding[1]
-        joint_tokens = (
-            self.joint_in(joints_flat)
-            + self.joint_pos.unsqueeze(0)
-            + joint_frame_bias.unsqueeze(0)
-            + joint_joint_bias.unsqueeze(0)
+        context_tokens = self.context_token.unsqueeze(0).expand(batch_size, -1, -1) + self.type_embedding[0]
+        shape_tokens = self.shape_in(human_shape).unsqueeze(1) + self.shape_pos.unsqueeze(0) + self.type_embedding[1]
+        pose_tokens = (
+            self.pose_in(human_pose)
+            + self.pose_pos.unsqueeze(0)
+            + self.frame_embedding.unsqueeze(0)
             + self.type_embedding[2]
+        )
+        translation_tokens = (
+            self.translation_in(human_translation)
+            + self.translation_pos.unsqueeze(0)
+            + self.frame_embedding.unsqueeze(0)
+            + self.type_embedding[3]
         )
         motion_tokens = (
             self.motion_in(motion_flat)
             + self.motion_pos.unsqueeze(0)
             + self.frame_embedding.unsqueeze(0)
-            + self.type_embedding[3]
+            + self.type_embedding[4]
         )
         contact_tokens = (
             self.contact_in(contact_signature)
             + self.contact_pos.unsqueeze(0)
             + self.frame_embedding.unsqueeze(0)
-            + self.type_embedding[4]
+            + self.type_embedding[5]
         )
-        return torch.cat([human_tokens, object_tokens, joint_tokens, motion_tokens, contact_tokens], dim=1)
+        return torch.cat(
+            [context_tokens, shape_tokens, pose_tokens, translation_tokens, motion_tokens, contact_tokens],
+            dim=1,
+        )
 
     def decode_tokens(self, tokens: Tensor) -> DecodedHOIState:
         chunks = self._split(tokens)
-        joints = self.joint_out(chunks["joints"]).view(tokens.shape[0], self.num_frames, self.num_joints, 3)
-        object_motion = _unflatten_object_transforms(self.motion_out(chunks["motion"]))
-        contact = self.contact_out(chunks["contact"])
+        context_tokens = chunks["context"]
+        shape_tokens = chunks["shape"]
+        pose_tokens = chunks["pose"]
+        translation_tokens = chunks["translation"]
+        motion_tokens = chunks["motion"]
+        contact_tokens = chunks["contact"]
+
+        human_shape = self.shape_out(shape_tokens.squeeze(1))
+        human_pose = self.pose_out(pose_tokens)
+        human_translation = self.translation_out(translation_tokens)
+        object_motion = _unflatten_object_transforms(self.motion_out(motion_tokens))
+        contact = self.contact_out(contact_tokens)
+
+        global_context = context_tokens + shape_tokens
+        human_aux = self.human_aux_query.unsqueeze(0) + global_context
+        object_aux = self.object_aux_query.unsqueeze(0) + global_context + motion_tokens.mean(dim=1, keepdim=True)
+        joint_aux = (
+            self.joint_aux_query.unsqueeze(0).unsqueeze(0)
+            + pose_tokens.unsqueeze(2)
+            + translation_tokens.unsqueeze(2)
+            + global_context.unsqueeze(1)
+        )
+        joints = self.joint_aux_out(joint_aux) + human_translation.unsqueeze(2)
+
         return DecodedHOIState(
-            human_gaussians=_apply_gaussian_activation(self.human_out(chunks["human"])),
-            object_gaussians=_apply_gaussian_activation(self.object_out(chunks["object"])),
+            human_shape=human_shape,
+            human_pose=human_pose,
+            human_translation=human_translation,
+            human_gaussians=_apply_gaussian_activation(self.human_gaussian_out(human_aux)),
+            object_gaussians=_apply_gaussian_activation(self.object_gaussian_out(object_aux)),
             joints_3d=joints,
             object_transforms=object_motion,
             contact_signature=contact,
@@ -691,8 +756,8 @@ class GeometryProjector(nn.Module):
         image_height: int,
         image_width: int,
         patch_size: int,
-        joint_sigma: float = 1.5,
-        object_sigma: float = 1.2,
+        joint_sigma: Optional[float] = None,
+        object_sigma: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.image_height = int(image_height)
@@ -700,8 +765,14 @@ class GeometryProjector(nn.Module):
         self.patch_size = int(patch_size)
         self.token_h = self.image_height // self.patch_size
         self.token_w = self.image_width // self.patch_size
-        self.joint_sigma = float(joint_sigma)
-        self.object_sigma = float(object_sigma)
+        # Match the dataset supervision after patchification instead of using
+        # token-space sigmas that are too wide and wash out silhouettes.
+        if joint_sigma is None:
+            joint_sigma = 6.0 / float(self.patch_size)
+        if object_sigma is None:
+            object_sigma = 2.0 / float(self.patch_size)
+        self.joint_sigma = max(float(joint_sigma), 1e-3)
+        self.object_sigma = max(float(object_sigma), 1e-3)
 
     def _scale_intrinsics_to_token_grid(self, intrinsics: Tensor) -> Tensor:
         scaled = intrinsics.clone()
@@ -760,6 +831,7 @@ class GeometryProjector(nn.Module):
                 self.token_w,
                 sigma=self.object_sigma,
             )
+            object_occ = 1.0 - torch.exp(-object_heat.clamp(min=0.0))
             object_depth_map = _make_heatmap(
                 object_coords,
                 object_depth.unsqueeze(-1) * object_opacity,
@@ -781,7 +853,7 @@ class GeometryProjector(nn.Module):
 
             object_center = object_coords.mean(dim=1)
             joints_maps.append(torch.cat([joint_heat, joint_depth_map], dim=1))
-            object_silhouettes.append(object_heat)
+            object_silhouettes.append(object_occ)
             object_depth_maps.append(object_depth_norm)
             contact_maps.append(contact_heat)
             object_center_coords.append(object_center)
@@ -950,19 +1022,25 @@ class DualBranchFusionBlock(nn.Module):
         global_video_context: Tensor,
         dynamic_video_context: Tensor,
         state_codec: HOIStateCodec,
+        cross_branch_scale: Optional[float] = None,
+        state_to_video_scale: float = 1.0,
+        video_to_state_scale: float = 1.0,
     ) -> Tuple[Tensor, Tensor]:
+        if cross_branch_scale is not None:
+            state_to_video_scale = float(cross_branch_scale)
+            video_to_state_scale = float(cross_branch_scale)
         video_tokens = self.video_block(video_tokens)
         state_tokens = self.state_block(state_tokens)
 
         video_tokens = video_tokens + self.video_from_condition(video_tokens, condition_tokens)
-        video_tokens = video_tokens + self.video_from_geometry(video_tokens, geometry_tokens)
-        video_tokens = video_tokens + self.video_from_state(video_tokens, state_tokens)
+        video_tokens = video_tokens + float(state_to_video_scale) * self.video_from_geometry(video_tokens, geometry_tokens)
+        video_tokens = video_tokens + float(state_to_video_scale) * self.video_from_state(video_tokens, state_tokens)
 
         global_tokens, dynamic_tokens = state_codec.split_global_dynamic(state_tokens)
-        global_tokens = global_tokens + self.global_gate(global_tokens) * global_video_context
-        dynamic_tokens = dynamic_tokens + self.dynamic_gate(dynamic_tokens) * dynamic_video_context
+        global_tokens = global_tokens + float(video_to_state_scale) * self.global_gate(global_tokens) * global_video_context
+        dynamic_tokens = dynamic_tokens + float(video_to_state_scale) * self.dynamic_gate(dynamic_tokens) * dynamic_video_context
         state_tokens = state_codec.merge_global_dynamic(global_tokens, dynamic_tokens)
-        state_tokens = state_tokens + self.state_from_video(state_tokens, video_tokens)
+        state_tokens = state_tokens + float(video_to_state_scale) * self.state_from_video(state_tokens, video_tokens)
         return video_tokens, state_tokens
 
 
@@ -972,9 +1050,14 @@ class DualBranchFMOutput:
     state_velocity: Tensor
     geometry_maps: Tensor
     decoded_state: DecodedHOIState
+    human_video_velocity: Optional[Tensor] = None
+    object_video_velocity: Optional[Tensor] = None
 
 
 class DualBranchCoGenerativeFlowMatching(nn.Module):
+    video_backend = "legacy_codec"
+    video_output_mode = "split_human_object"
+
     def __init__(
         self,
         *,
@@ -993,6 +1076,8 @@ class DualBranchCoGenerativeFlowMatching(nn.Module):
         num_object_gaussians: int,
         num_joints: int,
         contact_dim: int = 4,
+        human_shape_dim: int = 10,
+        human_pose_dim: int = 72,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -1025,6 +1110,8 @@ class DualBranchCoGenerativeFlowMatching(nn.Module):
             num_frames=num_frames,
             num_joints=num_joints,
             contact_dim=contact_dim,
+            human_shape_dim=human_shape_dim,
+            human_pose_dim=human_pose_dim,
         )
         self.geometry_projector = GeometryProjector(
             image_height=image_height,
@@ -1083,18 +1170,24 @@ class DualBranchCoGenerativeFlowMatching(nn.Module):
     def encode_state_target(
         self,
         *,
-        human_gaussians: Tensor,
-        object_gaussians: Tensor,
-        joints_3d: Tensor,
+        human_shape: Tensor,
+        human_pose: Tensor,
+        human_translation: Tensor,
         object_transforms: Tensor,
         contact_signature: Tensor,
+        human_gaussians: Optional[Tensor] = None,
+        object_gaussians: Optional[Tensor] = None,
+        joints_3d: Optional[Tensor] = None,
     ) -> Tensor:
         return self.state_codec.encode_targets(
+            human_shape=human_shape,
+            human_pose=human_pose,
+            human_translation=human_translation,
+            object_transforms=object_transforms,
+            contact_signature=contact_signature,
             human_gaussians=human_gaussians,
             object_gaussians=object_gaussians,
             joints_3d=joints_3d,
-            object_transforms=object_transforms,
-            contact_signature=contact_signature,
         )
 
     def decode_state_tokens(self, state_tokens: Tensor) -> DecodedHOIState:
@@ -1111,6 +1204,11 @@ class DualBranchCoGenerativeFlowMatching(nn.Module):
         timesteps: Tensor,
         condition_video: Tensor,
         camera_intrinsics: Tensor,
+        sequence_names: Optional[Sequence[str]] = None,
+        object_categories: Optional[Sequence[str]] = None,
+        cross_branch_scale: Optional[float] = None,
+        state_to_video_scale: float = 1.0,
+        video_to_state_scale: float = 1.0,
     ) -> DualBranchFMOutput:
         if video_xt.ndim != 3:
             raise ValueError(f"`video_xt` must have shape [B, L_v, D], got {tuple(video_xt.shape)}.")
@@ -1144,6 +1242,9 @@ class DualBranchCoGenerativeFlowMatching(nn.Module):
                 global_video_context=global_context,
                 dynamic_video_context=dynamic_context,
                 state_codec=self.state_codec,
+                cross_branch_scale=cross_branch_scale,
+                state_to_video_scale=float(state_to_video_scale),
+                video_to_state_scale=float(video_to_state_scale),
             )
             decoded_state = self.decode_state_tokens(state_tokens)
             geometry_aux = self.project_geometry(decoded_state, camera_intrinsics)

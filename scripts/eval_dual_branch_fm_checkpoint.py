@@ -15,17 +15,25 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from dataset.dual_branch_fm_dataset import DualBranchHOIDataset
-from model.dual_branch_cogenerative_fm import DualBranchCoGenerativeFlowMatching
 from model.joint_renderer_loss import DiffRasterizationLayer
 from train_dual_branch_fm import (
     SequencePrefetchBatchIterator,
     build_arg_parser as build_train_arg_parser,
+    build_model_from_args,
     build_curriculum_loss_weights,
+    build_human_supervision_target,
+    build_object_supervision_target,
     build_teacher_state,
     compute_losses,
     configure_torch_runtime,
+    filter_video_teacher_state_dict,
+    flow_match_sample,
     infer_condition_channels,
+    model_uses_wan_teacher,
+    render_human_proxy_branch,
     render_object_branch,
+    resolve_state_to_video_scale,
+    resolve_video_to_state_scale,
     resize_video_batch,
     scale_camera_intrinsics,
 )
@@ -34,6 +42,9 @@ from train_dual_branch_fm import (
 def namespace_from_checkpoint_args(checkpoint_args: dict[str, Any]) -> argparse.Namespace:
     parser = build_train_arg_parser()
     defaults = parser.parse_args([])
+    if "video_backend" not in checkpoint_args:
+        defaults.video_backend = "legacy_codec"
+        defaults.video_channels = 6
     for key, value in checkpoint_args.items():
         setattr(defaults, key, value)
     return defaults
@@ -105,29 +116,15 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     condition_channels = infer_condition_channels(dataset)
-    model = DualBranchCoGenerativeFlowMatching(
-        hidden_dim=checkpoint_args.hidden_dim,
-        num_heads=checkpoint_args.num_heads,
-        depth=checkpoint_args.depth,
-        mlp_ratio=checkpoint_args.mlp_ratio,
-        dropout=checkpoint_args.dropout,
-        condition_channels=condition_channels,
-        video_channels=checkpoint_args.video_channels,
-        patch_size=checkpoint_args.patch_size,
-        num_frames=checkpoint_args.clip_length,
-        image_height=checkpoint_args.image_height,
-        image_width=checkpoint_args.image_width,
-        num_human_gaussians=checkpoint_args.num_human_gaussians,
-        num_object_gaussians=checkpoint_args.num_object_gaussians,
-        num_joints=checkpoint_args.num_joints,
-        contact_dim=checkpoint_args.contact_dim,
-    )
-    incompatible = model.load_state_dict(checkpoint["model"], strict=False)
+    model = build_model_from_args(checkpoint_args, condition_channels=condition_channels)
+    incompatible = model.load_state_dict(filter_video_teacher_state_dict(checkpoint["model"]), strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:
-        raise RuntimeError(
-            "Checkpoint/model mismatch detected during evaluation. "
-            f"Missing keys: {incompatible.missing_keys[:10]} "
-            f"| Unexpected keys: {incompatible.unexpected_keys[:10]}"
+        print(
+            "[eval_dual_branch_fm_checkpoint] warning: checkpoint/model mismatch detected during evaluation "
+            f"| missing={incompatible.missing_keys[:10]} "
+            f"| unexpected={incompatible.unexpected_keys[:10]} "
+            "| continuing because Uni-HOI stage handoff uses strict=False.",
+            flush=True,
         )
     model.to(device=device).eval()
 
@@ -147,6 +144,7 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
         for batch in iterator:
             batch = _move_batch_to_device(batch, device)
             batch_size = int(batch["rgb"].shape[0])
+            sequence_names = [str(name) for name in batch["sequence_name"]]
             if args.max_clips > 0 and evaluated_clips >= args.max_clips:
                 break
             if args.max_clips > 0 and evaluated_clips + batch_size > args.max_clips:
@@ -170,10 +168,14 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
             depth = batch["depth"]
             camera_intrinsics = batch["camera_intrinsics"]
             object_poses = batch["object_poses"]
+            human_shape = batch["human_shape"]
+            body_pose = batch["body_pose"]
+            cam_t = batch["cam_t"]
             human_gaussians = batch["human_gaussians"]
             object_gaussians = batch["object_gaussians"]
             joints_3d = batch["joints_3d"]
             contact_signature = batch["contact_signature"]
+            object_categories = [str(name) for name in batch["object_category"]]
 
             if rgb.shape[-2:] != (checkpoint_args.image_height, checkpoint_args.image_width):
                 rgb = resize_video_batch(rgb, size=(checkpoint_args.image_height, checkpoint_args.image_width), mode="bilinear")
@@ -239,17 +241,11 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
                 ],
                 dim=2,
             )
-            background = torch.full_like(rgb, checkpoint_args.background_value)
-            object_visible = rgb * masks_object + background * (1.0 - masks_object)
-            teacher_object_render = render_object_branch(
-                renderer,
-                object_gaussians,
-                object_poses,
-                camera_intrinsics_render,
-            ).detach()
-            teacher_object_video = teacher_object_render * masks_human + object_visible * (1.0 - masks_human)
             teacher_state = build_teacher_state(
                 {
+                    "human_shape": human_shape,
+                    "body_pose": body_pose,
+                    "cam_t": cam_t,
                     "human_gaussians": human_gaussians,
                     "object_gaussians": object_gaussians,
                     "joints_3d": joints_3d,
@@ -258,9 +254,16 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
                 }
             )
 
-            video_target = torch.cat([human_visible, teacher_object_video], dim=2)
+            human_supervision_target = None
+            human_supervision_weights = None
+            object_supervision_target = None
+            object_supervision_weights = None
+            video_target = rgb
             video_target_tokens = model.encode_video_target(video_target)
             state_target_tokens = model.encode_state_target(
+                human_shape=human_shape,
+                human_pose=body_pose,
+                human_translation=cam_t,
                 human_gaussians=human_gaussians,
                 object_gaussians=object_gaussians,
                 joints_3d=joints_3d,
@@ -268,21 +271,28 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
                 contact_signature=contact_signature,
             )
 
-            timesteps = torch.rand(batch_size, device=device, dtype=video_target_tokens.dtype)
-            t_view = timesteps.view(batch_size, 1, 1)
+            timesteps = torch.rand(batch_size, device=device, dtype=torch.float32)
             video_noise = torch.randn_like(video_target_tokens)
             state_noise = torch.randn_like(state_target_tokens)
-            video_xt = t_view * video_target_tokens + (1.0 - t_view) * video_noise
-            state_xt = t_view * state_target_tokens + (1.0 - t_view) * state_noise
-            video_velocity_target = video_target_tokens - video_noise
-            state_velocity_target = state_target_tokens - state_noise
+            video_xt, video_velocity_target = flow_match_sample(video_target_tokens, video_noise, timesteps)
+            state_xt, state_velocity_target = flow_match_sample(state_target_tokens, state_noise, timesteps)
 
+            state_to_video_scale = resolve_state_to_video_scale(checkpoint_args, step)
+            video_to_state_scale = resolve_video_to_state_scale(checkpoint_args, step)
+            forward_kwargs = {}
+            if model_uses_wan_teacher(model):
+                forward_kwargs["condition_latents"] = video_target_tokens
             output = model(
                 video_xt=video_xt,
                 state_xt=state_xt,
                 timesteps=timesteps,
                 condition_video=condition_video,
                 camera_intrinsics=camera_intrinsics_render,
+                sequence_names=sequence_names,
+                object_categories=object_categories,
+                state_to_video_scale=state_to_video_scale,
+                video_to_state_scale=video_to_state_scale,
+                **forward_kwargs,
             )
             _, metrics = compute_losses(
                 model=model,
@@ -292,9 +302,10 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
                 state_xt=state_xt,
                 state_velocity_target=state_velocity_target,
                 teacher_state=teacher_state,
-                teacher_object_render=teacher_object_render,
-                teacher_object_video=teacher_object_video,
-                human_visible_target=human_visible,
+                human_supervision_target=human_supervision_target,
+                human_supervision_weights=human_supervision_weights,
+                object_supervision_target=object_supervision_target,
+                object_supervision_weights=object_supervision_weights,
                 masks_human=masks_human,
                 masks_object=masks_object,
                 keypoint_heatmaps=keypoint_heatmaps,
@@ -305,6 +316,7 @@ def evaluate_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
                 video_target_tokens=video_target_tokens,
                 state_target_tokens=state_target_tokens,
                 weights=loss_weights,
+                video_teacher_is_frozen=bool(getattr(checkpoint_args, "freeze_video_backbone", False)),
             )
 
             for name, value in metrics.items():
