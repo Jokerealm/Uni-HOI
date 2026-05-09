@@ -189,6 +189,7 @@ bbox_expand: 1.1
 
 wandb:
   enabled: true
+  entity: jokerealm-peking-university
   project: uni-hoi-4d
   vis_interval: 500
 
@@ -203,9 +204,10 @@ dual_branch_fm:
   python_bin: /data3/guanz/miniforge3/envs/cari4d/bin/python
 
   runtime:
-    run_name: procigen_dual_branch_fm
+    run_name: procigen_cari4d_supervised_state
     output_root: outputs
-    project_name: dual-branch-fm
+    project_name: uni-hoi-4d
+    wandb_entity: jokerealm-peking-university
     log_with: wandb
     mixed_precision: "bf16"
     seed: 42
@@ -230,7 +232,7 @@ dual_branch_fm:
     status_dir: ""
 
   train:
-    project_name: "FM"
+    project_name: uni-hoi-4d
     output_dir: ""
     data_root: ""
     processed_subdir: ""
@@ -240,6 +242,7 @@ dual_branch_fm:
     human_gaussian_source: smpl_mesh
     seed: 42
     log_with: wandb
+    wandb_required: true
     mixed_precision: "bf16"
     resume_checkpoint: ""
     init_checkpoint: ""
@@ -249,6 +252,9 @@ dual_branch_fm:
     max_steps: 150000
     save_every: 1000
     log_every: 50
+    train_visual_every: 500
+    train_visual_max_frames: 8
+    train_visual_max_points: 2048
     print_every: 5000
     gradient_accumulation_steps: 1
     max_grad_norm: 1.0
@@ -287,23 +293,25 @@ dual_branch_fm:
     contact_dim: 4
     human_shape_dim: 10
     human_pose_dim: 72
-    loss_preset: stage1
+    state_target_mode: absolute
+    residual_init_noise_std: 0.0
+    loss_preset: cari4d_supervised
     lambda_fm: 1.0
     lambda_geo_joint_heat: 1.0
     lambda_geo_object_silhouette: 0.5
     lambda_geo_depth: 1.0
-    lambda_reg_pose: 1.0
-    lambda_reg_shape: 0.25
-    lambda_reg_translation: 1.0
-    lambda_reg_object_pose: 1.0
-    lambda_reg_contact: 0.25
-    lambda_depth: 1.0
-    lambda_temp_object: 0.1
-    lambda_temp_contact: 0.1
-    lambda_phys_contact: 0.05
-    lambda_phys_penetration: 0.05
+    lambda_reg_pose: 0.5
+    lambda_reg_shape: 0.1
+    lambda_reg_translation: 0.5
+    lambda_reg_object_pose: 0.5
+    lambda_reg_contact: 0.1
+    lambda_depth: 0.5
+    lambda_temp_object: 0.02
+    lambda_temp_contact: 0.02
+    lambda_phys_contact: 0.01
+    lambda_phys_penetration: 0.01
     lambda_video_fm: 0.0
-    lambda_state_fm: 0.0
+    lambda_state_fm: 1.0
     lambda_video_latent: 0.0
     lambda_state_latent: 0.0
     lambda_human_visible: 0.0
