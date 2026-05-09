@@ -471,6 +471,8 @@ def main() -> None:
         print(
             "[train_cointeract_hoi] starting "
             f"| data_root={args.data_root} | max_steps={args.max_steps} "
+            f"| per_gpu_batch={args.batch_size} "
+            f"| global_batch={args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps} "
             f"| wan={args.wan_model_id} | input=image_only",
             flush=True,
         )
@@ -517,7 +519,7 @@ def main() -> None:
 
     optimizer = AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = build_scheduler(optimizer, warmup_steps=args.warmup_steps, total_steps=args.max_steps)
-    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
     raw_model: CoInteractHOI4DModel = accelerator.unwrap_model(model)
     global_step = 0

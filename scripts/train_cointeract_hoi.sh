@@ -18,13 +18,14 @@ TRAIN_ARGS=(
   --clip_stride "${CLIP_STRIDE:-8}" \
   --max_steps "${MAX_STEPS:-7000}" \
   --batch_size "${BATCH_SIZE:-1}" \
+  --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-1}" \
   --lr "${LR:-2e-4}" \
   --mixed_precision "${MIXED_PRECISION}" \
   --log_with "${LOG_WITH:-none}" \
   --project_name "${WANDB_PROJECT:-uni-hoi-4d}" \
   --run_name "${RUN_NAME:-cointeract_rgb_to_hoi_wan_ti2v}" \
   --train_visual_every "${TRAIN_VISUAL_EVERY:-500}" \
-  --num_workers "${NUM_WORKERS:-2}" \
+  --num_workers "${NUM_WORKERS:-8}" \
   "$@"
 )
 
