@@ -7,7 +7,7 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -166,6 +166,118 @@ def compute_state_losses(
     return losses
 
 
+def _to_wandb_image_grid(frames: Tensor, *, max_frames: int, normalize: bool = False):
+    frames = frames.detach().float().cpu()
+    if frames.ndim == 3:
+        frames = frames[:, None]
+    if frames.ndim != 4:
+        raise ValueError(f"Expected frames with shape [T, C, H, W], got {tuple(frames.shape)}.")
+    frames = frames[:max_frames]
+    if frames.shape[1] == 1:
+        frames = frames.repeat(1, 3, 1, 1)
+    elif frames.shape[1] > 3:
+        frames = frames[:, :3]
+    if normalize:
+        flat = frames.flatten(1)
+        vmin = flat.min(dim=1).values.view(-1, 1, 1, 1)
+        vmax = flat.max(dim=1).values.view(-1, 1, 1, 1)
+        frames = (frames - vmin) / (vmax - vmin).clamp_min(1e-6)
+    frames = frames.clamp(0.0, 1.0)
+    try:
+        from torchvision.utils import make_grid
+
+        grid = make_grid(frames, nrow=min(int(frames.shape[0]), 4), padding=2)
+    except Exception:
+        rows: List[Tensor] = []
+        for start in range(0, int(frames.shape[0]), 4):
+            row = torch.cat(list(frames[start : start + 4]), dim=-1)
+            rows.append(row)
+        width = max(row.shape[-1] for row in rows)
+        padded_rows = [F.pad(row, (0, width - row.shape[-1], 0, 0)) for row in rows]
+        grid = torch.cat(padded_rows, dim=-2)
+    image = (grid.permute(1, 2, 0).numpy() * 255.0).round().astype("uint8")
+    import wandb
+
+    return wandb.Image(image)
+
+
+def _gaussians_to_wandb_object3d(gaussians: Tensor, *, max_points: int):
+    points = gaussians.detach().float().cpu()
+    if points.ndim == 3:
+        points = points.reshape(-1, points.shape[-1])
+    if points.numel() == 0:
+        return None
+    if points.shape[-1] < 3:
+        return None
+    if points.shape[0] > max_points:
+        indices = torch.linspace(0, points.shape[0] - 1, max_points).long()
+        points = points.index_select(0, indices)
+    xyz = points[:, :3]
+    if points.shape[-1] >= 14:
+        rgb = points[:, 11:14]
+    elif points.shape[-1] >= 6:
+        rgb = points[:, 3:6]
+    else:
+        rgb = torch.full_like(xyz, 0.65)
+    rgb = rgb.clamp(0.0, 1.0)
+    cloud = torch.cat([xyz, (rgb * 255.0).round()], dim=-1).numpy()
+    import wandb
+
+    return wandb.Object3D(cloud)
+
+
+def log_wandb_visuals(
+    *,
+    batch: Dict[str, object],
+    decoded: DecodedHOIState,
+    step: int,
+    args: argparse.Namespace,
+) -> None:
+    if args.log_with != "wandb" or args.train_visual_every <= 0:
+        return
+    try:
+        import wandb
+    except Exception as exc:
+        print(f"[train_cointeract_hoi] wandb visual skipped: {exc}", flush=True)
+        return
+    if wandb.run is None:
+        return
+
+    sample_index = 0
+    max_frames = int(args.train_visual_max_frames)
+    max_points = int(args.train_visual_max_points)
+    payload = {
+        "train_visual/rgb": _to_wandb_image_grid(batch["rgb"][sample_index], max_frames=max_frames),
+        "train_visual/human_mask": _to_wandb_image_grid(batch["masks_human"][sample_index], max_frames=max_frames),
+        "train_visual/object_mask": _to_wandb_image_grid(batch["masks_object"][sample_index], max_frames=max_frames),
+        "train_visual/depth": _to_wandb_image_grid(
+            batch["depth"][sample_index],
+            max_frames=max_frames,
+            normalize=True,
+        ),
+    }
+    object3d_items = {
+        "train_visual/pred_human_gaussians": _gaussians_to_wandb_object3d(
+            decoded.human_gaussians[sample_index],
+            max_points=max_points,
+        ),
+        "train_visual/gt_human_gaussians": _gaussians_to_wandb_object3d(
+            batch["human_gaussians"][sample_index],
+            max_points=max_points,
+        ),
+        "train_visual/pred_object_gaussians": _gaussians_to_wandb_object3d(
+            decoded.object_gaussians[sample_index],
+            max_points=max_points,
+        ),
+        "train_visual/gt_object_gaussians": _gaussians_to_wandb_object3d(
+            batch["object_gaussians"][sample_index],
+            max_points=max_points,
+        ),
+    }
+    payload.update({key: value for key, value in object3d_items.items() if value is not None})
+    wandb.log(payload, step=step)
+
+
 def checkpoint_state_dict(model: CoInteractHOI4DModel) -> Dict[str, Tensor]:
     return {
         key: value.detach().cpu()
@@ -261,6 +373,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_steps", type=int, default=7000)
     parser.add_argument("--save_every", type=int, default=1000)
     parser.add_argument("--log_every", type=int, default=20)
+    parser.add_argument("--train_visual_every", type=int, default=500)
+    parser.add_argument("--train_visual_max_frames", type=int, default=8)
+    parser.add_argument("--train_visual_max_points", type=int, default=4096)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--persistent_workers", action=argparse.BooleanOptionalAction, default=True)
@@ -497,6 +612,18 @@ def main() -> None:
                     )
                     if args.log_with != "none":
                         accelerator.log(metrics, step=global_step)
+
+                if (
+                    accelerator.is_main_process
+                    and args.train_visual_every > 0
+                    and global_step % args.train_visual_every == 0
+                ):
+                    log_wandb_visuals(
+                        batch=batch,
+                        decoded=output.decoded_state,
+                        step=global_step,
+                        args=args,
+                    )
 
                 if accelerator.is_main_process and (global_step % args.save_every == 0 or global_step == args.max_steps):
                     save_checkpoint(
