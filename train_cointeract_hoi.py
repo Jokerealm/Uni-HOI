@@ -278,6 +278,18 @@ def log_wandb_visuals(
     wandb.log(payload, step=step)
 
 
+def ensure_wan_loaded_rank_by_rank(raw_model: CoInteractHOI4DModel, accelerator: Accelerator) -> None:
+    for process_index in range(accelerator.num_processes):
+        if accelerator.process_index == process_index:
+            print(
+                f"[train_cointeract_hoi] loading Wan stream on rank {process_index}/{accelerator.num_processes - 1}",
+                flush=True,
+            )
+            raw_model.ensure_wan_loaded(accelerator.device)
+            print(f"[train_cointeract_hoi] Wan stream loaded on rank {process_index}", flush=True)
+        accelerator.wait_for_everyone()
+
+
 def checkpoint_state_dict(model: CoInteractHOI4DModel) -> Dict[str, Tensor]:
     return {
         key: value.detach().cpu()
@@ -408,6 +420,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wan_prompt_max_sequence_length", type=int, default=512)
     parser.add_argument("--wan_local_files_only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--freeze_wan", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--serial_wan_load", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rgb_to_hoi_scale", type=float, default=1.0)
 
     parser.add_argument("--num_human_gaussians", type=int, default=750)
@@ -499,7 +512,7 @@ def main() -> None:
     model = build_model(args)
     if args.init_checkpoint:
         load_model_checkpoint(model, args.init_checkpoint)
-    if not args.freeze_wan:
+    if not args.freeze_wan and not args.serial_wan_load:
         model.ensure_wan_loaded(accelerator.device)
 
     optimizer = AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
@@ -515,6 +528,8 @@ def main() -> None:
             scheduler=scheduler,
             checkpoint_path=args.resume_checkpoint,
         )
+    if args.serial_wan_load:
+        ensure_wan_loaded_rank_by_rank(raw_model, accelerator)
 
     supervised_weights = {
         "shape": args.lambda_shape,
