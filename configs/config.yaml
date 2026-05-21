@@ -81,7 +81,7 @@ fm:
   num_heads: 6
   cond_dim: 192
   num_ode_steps: 50
-  num_frames: 12
+  num_frames: 1
   video_h: 256
   video_w: 256
   num_points: 4096
@@ -96,8 +96,8 @@ fm:
   patch_size: 16
   hidden_dim: 512
   fusion_depth: 8
-  num_human_gaussians: 1024
-  num_object_gaussians: 1024
+  num_human_gaussians: 850
+  num_object_gaussians: 850
   num_joints: 22
   contact_dim: 4
 
@@ -253,7 +253,7 @@ dual_branch_fm:
     save_every: 1000
     log_every: 50
     train_visual_every: 500
-    train_visual_max_frames: 8
+    train_visual_max_frames: 1
     train_visual_max_points: 2048
     print_every: 5000
     gradient_accumulation_steps: 1
@@ -261,8 +261,9 @@ dual_branch_fm:
     lr: 3e-4
     weight_decay: 1e-4
     warmup_steps: 300
-    clip_length: 9
-    clip_stride: 8
+    clip_length: 1
+    clip_stride: 1
+    coordinate_mode: relative
     max_sequences: 0
     dataset_cache_sequences: 4
     cache_rgb: true
@@ -287,13 +288,13 @@ dual_branch_fm:
     wan_prompt_max_sequence_length: 512
     wan_prompt_override: ""
     wan_pad_to_compatible_frames: true
-    num_human_gaussians: 750
-    num_object_gaussians: 750
+    num_human_gaussians: 850
+    num_object_gaussians: 850
     num_joints: 22
     contact_dim: 4
     human_shape_dim: 10
     human_pose_dim: 72
-    state_target_mode: absolute
+    state_target_mode: relative
     residual_init_noise_std: 0.0
     loss_preset: cari4d_supervised
     lambda_fm: 1.0
@@ -305,6 +306,9 @@ dual_branch_fm:
     lambda_reg_translation: 0.5
     lambda_reg_object_pose: 0.5
     lambda_reg_contact: 0.1
+    lambda_gaussian_chamfer: 1.0
+    lambda_gaussian_xyz_l1: 0.05
+    lambda_gaussian_attr_l1: 0.1
     lambda_depth: 0.5
     lambda_temp_object: 0.02
     lambda_temp_contact: 0.02

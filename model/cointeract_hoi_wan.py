@@ -48,6 +48,16 @@ def _retrieve_latents(encoder_output, sample_mode: str = "argmax") -> Tensor:
     raise AttributeError("Could not retrieve latents from Wan VAE output.")
 
 
+def _retrieve_video_sample(decoder_output) -> Tensor:
+    if hasattr(decoder_output, "sample"):
+        return decoder_output.sample
+    if isinstance(decoder_output, (tuple, list)) and decoder_output:
+        return decoder_output[0]
+    if isinstance(decoder_output, Tensor):
+        return decoder_output
+    raise AttributeError("Could not retrieve video sample from Wan VAE output.")
+
+
 def _apply_gaussian_activation(raw_tokens: Tensor) -> Tensor:
     if raw_tokens.shape[-1] != 14:
         raise ValueError(f"Expected 14D Gaussian tokens, got {raw_tokens.shape[-1]}.")
@@ -196,7 +206,7 @@ class DecodedHOIState:
 
 
 class HOIStateCodec(nn.Module):
-    """Explicit 4D HOI tokenization used by the new RGB->HOI stream."""
+    """Explicit HOI tokenization used by the RGB->HOI stream."""
 
     def __init__(
         self,
@@ -494,6 +504,16 @@ class FrozenWanTI2VImageStream(nn.Module):
         )
 
     @torch.no_grad()
+    def decode_video(self, latents: Tensor) -> Tensor:
+        self.ensure_loaded(latents.device)
+        if latents.ndim != 5:
+            raise ValueError(f"Wan latents must have shape [B, C, T, H, W], got {tuple(latents.shape)}.")
+        latents = self._denormalize_latents(latents.to(device=self.latents_mean.device, dtype=self.vae.dtype))
+        video = _retrieve_video_sample(self.vae.decode(latents))
+        video = video.float().clamp(-1.0, 1.0).add(1.0).mul(0.5)
+        return video.permute(0, 2, 1, 3, 4).contiguous()
+
+    @torch.no_grad()
     def encode_video(self, video: Tensor) -> Tensor:
         self.ensure_loaded(video.device)
         if video.ndim != 5 or video.shape[2] != 3:
@@ -746,6 +766,10 @@ class CoInteractHOI4DModel(nn.Module):
     @torch.no_grad()
     def encode_video_target(self, video: Tensor) -> Tensor:
         return self.rgb_stream.encode_video(video)
+
+    @torch.no_grad()
+    def decode_video_latents(self, latents: Tensor) -> Tensor:
+        return self.rgb_stream.decode_video(latents)
 
     @torch.no_grad()
     def encode_first_frame(self, first_frame: Tensor) -> Tensor:

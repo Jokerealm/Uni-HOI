@@ -12,10 +12,10 @@ The dataset consumes Step-1 assets plus an asymmetric teacher contract:
   (default human pseudo-GT comes from `vertices/faces`; `G_h.pt` is only needed in `teacher` mode)
 - gs_init/G_o.pt
 
-It returns clips that jointly supervise:
-- video branch conditions
+It returns single-frame samples that jointly supervise:
+- image branch conditions
 - pseudo object amodal targets
-- 4D state targets (human/object Gaussians, joints, object motion, contact)
+- human-relative state targets (human/object Gaussians, joints, object pose, contact)
 """
 
 from __future__ import annotations
@@ -40,10 +40,11 @@ from torch.utils.data import Dataset
 
 INDEX_CACHE_VERSION = 5
 VALID_HUMAN_GAUSSIAN_SOURCES = ("smpl_mesh", "teacher")
+VALID_COORDINATE_MODES = ("relative", "absolute")
 DUAL_BRANCH_TARGET_CACHE_VERSION = 1
 DUAL_BRANCH_TARGETS_FILENAME = "dual_branch_targets.npz"
-DUAL_BRANCH_SEQUENCE_H5_CACHE_VERSION = 2
-DUAL_BRANCH_SEQUENCE_H5_CACHE_FILENAME = "dual_branch_clip_cache_v2.h5"
+DUAL_BRANCH_SEQUENCE_H5_CACHE_VERSION = 3
+DUAL_BRANCH_SEQUENCE_H5_CACHE_FILENAME = "dual_branch_clip_cache_v3.h5"
 SMPL_HUMAN_GAUSSIANS_FILENAME = "G_h_smpl.pt"
 DEFAULT_KEYPOINT_HEATMAP_SIGMA = 6.0
 DEFAULT_CONTACT_SIGNATURE_DIM = 4
@@ -236,16 +237,9 @@ def _safe_normalize(vector: Tensor, fallback: Sequence[float]) -> Tensor:
     return torch.where(norm > 1e-6, normalized, _expand_fallback_vector(vector, fallback))
 
 
-def _canonicalize_vertices_with_body_frame(vertices: Tensor, joints_3d: Tensor) -> Tensor:
-    if vertices.ndim != 3 or vertices.shape[-1] != 3:
-        raise ValueError(f"`vertices` must have shape [T, V, 3], got {tuple(vertices.shape)}.")
+def _human_body_frame_from_joints(joints_3d: Tensor) -> Tensor:
     if joints_3d.ndim != 3 or joints_3d.shape[-1] != 3:
         raise ValueError(f"`joints_3d` must have shape [T, J, 3], got {tuple(joints_3d.shape)}.")
-    if vertices.shape[0] != joints_3d.shape[0]:
-        raise ValueError(
-            f"`vertices` and `joints_3d` must share the same frame count, got {vertices.shape[0]} and {joints_3d.shape[0]}."
-        )
-
     root = joints_3d[:, 0]
     if joints_3d.shape[1] >= 3:
         hip_center = 0.5 * (joints_3d[:, 1] + joints_3d[:, 2])
@@ -267,7 +261,21 @@ def _canonicalize_vertices_with_body_frame(vertices: Tensor, joints_3d: Tensor) 
     axis_z = _safe_normalize(torch.cross(axis_x, axis_y_hint, dim=-1), fallback=(0.0, 0.0, 1.0))
     axis_y = _safe_normalize(torch.cross(axis_z, axis_x, dim=-1), fallback=(0.0, 1.0, 0.0))
     axis_z = _safe_normalize(torch.cross(axis_x, axis_y, dim=-1), fallback=(0.0, 0.0, 1.0))
-    basis = torch.stack([axis_x, axis_y, axis_z], dim=-1)
+    return torch.stack([axis_x, axis_y, axis_z], dim=-1)
+
+
+def _canonicalize_vertices_with_body_frame(vertices: Tensor, joints_3d: Tensor) -> Tensor:
+    if vertices.ndim != 3 or vertices.shape[-1] != 3:
+        raise ValueError(f"`vertices` must have shape [T, V, 3], got {tuple(vertices.shape)}.")
+    if joints_3d.ndim != 3 or joints_3d.shape[-1] != 3:
+        raise ValueError(f"`joints_3d` must have shape [T, J, 3], got {tuple(joints_3d.shape)}.")
+    if vertices.shape[0] != joints_3d.shape[0]:
+        raise ValueError(
+            f"`vertices` and `joints_3d` must share the same frame count, got {vertices.shape[0]} and {joints_3d.shape[0]}."
+        )
+
+    root = joints_3d[:, 0]
+    basis = _human_body_frame_from_joints(joints_3d)
     centered = vertices - root.unsqueeze(1)
     return torch.matmul(centered, basis)
 
@@ -438,6 +446,28 @@ def _assemble_raw_gaussian_tokens(payload: Dict[str, Tensor]) -> Tensor:
     return torch.cat([xyz, rotation, scaling, opacity, shs], dim=-1)
 
 
+def _farthest_point_sample_indices(points: Tensor, num_samples: int) -> Tensor:
+    if points.ndim != 2 or points.shape[-1] != 3:
+        raise ValueError(f"`points` must have shape [N, 3], got {tuple(points.shape)}.")
+    num_points = int(points.shape[0])
+    if num_samples >= num_points:
+        return torch.arange(num_points, device=points.device, dtype=torch.long)
+    if num_samples <= 0:
+        return torch.empty(0, device=points.device, dtype=torch.long)
+
+    points_f = torch.nan_to_num(points.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    centroid = points_f.mean(dim=0, keepdim=True)
+    farthest = torch.sum((points_f - centroid) ** 2, dim=-1).argmax()
+    selected = torch.empty(num_samples, device=points.device, dtype=torch.long)
+    min_dist = torch.full((num_points,), torch.inf, device=points.device, dtype=points_f.dtype)
+    for sample_idx in range(num_samples):
+        selected[sample_idx] = farthest
+        dist = torch.sum((points_f - points_f[farthest].unsqueeze(0)) ** 2, dim=-1)
+        min_dist = torch.minimum(min_dist, dist)
+        farthest = min_dist.argmax()
+    return selected
+
+
 def _subsample_tokens(tokens: Tensor, num_tokens: int) -> Tensor:
     if tokens.shape[0] == num_tokens:
         return tokens
@@ -445,8 +475,7 @@ def _subsample_tokens(tokens: Tensor, num_tokens: int) -> Tensor:
         pad = num_tokens - tokens.shape[0]
         tail = tokens[-1:].expand(pad, -1)
         return torch.cat([tokens, tail], dim=0)
-    indices = torch.linspace(0, tokens.shape[0] - 1, steps=num_tokens, device=tokens.device)
-    indices = indices.round().long().clamp(min=0, max=tokens.shape[0] - 1)
+    indices = _farthest_point_sample_indices(tokens[:, :3], num_tokens)
     return tokens.index_select(0, indices)
 
 
@@ -485,6 +514,90 @@ def _normalize_human_gaussian_source(human_gaussian_source: str) -> str:
             f"`human_gaussian_source` must be one of {VALID_HUMAN_GAUSSIAN_SOURCES}, got {human_gaussian_source!r}."
         )
     return source
+
+
+def _normalize_coordinate_mode(coordinate_mode: str) -> str:
+    mode = str(coordinate_mode).strip().lower()
+    if mode not in VALID_COORDINATE_MODES:
+        raise ValueError(f"`coordinate_mode` must be one of {VALID_COORDINATE_MODES}, got {coordinate_mode!r}.")
+    return mode
+
+
+def _relative_origin_from_human(cam_t: Tensor, joints_3d: Tensor) -> Tensor:
+    if cam_t.ndim != 2 or cam_t.shape[-1] != 3:
+        raise ValueError(f"`cam_t` must have shape [T, 3], got {tuple(cam_t.shape)}.")
+    if joints_3d.ndim != 3 or joints_3d.shape[-1] != 3:
+        raise ValueError(f"`joints_3d` must have shape [T, J, 3], got {tuple(joints_3d.shape)}.")
+    origin = cam_t.float()
+    root = joints_3d[:, 0].float()
+    cam_is_valid = torch.isfinite(origin).all(dim=-1, keepdim=True) & (
+        torch.linalg.norm(origin, dim=-1, keepdim=True) > 1e-6
+    )
+    return torch.where(cam_is_valid, origin, root)
+
+
+def _transform_points_to_human_relative(points: Tensor, origin: Tensor, basis: Tensor) -> Tensor:
+    if points.shape[-1] != 3:
+        raise ValueError(f"`points` must end with 3 coordinates, got {tuple(points.shape)}.")
+    centered = points.float() - origin.view(origin.shape[0], *([1] * (points.ndim - 2)), 3)
+    return torch.matmul(centered, basis)
+
+
+def _maybe_transform_vertices_to_human_relative(
+    vertices: Tensor,
+    *,
+    origin: Tensor,
+    basis: Tensor,
+    relative_joints_3d: Tensor,
+) -> Tensor:
+    if vertices.ndim != 3 or vertices.shape[-1] != 3 or vertices.shape[-2] == 0:
+        return vertices
+    transformed = _transform_points_to_human_relative(vertices, origin, basis)
+    target_center = relative_joints_3d.float().mean(dim=-2)
+    raw_distance = torch.linalg.norm(vertices.float().mean(dim=-2) - target_center, dim=-1).mean()
+    transformed_distance = torch.linalg.norm(transformed.float().mean(dim=-2) - target_center, dim=-1).mean()
+    if bool(transformed_distance < raw_distance):
+        return transformed
+    return vertices
+
+
+def _object_poses_to_human_relative(object_poses: Tensor, origin: Tensor, basis: Tensor) -> Tensor:
+    if object_poses.ndim != 3 or object_poses.shape[-2:] != (4, 4):
+        raise ValueError(f"`object_poses` must have shape [T, 4, 4], got {tuple(object_poses.shape)}.")
+    relative = object_poses.float().clone()
+    rotation = relative[:, :3, :3]
+    translation = relative[:, :3, 3]
+    relative[:, :3, :3] = torch.matmul(basis.transpose(-2, -1), rotation)
+    relative[:, :3, 3] = torch.matmul((translation - origin).unsqueeze(1), basis).squeeze(1)
+    return _project_object_poses_to_se3(relative)
+
+
+def make_sample_targets_relative_to_human(
+    *,
+    cam_t: Tensor,
+    joints_3d: Tensor,
+    object_poses: Tensor,
+    human_vertices: Tensor,
+) -> Dict[str, Tensor]:
+    origin = _relative_origin_from_human(cam_t, joints_3d)
+    basis = _human_body_frame_from_joints(joints_3d.float())
+    relative_joints = _transform_points_to_human_relative(joints_3d, origin, basis)
+    relative_cam_t = torch.matmul((cam_t.float() - origin).unsqueeze(1), basis).squeeze(1)
+    relative_object_poses = _object_poses_to_human_relative(object_poses, origin, basis)
+    relative_vertices = _maybe_transform_vertices_to_human_relative(
+        human_vertices,
+        origin=origin,
+        basis=basis,
+        relative_joints_3d=relative_joints,
+    )
+    return {
+        "cam_t": relative_cam_t,
+        "joints_3d": relative_joints,
+        "object_poses": relative_object_poses,
+        "human_vertices": relative_vertices,
+        "relative_origin": origin,
+        "relative_basis": basis,
+    }
 
 
 def _placeholder_gaussian_tokens(num_tokens: int) -> Tensor:
@@ -619,12 +732,12 @@ def compute_contact_signature(
     for frame_idx in range(num_frames):
         transform = object_poses[frame_idx]
         object_h = torch.cat([object_xyz, torch.ones_like(object_xyz[:, :1])], dim=-1)
-        object_world = torch.matmul(transform.unsqueeze(0), object_h.unsqueeze(-1)).squeeze(-1)[..., :3]
+        object_points = torch.matmul(transform.unsqueeze(0), object_h.unsqueeze(-1)).squeeze(-1)[..., :3]
 
         left_hand = joints_3d[frame_idx, left_indices]
         right_hand = joints_3d[frame_idx, right_indices]
-        left_dist = torch.cdist(left_hand.unsqueeze(0), object_world.unsqueeze(0)).min().detach()
-        right_dist = torch.cdist(right_hand.unsqueeze(0), object_world.unsqueeze(0)).min().detach()
+        left_dist = torch.cdist(left_hand.unsqueeze(0), object_points.unsqueeze(0)).min().detach()
+        right_dist = torch.cdist(right_hand.unsqueeze(0), object_points.unsqueeze(0)).min().detach()
         left_contact = torch.exp(-left_dist / 0.08)
         right_contact = torch.exp(-right_dist / 0.08)
         values = [left_dist, right_dist, left_contact, right_contact]
@@ -759,8 +872,8 @@ def build_dual_branch_sequence_h5_cache(
     processed_subdir: str = "processed",
     gs_subdir: str = "gs_init",
     human_gaussian_source: str = "smpl_mesh",
-    num_human_gaussians: int = 1024,
-    num_object_gaussians: int = 1024,
+    num_human_gaussians: int = 850,
+    num_object_gaussians: int = 850,
     num_joints: int = 22,
     contact_dim: int = 4,
     hand_joint_indices: Optional[Sequence[int]] = None,
@@ -815,6 +928,7 @@ def build_dual_branch_sequence_h5_cache(
 
     human_gaussians: Optional[Tensor] = None
     human_vertices: Optional[Tensor] = None
+    human_faces: Optional[Tensor] = None
     with np.load(processed_dir / "smpl_params.npz") as smpl_params:
         joints_3d = _resolve_joint_targets_from_smpl_params(smpl_params, num_joints)
         human_shape_frames = _resolve_human_shape_targets_from_smpl_params(smpl_params)
@@ -825,6 +939,8 @@ def build_dual_branch_sequence_h5_cache(
             cam_t = torch.from_numpy(smpl_params["cam_t"].astype(np.float32))
         else:
             cam_t = torch.zeros(body_pose.shape[0], 3, dtype=torch.float32)
+        if "faces" in smpl_params:
+            human_faces = torch.from_numpy(np.asarray(smpl_params["faces"], dtype=np.int64))
         if "vertices" in smpl_params:
             human_vertices = torch.from_numpy(np.asarray(smpl_params["vertices"], dtype=np.float32))
         if human_gaussian_source == "smpl_mesh":
@@ -961,6 +1077,8 @@ def build_dual_branch_sequence_h5_cache(
         _write_h5_dataset(handle, "cam_t", cam_t.cpu().numpy(), chunk_frames=chunk_frames)
         if human_vertices is not None:
             _write_h5_dataset(handle, "human_vertices", human_vertices.cpu().numpy(), chunk_frames=chunk_frames)
+        if human_faces is not None:
+            _write_h5_dataset(handle, "human_faces", human_faces.cpu().numpy(), chunk_frames=None)
         _write_h5_dataset(handle, "object_poses", object_poses.cpu().numpy(), chunk_frames=chunk_frames)
         _write_h5_dataset(handle, "contact_signature", contact_signature.cpu().numpy(), chunk_frames=chunk_frames)
         _write_h5_dataset(handle, "human_gaussians", human_gaussians.cpu().numpy(), chunk_frames=None)
@@ -1290,8 +1408,8 @@ def load_dual_branch_sequence_bundle(
     processed_subdir: str = "processed",
     gs_subdir: str = "gs_init",
     human_gaussian_source: str = "smpl_mesh",
-    num_human_gaussians: int = 1024,
-    num_object_gaussians: int = 1024,
+    num_human_gaussians: int = 850,
+    num_object_gaussians: int = 850,
     num_joints: int = 22,
     contact_dim: int = 4,
     hand_joint_indices: Optional[Sequence[int]] = None,
@@ -1339,6 +1457,7 @@ def load_dual_branch_sequence_bundle(
 
     human_gaussians: Optional[Tensor] = None
     human_vertices: Optional[Tensor] = None
+    human_faces: Optional[Tensor] = None
     with np.load(processed_dir / "smpl_params.npz") as smpl_params:
         joints_3d = _resolve_joint_targets_from_smpl_params(smpl_params, num_joints)
         human_shape_frames = _resolve_human_shape_targets_from_smpl_params(smpl_params)
@@ -1349,6 +1468,8 @@ def load_dual_branch_sequence_bundle(
             cam_t = torch.from_numpy(smpl_params["cam_t"].astype(np.float32))
         else:
             cam_t = torch.zeros(body_pose.shape[0], 3, dtype=torch.float32)
+        if "faces" in smpl_params:
+            human_faces = torch.from_numpy(np.asarray(smpl_params["faces"], dtype=np.int64))
         if include_human_vertices and "vertices" in smpl_params:
             human_vertices = torch.from_numpy(smpl_params["vertices"].astype(np.float32))
         if human_gaussian_source == "smpl_mesh":
@@ -1464,6 +1585,7 @@ def load_dual_branch_sequence_bundle(
         "body_pose": body_pose,
         "cam_t": cam_t,
         "human_vertices": human_vertices,
+        "human_faces": human_faces,
         "object_poses": object_poses[:num_frames],
         "contact_signature": contact_signature,
         "human_gaussians": human_gaussians,
@@ -1492,10 +1614,11 @@ class DualBranchHOIDataset(Dataset):
         processed_subdir: str = "processed",
         gs_subdir: str = "gs_init",
         human_gaussian_source: str = "smpl_mesh",
-        num_human_gaussians: int = 1024,
-        num_object_gaussians: int = 1024,
+        num_human_gaussians: int = 850,
+        num_object_gaussians: int = 850,
         num_joints: int = 22,
         contact_dim: int = 4,
+        coordinate_mode: str = "relative",
         background_value: float = 1.0,
         max_sequences: int = 0,
         hand_joint_indices: Optional[Sequence[int]] = None,
@@ -1521,6 +1644,7 @@ class DualBranchHOIDataset(Dataset):
         self.num_object_gaussians = int(num_object_gaussians)
         self.num_joints = int(num_joints)
         self.contact_dim = int(contact_dim)
+        self.coordinate_mode = _normalize_coordinate_mode(coordinate_mode)
         self.background_value = float(background_value)
         self.hand_joint_indices = tuple(hand_joint_indices or [])
         self.cache_sequences = max(int(cache_sequences), 0)
@@ -1605,7 +1729,7 @@ class DualBranchHOIDataset(Dataset):
 
         if not self.samples:
             raise RuntimeError(
-                f"No training clips found under {data_root} for clip_length={self.clip_length} and clip_stride={self.clip_stride}."
+                f"No training samples found under {data_root} for clip_length={self.clip_length} and clip_stride={self.clip_stride}."
             )
 
     def __len__(self) -> int:
@@ -1698,10 +1822,22 @@ class DualBranchHOIDataset(Dataset):
                 )
             human_gaussians = torch.from_numpy(np.asarray(handle["human_gaussians"], dtype=np.float32))
             object_gaussians = torch.from_numpy(np.asarray(handle["object_gaussians"], dtype=np.float32))
+            human_gaussians = _sort_gaussian_tokens_by_xyz(
+                _subsample_tokens(human_gaussians, self.num_human_gaussians)
+            )
+            object_gaussians = _sort_gaussian_tokens_by_xyz(
+                _subsample_tokens(object_gaussians, self.num_object_gaussians)
+            )
+            human_faces = (
+                torch.from_numpy(np.asarray(handle["human_faces"], dtype=np.int64))
+                if "human_faces" in handle
+                else None
+            )
             num_frames = int(handle.attrs["num_frames"])
             image_height = int(handle.attrs["image_height"])
             image_width = int(handle.attrs["image_width"])
             has_human_vertices = "human_vertices" in handle
+            has_human_faces = "human_faces" in handle
             object_category = str(handle.attrs.get("object_category", "object"))
         return {
             "backend": H5_SEQUENCE_BACKEND,
@@ -1710,8 +1846,10 @@ class DualBranchHOIDataset(Dataset):
             "image_height": image_height,
             "image_width": image_width,
             "has_human_vertices": bool(has_human_vertices),
+            "has_human_faces": bool(has_human_faces),
             "human_gaussians": human_gaussians,
             "object_gaussians": object_gaussians,
+            "human_faces": human_faces,
             "sequence_name": Path(sequence_dir).name,
             "object_category": object_category,
         }
@@ -1822,6 +1960,7 @@ class DualBranchHOIDataset(Dataset):
                 human_vertices = _load_h5_tensor_clip(handle, "human_vertices", start, end)
             else:
                 human_vertices = None
+            human_faces = bundle["human_faces"].clone() if bool(bundle.get("has_human_faces", False)) else None
             object_poses = _load_h5_tensor_clip(handle, "object_poses", start, end)
             camera_intrinsics = _load_h5_tensor_clip(handle, "intrinsics", start, end)
             human_gaussians = bundle["human_gaussians"].clone()
@@ -1849,6 +1988,7 @@ class DualBranchHOIDataset(Dataset):
             body_pose = bundle["body_pose"][start:end].clone()
             cam_t = bundle["cam_t"][start:end].clone()
             human_vertices = bundle["human_vertices"][start:end].clone() if bundle.get("human_vertices") is not None else None
+            human_faces = bundle["human_faces"].clone() if bundle.get("human_faces") is not None else None
             object_poses = bundle["object_poses"][start:end].clone()
             camera_intrinsics = bundle["intrinsics"][start:end].clone()
             human_gaussians = bundle["human_gaussians"].clone()
@@ -1867,6 +2007,23 @@ class DualBranchHOIDataset(Dataset):
         human_visible = rgb * masks_human + background * (1.0 - masks_human)
         if human_vertices is None:
             human_vertices = joints_3d.new_zeros((end - start, 0, 3))
+        if human_faces is None:
+            human_faces = torch.empty(0, 3, dtype=torch.long)
+        relative_origin = cam_t.new_zeros(cam_t.shape)
+        relative_basis = torch.eye(3, dtype=cam_t.dtype, device=cam_t.device).unsqueeze(0).expand(cam_t.shape[0], -1, -1)
+        if self.coordinate_mode == "relative":
+            relative_targets = make_sample_targets_relative_to_human(
+                cam_t=cam_t,
+                joints_3d=joints_3d,
+                object_poses=object_poses,
+                human_vertices=human_vertices,
+            )
+            cam_t = relative_targets["cam_t"]
+            joints_3d = relative_targets["joints_3d"]
+            object_poses = relative_targets["object_poses"]
+            human_vertices = relative_targets["human_vertices"]
+            relative_origin = relative_targets["relative_origin"]
+            relative_basis = relative_targets["relative_basis"]
         human_shape = human_shape_frames.mean(dim=0)
 
         return {
@@ -1885,13 +2042,17 @@ class DualBranchHOIDataset(Dataset):
             "body_pose": body_pose,
             "cam_t": cam_t,
             "human_vertices": human_vertices,
+            "human_faces": human_faces,
             "camera_intrinsics": camera_intrinsics,
             "object_poses": object_poses,
             "contact_signature": contact_signature,
             "human_gaussians": human_gaussians,
             "object_gaussians": object_gaussians,
+            "relative_origin": relative_origin,
+            "relative_basis": relative_basis,
             "sequence_name": bundle["sequence_name"],
             "object_category": str(bundle.get("object_category", "object")),
+            "coordinate_mode": self.coordinate_mode,
         }
 
     def __getitem__(self, index: int) -> Dict[str, Tensor]:

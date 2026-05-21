@@ -60,8 +60,8 @@ class FlowMatchingInferenceConfig:
     patch_size: int = 16
     hidden_dim: int = 512
     fusion_depth: int = 8
-    num_human_gaussians: int = 1024
-    num_object_gaussians: int = 1024
+    num_human_gaussians: int = 850
+    num_object_gaussians: int = 850
     num_joints: int = 22
     contact_dim: int = 4
 

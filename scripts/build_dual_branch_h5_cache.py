@@ -20,7 +20,7 @@ from dataset.dual_branch_fm_dataset import (
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Materialize per-sequence H5 caches for clip-level lazy reads."
+        description="Materialize per-sequence H5 caches for lazy single-frame reads."
     )
     parser.add_argument("--data_root", type=str, required=True)
     parser.add_argument("--processed_subdir", type=str, default="processed")
@@ -34,8 +34,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split_file", type=str, default="")
     parser.add_argument("--split_key", type=str, default="train")
     parser.add_argument("--max_sequences", type=int, default=0)
-    parser.add_argument("--num_human_gaussians", type=int, default=1024)
-    parser.add_argument("--num_object_gaussians", type=int, default=1024)
+    parser.add_argument("--num_human_gaussians", type=int, default=850)
+    parser.add_argument("--num_object_gaussians", type=int, default=850)
     parser.add_argument("--num_joints", type=int, default=22)
     parser.add_argument("--contact_dim", type=int, default=4)
     parser.add_argument("--chunk_frames", type=int, default=DEFAULT_SEQUENCE_H5_CHUNK_FRAMES)

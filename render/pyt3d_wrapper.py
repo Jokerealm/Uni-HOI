@@ -107,17 +107,23 @@ def get_kinect_camera(device='cuda:0', kid=1):
 class PcloudRenderer:
     "a simple wrapper for pytorch3d point cloud renderer"
     def __init__(self, image_size=1024, radius=0.005, points_per_pixel=10,
-                 device='cuda:0', bin_size=128, batch_size=1, ret_depth=False):
+                 device='cuda:0', bin_size=128, batch_size=1, ret_depth=False,
+                 background_color=None):
+        if isinstance(image_size, (tuple, list)):
+            image_h, image_w = int(image_size[0]), int(image_size[1])
+        else:
+            image_h = image_w = int(image_size)
         camera_centers = []
         focal_lengths = []
         for i in range(batch_size):
-            camera_centers.append(torch.Tensor([image_size / 2., image_size / 2.]).to(device))
-            focal_lengths.append(torch.Tensor([image_size / 2., image_size / 2.]).to(device))
+            camera_centers.append(torch.Tensor([image_w / 2., image_h / 2.]).to(device))
+            focal_lengths.append(torch.Tensor([image_w / 2., image_h / 2.]).to(device))
         self.image_size = image_size
         self.device = device
         self.camera_center = torch.stack(camera_centers)
         self.focal_length = torch.stack(focal_lengths)
         self.ret_depth = ret_depth # return depth  map or not
+        self.background_color = background_color
         self.renderer = self.setup_renderer(radius, points_per_pixel, bin_size)
 
     def render(self, pc, cameras, mode='image'):
@@ -172,7 +178,7 @@ class PcloudRenderer:
         rasterizer = PointsRasterizer(raster_settings=raster_settings)
         renderer = PointsRendererWithFragments(
             rasterizer=rasterizer,
-            compositor=AlphaCompositor()
+            compositor=AlphaCompositor(background_color=self.background_color)
         )
         return renderer
 
@@ -294,7 +300,6 @@ def test_mesh_rasterizer():
 if __name__ == '__main__':
     # test_depth_rasterizer()
     test_mesh_rasterizer()
-
 
 
 
