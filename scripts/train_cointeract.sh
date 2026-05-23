@@ -11,17 +11,23 @@ IFS=',' read -r -a CUDA_DEVICE_IDS <<< "${CUDA_VISIBLE_DEVICES}"
 NUM_PROCESSES="${NUM_PROCESSES:-${#CUDA_DEVICE_IDS[@]}}"
 LOG_PATH="${LOG_PATH:-${REPO_ROOT}/logs/output.log}"
 
+MODEL_VARIANT="${MODEL_VARIANT:-cointeract}"
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/sample_data/behave_1pct/sequences}"
-OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/outputs/cointeract_hoi_wan_ti2v}"
+OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/outputs/${MODEL_VARIANT}_hoi_wan_ti2v}"
 WAN_MODEL_ID="${WAN_MODEL_ID:-Wan-AI/Wan2.2-TI2V-5B-Diffusers}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 
 TRAIN_ARGS=(
+  --model_variant "${MODEL_VARIANT}" \
   --data_root "${DATA_ROOT}" \
   --output_dir "${OUTPUT_DIR}" \
   --wan_model_id "${WAN_MODEL_ID}" \
   --rgb_to_hoi_scale "${RGB_TO_HOI_SCALE:-1.0}" \
   --hoi_to_rgb_scale "${HOI_TO_RGB_SCALE:-0.0}" \
+  --cross_3d2d_scale "${CROSS_3D2D_SCALE:-1.0}" \
+  --visual_prior_num_global_tokens "${VISUAL_PRIOR_NUM_GLOBAL_TOKENS:-8}" \
+  --visual_resampler_depth "${VISUAL_RESAMPLER_DEPTH:-2}" \
+  --cross_3d2d_depth "${CROSS_3D2D_DEPTH:-6}" \
   --clip_length "${CLIP_LENGTH:-1}" \
   --clip_stride "${CLIP_STRIDE:-1}" \
   --coordinate_mode "${COORDINATE_MODE:-relative}" \
@@ -66,5 +72,7 @@ fi
 
 mkdir -p "$(dirname "${LOG_PATH}")"
 echo "Starting training with nohup. Logs: ${LOG_PATH}"
+echo "MODEL_VARIANT=${MODEL_VARIANT}"
+echo "OUTPUT_DIR=${OUTPUT_DIR}"
 nohup "${TRAIN_CMD[@]}" > "${LOG_PATH}" 2>&1 &
 echo "Training PID: $!"

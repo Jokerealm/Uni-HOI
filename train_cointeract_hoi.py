@@ -20,6 +20,7 @@ from tqdm.auto import tqdm
 
 from dataset.dual_branch_fm_dataset import DualBranchHOIDataset
 from model.cointeract_hoi_wan import CoInteractHOI4DModel, DecodedHOIState
+from model.comovi_hoi_rgb_wan import CoMoViHOIRGBModel
 
 
 def resize_video_batch(video: Tensor, size: Tuple[int, int], mode: str = "bilinear") -> Tensor:
@@ -122,31 +123,39 @@ def prepare_batch(batch: Dict[str, object], *, device: torch.device, image_heigh
 
 
 def build_model(args: argparse.Namespace) -> CoInteractHOI4DModel:
-    return CoInteractHOI4DModel(
-        hidden_dim=args.hidden_dim,
-        num_heads=args.num_heads,
-        depth=args.depth,
-        mlp_ratio=args.mlp_ratio,
-        dropout=args.dropout,
-        num_frames=args.clip_length,
-        image_height=args.image_height,
-        image_width=args.image_width,
-        image_patch_size=args.image_patch_size,
-        num_human_gaussians=args.num_human_gaussians,
-        num_object_gaussians=args.num_object_gaussians,
-        num_joints=args.num_joints,
-        contact_dim=args.contact_dim,
-        human_shape_dim=args.human_shape_dim,
-        human_pose_dim=args.human_pose_dim,
-        wan_model_id=args.wan_model_id,
-        wan_dtype=args.wan_dtype,
-        wan_hidden_dim=args.wan_hidden_dim,
-        wan_prompt_max_sequence_length=args.wan_prompt_max_sequence_length,
-        wan_local_files_only=args.wan_local_files_only,
-        freeze_wan=args.freeze_wan,
-        detach_rgb_context=args.detach_rgb_context,
-        enable_hoi_to_rgb=abs(args.hoi_to_rgb_scale) > 0.0,
-    )
+    common_kwargs = {
+        "hidden_dim": args.hidden_dim,
+        "num_heads": args.num_heads,
+        "depth": args.depth,
+        "mlp_ratio": args.mlp_ratio,
+        "dropout": args.dropout,
+        "num_frames": args.clip_length,
+        "image_height": args.image_height,
+        "image_width": args.image_width,
+        "image_patch_size": args.image_patch_size,
+        "num_human_gaussians": args.num_human_gaussians,
+        "num_object_gaussians": args.num_object_gaussians,
+        "num_joints": args.num_joints,
+        "contact_dim": args.contact_dim,
+        "human_shape_dim": args.human_shape_dim,
+        "human_pose_dim": args.human_pose_dim,
+        "wan_model_id": args.wan_model_id,
+        "wan_dtype": args.wan_dtype,
+        "wan_hidden_dim": args.wan_hidden_dim,
+        "wan_prompt_max_sequence_length": args.wan_prompt_max_sequence_length,
+        "wan_local_files_only": args.wan_local_files_only,
+        "freeze_wan": args.freeze_wan,
+        "detach_rgb_context": args.detach_rgb_context,
+        "enable_hoi_to_rgb": abs(args.hoi_to_rgb_scale) > 0.0,
+    }
+    if args.model_variant == "comovi":
+        return CoMoViHOIRGBModel(
+            **common_kwargs,
+            visual_prior_num_global_tokens=args.visual_prior_num_global_tokens,
+            visual_resampler_depth=args.visual_resampler_depth,
+            cross_3d2d_depth=args.cross_3d2d_depth,
+        )
+    return CoInteractHOI4DModel(**common_kwargs)
 
 
 def encode_state_target(model: CoInteractHOI4DModel, batch: Dict[str, object]) -> Tensor:
@@ -647,6 +656,7 @@ def load_training_checkpoint(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train HOI-primary CoInteract-style RGB-guided dual-stream Wan model.")
+    parser.add_argument("--model_variant", type=str, default="cointeract", choices=("cointeract", "comovi"))
     parser.add_argument("--data_root", type=str, default="sample_data/behave_1pct/sequences")
     parser.add_argument("--processed_subdir", type=str, default="processed")
     parser.add_argument("--gs_subdir", type=str, default="gs_init")
@@ -712,6 +722,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--serial_wan_load", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rgb_to_hoi_scale", type=float, default=1.0)
     parser.add_argument("--hoi_to_rgb_scale", type=float, default=0.0)
+    parser.add_argument("--cross_3d2d_scale", type=float, default=1.0)
+    parser.add_argument("--visual_prior_num_global_tokens", type=int, default=8)
+    parser.add_argument("--visual_resampler_depth", type=int, default=2)
+    parser.add_argument("--cross_3d2d_depth", type=int, default=6)
 
     parser.add_argument("--num_human_gaussians", type=int, default=850)
     parser.add_argument("--num_object_gaussians", type=int, default=850)
@@ -774,7 +788,8 @@ def main() -> None:
             f"| data_root={args.data_root} | max_steps={args.max_steps} "
             f"| per_gpu_batch={args.batch_size} "
             f"| global_batch={args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps} "
-            f"| wan={args.wan_model_id} | input=single_image | coordinate_mode={args.coordinate_mode}",
+            f"| model={args.model_variant} | wan={args.wan_model_id} "
+            f"| input=single_image | coordinate_mode={args.coordinate_mode}",
             flush=True,
         )
 
@@ -910,14 +925,17 @@ def main() -> None:
                     )
                     state_xt, state_velocity_target = flow_match_sample(state_target, state_noise, timesteps)
 
-                output = model(
-                    video_xt=video_xt,
-                    state_xt=state_xt,
-                    timesteps=timesteps,
-                    first_frame=rgb[:, 0],
-                    rgb_to_hoi_scale=args.rgb_to_hoi_scale,
-                    hoi_to_rgb_scale=args.hoi_to_rgb_scale,
-                )
+                forward_kwargs = {
+                    "video_xt": video_xt,
+                    "state_xt": state_xt,
+                    "timesteps": timesteps,
+                    "first_frame": rgb[:, 0],
+                    "rgb_to_hoi_scale": args.rgb_to_hoi_scale,
+                    "hoi_to_rgb_scale": args.hoi_to_rgb_scale,
+                }
+                if args.model_variant == "comovi":
+                    forward_kwargs["cross_3d2d_scale"] = args.cross_3d2d_scale
+                output = model(**forward_kwargs)
                 state_fm = F.mse_loss(output.state_velocity.float(), state_velocity_target.float())
                 state_losses = compute_state_losses(output.decoded_state, batch, weights=supervised_weights)
                 physics_losses = compute_physics_losses(output.decoded_state, batch, args=args)
@@ -945,6 +963,7 @@ def main() -> None:
                         "loss_rgb_fm": float(rgb_fm.detach().item()),
                         "loss_supervised": float(state_losses["supervised"].detach().item()),
                         "loss_physics": float(physics_losses["physics"].detach().item()),
+                        "cross_3d2d_scale": float(args.cross_3d2d_scale),
                         "rgb_to_hoi_scale": float(args.rgb_to_hoi_scale),
                         "hoi_to_rgb_scale": float(args.hoi_to_rgb_scale),
                         "lr": float(scheduler.get_last_lr()[0]),
