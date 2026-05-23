@@ -43,6 +43,8 @@ VALID_HUMAN_GAUSSIAN_SOURCES = ("smpl_mesh", "teacher")
 VALID_COORDINATE_MODES = ("relative", "absolute")
 DUAL_BRANCH_TARGET_CACHE_VERSION = 1
 DUAL_BRANCH_TARGETS_FILENAME = "dual_branch_targets.npz"
+DENSE_CONTACT_CACHE_VERSION = 1
+DENSE_CONTACTS_FILENAME = "dense_contacts.npz"
 DUAL_BRANCH_SEQUENCE_H5_CACHE_VERSION = 3
 DUAL_BRANCH_SEQUENCE_H5_CACHE_FILENAME = "dual_branch_clip_cache_v3.h5"
 SMPL_HUMAN_GAUSSIANS_FILENAME = "G_h_smpl.pt"
@@ -582,7 +584,9 @@ def make_sample_targets_relative_to_human(
     origin = _relative_origin_from_human(cam_t, joints_3d)
     basis = _human_body_frame_from_joints(joints_3d.float())
     relative_joints = _transform_points_to_human_relative(joints_3d, origin, basis)
-    relative_cam_t = torch.matmul((cam_t.float() - origin).unsqueeze(1), basis).squeeze(1)
+    # SMPL-derived human Gaussian targets are canonicalized around the joint root,
+    # so the decoded human translation should place that root in the shared frame.
+    relative_cam_t = relative_joints[:, 0].clone()
     relative_object_poses = _object_poses_to_human_relative(object_poses, origin, basis)
     relative_vertices = _maybe_transform_vertices_to_human_relative(
         human_vertices,
@@ -837,6 +841,100 @@ def _maybe_load_precomputed_dual_branch_targets(
     }
 
 
+def _empty_dense_contacts(num_frames: int) -> Dict[str, Tensor]:
+    return {
+        "dense_contact_object_points": torch.empty(num_frames, 0, 3, dtype=torch.float32),
+        "dense_contact_human_points": torch.empty(num_frames, 0, 3, dtype=torch.float32),
+        "dense_contact_labels": torch.empty(num_frames, 0, dtype=torch.float32),
+    }
+
+
+def _pad_or_trim_dense_contacts(contacts: Dict[str, Tensor], num_frames: int) -> Dict[str, Tensor]:
+    result: Dict[str, Tensor] = {}
+    for key, value in contacts.items():
+        if value.shape[0] >= num_frames:
+            result[key] = value[:num_frames]
+            continue
+        padding_shape = (num_frames - value.shape[0],) + tuple(value.shape[1:])
+        padding = value.new_zeros(padding_shape)
+        result[key] = torch.cat([value, padding], dim=0)
+    return result
+
+
+def _read_official_contact_npz(path: Path) -> Dict[str, np.ndarray]:
+    with np.load(path, allow_pickle=True) as payload:
+        if {"object_points", "contact_label", "contact_vertices"}.issubset(payload.files):
+            return {
+                "object_points": np.asarray(payload["object_points"], dtype=np.float32),
+                "contact_labels": np.asarray(payload["contact_label"], dtype=np.float32),
+                "contact_human_points": np.asarray(payload["contact_vertices"], dtype=np.float32),
+            }
+        if "arr_0" not in payload:
+            raise KeyError(f"Unrecognized dense contact file format: {path}")
+        item = payload["arr_0"].item()
+        return {
+            "object_points": np.asarray(item["object_points"], dtype=np.float32),
+            "contact_labels": np.asarray(item["contact_label"], dtype=np.float32),
+            "contact_human_points": np.asarray(item["contact_vertices"], dtype=np.float32),
+        }
+
+
+def _maybe_load_dense_contacts(
+    sequence_dir: Path,
+    *,
+    processed_subdir: str,
+    num_frames: int,
+) -> Dict[str, Tensor]:
+    cache_path = sequence_dir / processed_subdir / "cropped" / DENSE_CONTACTS_FILENAME
+    if cache_path.is_file():
+        try:
+            with np.load(cache_path, allow_pickle=False) as payload:
+                version = int(payload["version"][0]) if "version" in payload else DENSE_CONTACT_CACHE_VERSION
+                if version != DENSE_CONTACT_CACHE_VERSION:
+                    return _empty_dense_contacts(num_frames)
+                contacts = {
+                    "dense_contact_object_points": torch.from_numpy(
+                        np.asarray(payload["object_points"], dtype=np.float32)
+                    ),
+                    "dense_contact_human_points": torch.from_numpy(
+                        np.asarray(payload["contact_human_points"], dtype=np.float32)
+                    ),
+                    "dense_contact_labels": torch.from_numpy(
+                        np.asarray(payload["contact_labels"], dtype=np.float32)
+                    ),
+                }
+        except Exception:
+            return _empty_dense_contacts(num_frames)
+        return _pad_or_trim_dense_contacts(contacts, num_frames)
+
+    timestep_dirs = _discover_timestep_dirs(sequence_dir)
+    frame_contacts: List[Dict[str, np.ndarray]] = []
+    for timestep_dir in timestep_dirs[:num_frames]:
+        contact_paths = sorted(timestep_dir.glob("*/fit01/*_contact.npz"))
+        contact_paths = [path for path in contact_paths if "/person/" not in str(path)]
+        if not contact_paths:
+            return _empty_dense_contacts(num_frames)
+        try:
+            frame_contacts.append(_read_official_contact_npz(contact_paths[0]))
+        except Exception:
+            return _empty_dense_contacts(num_frames)
+    if not frame_contacts:
+        return _empty_dense_contacts(num_frames)
+    min_samples = min(item["object_points"].shape[0] for item in frame_contacts)
+    contacts = {
+        "dense_contact_object_points": torch.from_numpy(
+            np.stack([item["object_points"][:min_samples] for item in frame_contacts], axis=0).astype(np.float32)
+        ),
+        "dense_contact_human_points": torch.from_numpy(
+            np.stack([item["contact_human_points"][:min_samples] for item in frame_contacts], axis=0).astype(np.float32)
+        ),
+        "dense_contact_labels": torch.from_numpy(
+            np.stack([item["contact_labels"][:min_samples] for item in frame_contacts], axis=0).astype(np.float32)
+        ),
+    }
+    return _pad_or_trim_dense_contacts(contacts, num_frames)
+
+
 def _resolve_sequence_h5_chunks(shape: Sequence[int], *, chunk_frames: int) -> Optional[Tuple[int, ...]]:
     if not shape:
         return None
@@ -1033,6 +1131,11 @@ def build_dual_branch_sequence_h5_cache(
             contact_dim=contact_dim,
             hand_joint_indices=hand_joint_indices,
         )
+    dense_contacts = _maybe_load_dense_contacts(
+        sequence_path,
+        processed_subdir=processed_subdir,
+        num_frames=num_frames,
+    )
 
     object_category = resolve_object_category(sequence_path, processed_subdir=processed_subdir)
     first_rgb = np.asarray(Image.open(rgb_paths[0]).convert("RGB"), dtype=np.uint8)
@@ -1081,6 +1184,25 @@ def build_dual_branch_sequence_h5_cache(
             _write_h5_dataset(handle, "human_faces", human_faces.cpu().numpy(), chunk_frames=None)
         _write_h5_dataset(handle, "object_poses", object_poses.cpu().numpy(), chunk_frames=chunk_frames)
         _write_h5_dataset(handle, "contact_signature", contact_signature.cpu().numpy(), chunk_frames=chunk_frames)
+        if dense_contacts["dense_contact_labels"].shape[-1] > 0:
+            _write_h5_dataset(
+                handle,
+                "dense_contact_object_points",
+                dense_contacts["dense_contact_object_points"].cpu().numpy(),
+                chunk_frames=chunk_frames,
+            )
+            _write_h5_dataset(
+                handle,
+                "dense_contact_human_points",
+                dense_contacts["dense_contact_human_points"].cpu().numpy(),
+                chunk_frames=chunk_frames,
+            )
+            _write_h5_dataset(
+                handle,
+                "dense_contact_labels",
+                dense_contacts["dense_contact_labels"].cpu().numpy(),
+                chunk_frames=chunk_frames,
+            )
         _write_h5_dataset(handle, "human_gaussians", human_gaussians.cpu().numpy(), chunk_frames=None)
         _write_h5_dataset(handle, "object_gaussians", object_gaussians.cpu().numpy(), chunk_frames=None)
 
@@ -1568,6 +1690,11 @@ def load_dual_branch_sequence_bundle(
             contact_dim=contact_dim,
             hand_joint_indices=hand_joint_indices,
         )
+    dense_contacts = _maybe_load_dense_contacts(
+        sequence_path,
+        processed_subdir=processed_subdir,
+        num_frames=num_frames,
+    )
 
     bundle = {
         "rgb_paths": rgb_paths,
@@ -1588,6 +1715,7 @@ def load_dual_branch_sequence_bundle(
         "human_faces": human_faces,
         "object_poses": object_poses[:num_frames],
         "contact_signature": contact_signature,
+        **dense_contacts,
         "human_gaussians": human_gaussians,
         "object_gaussians": object_gaussians,
         "num_frames": num_frames,
@@ -1838,7 +1966,24 @@ class DualBranchHOIDataset(Dataset):
             image_width = int(handle.attrs["image_width"])
             has_human_vertices = "human_vertices" in handle
             has_human_faces = "human_faces" in handle
+            has_dense_contacts = all(
+                name in handle
+                for name in (
+                    "dense_contact_object_points",
+                    "dense_contact_human_points",
+                    "dense_contact_labels",
+                )
+            )
             object_category = str(handle.attrs.get("object_category", "object"))
+        dense_contacts = (
+            _empty_dense_contacts(num_frames)
+            if has_dense_contacts
+            else _maybe_load_dense_contacts(
+                Path(sequence_dir),
+                processed_subdir=self.processed_subdir,
+                num_frames=num_frames,
+            )
+        )
         return {
             "backend": H5_SEQUENCE_BACKEND,
             "h5_path": str(cache_path),
@@ -1847,9 +1992,11 @@ class DualBranchHOIDataset(Dataset):
             "image_width": image_width,
             "has_human_vertices": bool(has_human_vertices),
             "has_human_faces": bool(has_human_faces),
+            "has_dense_contacts": bool(has_dense_contacts),
             "human_gaussians": human_gaussians,
             "object_gaussians": object_gaussians,
             "human_faces": human_faces,
+            **dense_contacts,
             "sequence_name": Path(sequence_dir).name,
             "object_category": object_category,
         }
@@ -1966,6 +2113,14 @@ class DualBranchHOIDataset(Dataset):
             human_gaussians = bundle["human_gaussians"].clone()
             object_gaussians = bundle["object_gaussians"].clone()
             contact_signature = _load_h5_tensor_clip(handle, "contact_signature", start, end)
+            if bool(bundle.get("has_dense_contacts", False)):
+                dense_contact_object_points = _load_h5_tensor_clip(handle, "dense_contact_object_points", start, end)
+                dense_contact_human_points = _load_h5_tensor_clip(handle, "dense_contact_human_points", start, end)
+                dense_contact_labels = _load_h5_tensor_clip(handle, "dense_contact_labels", start, end)
+            else:
+                dense_contact_object_points = bundle["dense_contact_object_points"][start:end].clone()
+                dense_contact_human_points = bundle["dense_contact_human_points"][start:end].clone()
+                dense_contact_labels = bundle["dense_contact_labels"][start:end].clone()
             keypoint_heatmaps = _build_keypoint_heatmaps(
                 keypoints_2d,
                 height=int(bundle["image_height"]),
@@ -2002,6 +2157,9 @@ class DualBranchHOIDataset(Dataset):
                     width=depth.shape[-1],
                 )
             contact_signature = bundle["contact_signature"][start:end].clone()
+            dense_contact_object_points = bundle["dense_contact_object_points"][start:end].clone()
+            dense_contact_human_points = bundle["dense_contact_human_points"][start:end].clone()
+            dense_contact_labels = bundle["dense_contact_labels"][start:end].clone()
 
         background = torch.full_like(rgb, self.background_value)
         human_visible = rgb * masks_human + background * (1.0 - masks_human)
@@ -2024,6 +2182,16 @@ class DualBranchHOIDataset(Dataset):
             human_vertices = relative_targets["human_vertices"]
             relative_origin = relative_targets["relative_origin"]
             relative_basis = relative_targets["relative_basis"]
+            dense_contact_object_points = _transform_points_to_human_relative(
+                dense_contact_object_points,
+                relative_origin,
+                relative_basis,
+            )
+            dense_contact_human_points = _transform_points_to_human_relative(
+                dense_contact_human_points,
+                relative_origin,
+                relative_basis,
+            )
         human_shape = human_shape_frames.mean(dim=0)
 
         return {
@@ -2046,6 +2214,9 @@ class DualBranchHOIDataset(Dataset):
             "camera_intrinsics": camera_intrinsics,
             "object_poses": object_poses,
             "contact_signature": contact_signature,
+            "dense_contact_object_points": dense_contact_object_points,
+            "dense_contact_human_points": dense_contact_human_points,
+            "dense_contact_labels": dense_contact_labels,
             "human_gaussians": human_gaussians,
             "object_gaussians": object_gaussians,
             "relative_origin": relative_origin,
@@ -2069,6 +2240,7 @@ __all__ = [
     "DEFAULT_CONTACT_SIGNATURE_DIM",
     "DEFAULT_KEYPOINT_HEATMAP_SIGMA",
     "DEFAULT_SEQUENCE_H5_CHUNK_FRAMES",
+    "DENSE_CONTACTS_FILENAME",
     "DUAL_BRANCH_TARGET_CACHE_VERSION",
     "DUAL_BRANCH_SEQUENCE_H5_CACHE_FILENAME",
     "DUAL_BRANCH_TARGETS_FILENAME",

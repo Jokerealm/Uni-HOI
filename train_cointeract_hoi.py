@@ -144,6 +144,8 @@ def build_model(args: argparse.Namespace) -> CoInteractHOI4DModel:
         wan_prompt_max_sequence_length=args.wan_prompt_max_sequence_length,
         wan_local_files_only=args.wan_local_files_only,
         freeze_wan=args.freeze_wan,
+        detach_rgb_context=args.detach_rgb_context,
+        enable_hoi_to_rgb=abs(args.hoi_to_rgb_scale) > 0.0,
     )
 
 
@@ -644,7 +646,7 @@ def load_training_checkpoint(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train CoInteract-style RGB->HOI dual-stream Wan model.")
+    parser = argparse.ArgumentParser(description="Train HOI-primary CoInteract-style RGB-guided dual-stream Wan model.")
     parser.add_argument("--data_root", type=str, default="sample_data/behave_1pct/sequences")
     parser.add_argument("--processed_subdir", type=str, default="processed")
     parser.add_argument("--gs_subdir", type=str, default="gs_init")
@@ -706,8 +708,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wan_prompt_max_sequence_length", type=int, default=512)
     parser.add_argument("--wan_local_files_only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--freeze_wan", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--detach_rgb_context", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--serial_wan_load", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rgb_to_hoi_scale", type=float, default=1.0)
+    parser.add_argument("--hoi_to_rgb_scale", type=float, default=0.0)
 
     parser.add_argument("--num_human_gaussians", type=int, default=850)
     parser.add_argument("--num_object_gaussians", type=int, default=850)
@@ -912,6 +916,7 @@ def main() -> None:
                     timesteps=timesteps,
                     first_frame=rgb[:, 0],
                     rgb_to_hoi_scale=args.rgb_to_hoi_scale,
+                    hoi_to_rgb_scale=args.hoi_to_rgb_scale,
                 )
                 state_fm = F.mse_loss(output.state_velocity.float(), state_velocity_target.float())
                 state_losses = compute_state_losses(output.decoded_state, batch, weights=supervised_weights)
@@ -940,6 +945,8 @@ def main() -> None:
                         "loss_rgb_fm": float(rgb_fm.detach().item()),
                         "loss_supervised": float(state_losses["supervised"].detach().item()),
                         "loss_physics": float(physics_losses["physics"].detach().item()),
+                        "rgb_to_hoi_scale": float(args.rgb_to_hoi_scale),
+                        "hoi_to_rgb_scale": float(args.hoi_to_rgb_scale),
                         "lr": float(scheduler.get_last_lr()[0]),
                     }
                     for key, value in state_losses.items():

@@ -6,7 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -166,6 +166,137 @@ def compute_state_losses(
     return losses
 
 
+def _parse_contact_joint_indices(value: str, num_joints: int) -> List[int]:
+    if value.strip():
+        indices = [int(part.strip()) for part in value.split(",") if part.strip()]
+    elif num_joints >= 52:
+        indices = list(range(20, 52))
+    elif num_joints >= 22:
+        indices = [20, 21]
+    else:
+        indices = list(range(max(0, num_joints - 2), num_joints))
+    if not indices:
+        indices = [max(0, num_joints - 1)]
+    return [min(max(idx, 0), num_joints - 1) for idx in indices]
+
+
+def _explicit_contact_joint_indices(value: str) -> Optional[List[int]]:
+    if not value.strip():
+        return None
+    return [int(part.strip()) for part in value.split(",") if part.strip()]
+
+
+def _transform_object_points(object_xyz: Tensor, object_transforms: Tensor) -> Tensor:
+    rotation = object_transforms[..., :3, :3].float()
+    translation = object_transforms[..., :3, 3].float()
+    return torch.einsum("btij,bnj->btni", rotation, object_xyz.float()) + translation.unsqueeze(2)
+
+
+def contact_geometry_loss(
+    decoded: DecodedHOIState,
+    batch: Dict[str, object],
+    *,
+    contact_joint_indices: Sequence[int],
+) -> Tensor:
+    if not contact_joint_indices:
+        return decoded.joints_3d.new_zeros(())
+
+    object_points = _transform_object_points(decoded.object_gaussians[..., :3], decoded.object_transforms)
+    joints = decoded.joints_3d[:, :, list(contact_joint_indices)].float()
+    batch_size, num_frames, num_contact_joints = joints.shape[:3]
+    min_dist = torch.cdist(
+        joints.reshape(batch_size * num_frames, num_contact_joints, 3),
+        object_points.reshape(batch_size * num_frames, object_points.shape[2], 3),
+    ).min(dim=-1).values.reshape(batch_size, num_frames, num_contact_joints)
+
+    contact_signature = batch["contact_signature"].float()
+    if contact_signature.shape[-1] >= 4 and num_contact_joints >= 2:
+        left_count = max(1, num_contact_joints // 2)
+        right_count = num_contact_joints - left_count
+        left_gate = contact_signature[..., 2:3].expand(-1, -1, left_count)
+        right_gate = contact_signature[..., 3:4].expand(-1, -1, max(right_count, 1))[..., :right_count]
+        gate = torch.cat([left_gate, right_gate], dim=-1)
+        return (min_dist * gate).sum() / gate.sum().clamp_min(1.0)
+    return min_dist.mean()
+
+
+def _even_contact_indices(indices: Tensor, max_points: int) -> Tensor:
+    if max_points <= 0 or indices.numel() <= max_points:
+        return indices
+    select = torch.linspace(0, indices.numel() - 1, steps=max_points, device=indices.device).round().long()
+    return indices.index_select(0, select)
+
+
+def dense_contact_pair_loss(
+    decoded: DecodedHOIState,
+    batch: Dict[str, object],
+    *,
+    max_points: int,
+) -> Tensor:
+    object_points_gt = batch.get("dense_contact_object_points")
+    human_points_gt = batch.get("dense_contact_human_points")
+    contact_labels = batch.get("dense_contact_labels")
+    if not isinstance(object_points_gt, Tensor) or not isinstance(human_points_gt, Tensor) or not isinstance(contact_labels, Tensor):
+        return decoded.object_gaussians.new_zeros(())
+    if object_points_gt.numel() == 0 or contact_labels.numel() == 0:
+        return decoded.object_gaussians.new_zeros(())
+
+    pred_object = _transform_object_points(decoded.object_gaussians[..., :3], decoded.object_transforms)
+    pred_human = decoded.human_gaussians[:, None, :, :3].float() + decoded.human_translation.float().unsqueeze(-2)
+
+    losses: List[Tensor] = []
+    labels = contact_labels.float()
+    for batch_idx in range(pred_object.shape[0]):
+        for frame_idx in range(pred_object.shape[1]):
+            contact_indices = torch.nonzero(labels[batch_idx, frame_idx] > 0.5, as_tuple=False).flatten()
+            if contact_indices.numel() == 0:
+                continue
+            contact_indices = _even_contact_indices(contact_indices, max_points)
+            gt_object_contact = object_points_gt[batch_idx, frame_idx].float().index_select(0, contact_indices)
+            gt_human_contact = human_points_gt[batch_idx, frame_idx].float().index_select(0, contact_indices)
+
+            pred_object_frame = pred_object[batch_idx, frame_idx]
+            pred_human_frame = pred_human[batch_idx, frame_idx]
+            object_match = torch.cdist(gt_object_contact.unsqueeze(0), pred_object_frame.unsqueeze(0)).argmin(dim=-1).squeeze(0)
+            human_match = torch.cdist(gt_human_contact.unsqueeze(0), pred_human_frame.unsqueeze(0)).argmin(dim=-1).squeeze(0)
+            selected_object = pred_object_frame.index_select(0, object_match)
+            selected_human = pred_human_frame.index_select(0, human_match)
+            losses.append(torch.linalg.norm(selected_object - selected_human, dim=-1).mean())
+    if not losses:
+        return decoded.object_gaussians.new_zeros(())
+    return torch.stack(losses).mean()
+
+
+def compute_physics_losses(
+    decoded: DecodedHOIState,
+    batch: Dict[str, object],
+    *,
+    args: argparse.Namespace,
+) -> Dict[str, Tensor]:
+    losses: Dict[str, Tensor] = {}
+    if args.lambda_phys_contact > 0.0:
+        losses["phys_contact"] = contact_geometry_loss(
+            decoded,
+            batch,
+            contact_joint_indices=_parse_contact_joint_indices(args.contact_joint_indices, args.num_joints),
+        )
+    else:
+        losses["phys_contact"] = decoded.joints_3d.new_zeros(())
+    if args.lambda_dense_contact > 0.0:
+        losses["dense_contact"] = dense_contact_pair_loss(
+            decoded,
+            batch,
+            max_points=args.dense_contact_max_points,
+        )
+    else:
+        losses["dense_contact"] = decoded.object_gaussians.new_zeros(())
+    losses["physics"] = (
+        float(args.lambda_phys_contact) * losses["phys_contact"]
+        + float(args.lambda_dense_contact) * losses["dense_contact"]
+    )
+    return losses
+
+
 def supervised_weights_from_args(args: argparse.Namespace) -> Dict[str, float]:
     return {
         "shape": args.lambda_shape,
@@ -202,6 +333,7 @@ def build_dataset(
         num_object_gaussians=args.num_object_gaussians,
         num_joints=args.num_joints,
         contact_dim=args.contact_dim,
+        hand_joint_indices=_explicit_contact_joint_indices(args.contact_joint_indices),
         coordinate_mode=args.coordinate_mode,
         max_sequences=args.max_sequences,
         cache_sequences=args.dataset_cache_sequences,
@@ -390,9 +522,12 @@ def forward_and_loss(
         state_fm = F.mse_loss(output.state_velocity.float(), state_velocity_target.float())
 
     state_losses = compute_state_losses(output.decoded_state, batch, weights=weights)
-    loss = state_losses["supervised"] + float(args.lambda_state_fm) * state_fm
+    physics_losses = compute_physics_losses(output.decoded_state, batch, args=args)
+    loss = state_losses["supervised"] + float(args.lambda_state_fm) * state_fm + physics_losses["physics"]
     metrics = {"loss": loss.detach(), "loss_state_fm": state_fm.detach()}
     for key, value in state_losses.items():
+        metrics[f"loss_{key}"] = value.detach()
+    for key, value in physics_losses.items():
         metrics[f"loss_{key}"] = value.detach()
     return loss, metrics, output
 
@@ -481,6 +616,20 @@ def transform_object_points(points: Tensor, transforms: Tensor) -> Tensor:
     ones = torch.ones_like(points[..., :1])
     homogeneous = torch.cat([points, ones], dim=-1)
     return torch.matmul(transforms.unsqueeze(-3), homogeneous.unsqueeze(-1)).squeeze(-1)[..., :3]
+
+
+def target_human_points_for_frame(
+    batch: Dict[str, object],
+    *,
+    sample_index: int,
+    frame_index: int,
+    fallback_base: Tensor,
+    fallback_translation: Tensor,
+) -> Tensor:
+    human_vertices = batch.get("human_vertices")
+    if isinstance(human_vertices, Tensor) and human_vertices.ndim >= 4 and human_vertices.shape[-2] > 0:
+        return human_vertices[sample_index, frame_index, ..., :3].detach().float()
+    return fallback_base[sample_index] + fallback_translation[sample_index, frame_index].view(1, 3)
 
 
 def select_render_points(points: Tensor, max_points: int) -> Tensor:
@@ -696,7 +845,7 @@ def export_pointcloud_debug(
         "frame_index": 0,
         "notes": [
             "canonical clouds use decoded/target Gaussian xyz before per-frame transforms",
-            "relative_frame0000 applies human-relative translation or object transform for frame 0",
+            "relative_frame0000 uses SMPL vertices for GT human when available, otherwise Gaussian xyz plus translation",
             "PNG/GIF renders are produced with render.pyt3d_wrapper.PcloudRenderer",
         ],
     }
@@ -864,7 +1013,13 @@ def render_prediction_batch(
             target_object_transforms[sample_idx, 0],
         )
         pred_human_relative0 = pred_human_base[sample_idx] + pred_human_translation[sample_idx, 0].view(1, 3)
-        target_human_relative0 = target_human_base[sample_idx] + target_human_translation[sample_idx, 0].view(1, 3)
+        target_human_relative0 = target_human_points_for_frame(
+            batch,
+            sample_index=sample_idx,
+            frame_index=0,
+            fallback_base=target_human_base,
+            fallback_translation=target_human_translation,
+        )
         sequence_name = batch.get("sequence_name")
         if isinstance(sequence_name, (list, tuple)):
             sequence_value = sequence_name[sample_idx]
@@ -884,7 +1039,13 @@ def render_prediction_batch(
         )
         for frame_idx in range(num_frames):
             pred_human = pred_human_base[sample_idx] + pred_human_translation[sample_idx, frame_idx].view(1, 3)
-            target_human = target_human_base[sample_idx] + target_human_translation[sample_idx, frame_idx].view(1, 3)
+            target_human = target_human_points_for_frame(
+                batch,
+                sample_index=sample_idx,
+                frame_index=frame_idx,
+                fallback_base=target_human_base,
+                fallback_translation=target_human_translation,
+            )
             pred_object = transform_object_points(
                 pred_object_base[sample_idx],
                 pred_object_transforms[sample_idx, frame_idx],
@@ -978,11 +1139,17 @@ def _relative_reconstruction_point_groups(
 ]:
     pred_human_base = decoded.human_gaussians[sample_index, ..., :3]
     pred_object_base = decoded.object_gaussians[sample_index, ..., :3]
-    target_human_base = batch["human_gaussians"][sample_index, ..., :3]
+    target_human_base = batch["human_gaussians"][..., :3]
     target_object_base = batch["object_gaussians"][sample_index, ..., :3]
 
     pred_human = pred_human_base + decoded.human_translation[sample_index, frame_index].view(1, 3)
-    target_human = target_human_base + batch["cam_t"][sample_index, frame_index].view(1, 3)
+    target_human = target_human_points_for_frame(
+        batch,
+        sample_index=sample_index,
+        frame_index=frame_index,
+        fallback_base=target_human_base,
+        fallback_translation=batch["cam_t"],
+    )
     pred_object = transform_object_points(
         pred_object_base,
         decoded.object_transforms[sample_index, frame_index],
@@ -1869,6 +2036,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_object_gaussians", type=int, default=256)
     parser.add_argument("--num_joints", type=int, default=22)
     parser.add_argument("--contact_dim", type=int, default=4)
+    parser.add_argument("--contact_joint_indices", type=str, default="")
     parser.add_argument("--human_shape_dim", type=int, default=10)
     parser.add_argument("--human_pose_dim", type=int, default=72)
 
@@ -1885,6 +2053,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_gaussian_chamfer", type=float, default=1.0)
     parser.add_argument("--lambda_gaussian_xyz_l1", type=float, default=0.05)
     parser.add_argument("--lambda_gaussian_attr_l1", type=float, default=0.1)
+    parser.add_argument("--lambda_phys_contact", type=float, default=0.0)
+    parser.add_argument("--lambda_dense_contact", type=float, default=0.0)
+    parser.add_argument("--dense_contact_max_points", type=int, default=512)
 
     parser.add_argument("--test_max_batches", type=int, default=0)
     parser.add_argument("--test_every", type=int, default=0)

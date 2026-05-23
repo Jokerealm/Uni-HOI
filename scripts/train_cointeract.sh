@@ -20,10 +20,12 @@ TRAIN_ARGS=(
   --data_root "${DATA_ROOT}" \
   --output_dir "${OUTPUT_DIR}" \
   --wan_model_id "${WAN_MODEL_ID}" \
+  --rgb_to_hoi_scale "${RGB_TO_HOI_SCALE:-1.0}" \
+  --hoi_to_rgb_scale "${HOI_TO_RGB_SCALE:-0.0}" \
   --clip_length "${CLIP_LENGTH:-1}" \
   --clip_stride "${CLIP_STRIDE:-1}" \
   --coordinate_mode "${COORDINATE_MODE:-relative}" \
-  --max_steps "${MAX_STEPS:-7000}" \
+  --max_steps "${MAX_STEPS:-35000}" \
   --batch_size "${BATCH_SIZE:-16}" \
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-1}" \
   --lr "${LR:-2e-5}" \

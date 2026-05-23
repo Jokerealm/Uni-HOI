@@ -2,9 +2,9 @@
 
 This branch keeps the existing HDM/ProciGen/BEHAVE dataloader and preprocessing assets, but replaces the old training code with a new experimental model:
 
-- RGB stream: single-image input through the frozen Wan visual prior.
-- HOI stream: explicit single-frame HOI tokens for human/object Gaussians, joints, SMPL pose/shape/translation, object SE(3), and contact in a human-relative coordinate frame.
-- Fusion: CoInteract-style RGB hidden tokens guide the HOI stream. By default the Wan RGB stream is frozen and gradients update only the HOI stream.
+- RGB stream: RGB frame/video latents through the frozen Wan visual prior.
+- HOI stream: explicit per-clip HOI tokens for human/object Gaussians, joints, SMPL pose/shape/translation, object SE(3), and contact in a human-relative coordinate frame.
+- Fusion: HOI-primary CoInteract-style dual stream. RGB hidden tokens are the auxiliary stream; each HOI block updates HOI tokens as the main denoising stream and injects RGB context through zero-init cross-stream adapters. By default the Wan RGB stream is frozen/detached and gradients update only the HOI-side modules.
 - Default schedule: short sample/smoke runs use constant-with-warmup learning rate and select step count from effective dataset passes.
 
 ## Train
@@ -27,8 +27,15 @@ Useful overrides:
 WAN_MODEL_ID=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
 DATA_ROOT=/path/to/prepared/sequences \
 LOG_WITH=wandb \
-scripts/train_cointeract.sh --batch_size 1 --clip_length 1 --num_human_gaussians 750 --num_object_gaussians 750
+CLIP_LENGTH=5 \
+scripts/train_cointeract.sh --batch_size 1 --num_human_gaussians 750 --num_object_gaussians 750
 ```
+
+Dual-stream controls:
+
+- `--rgb_to_hoi_scale`: strength of RGB auxiliary tokens guiding the HOI main stream.
+- `--hoi_to_rgb_scale`: optional reverse adapter for symmetric experimentation; default `0.0` keeps the CoInteract-style asymmetric direction but with HOI as the retained main stream.
+- `--no-detach_rgb_context`: allow HOI loss to update the Wan RGB branch when `--no-freeze_wan` is also used. The default keeps the RGB video prior as a fixed collaborator.
 
 For single-image sample data, choose `MAX_STEPS` by effective passes rather than paper-scale step counts:
 

@@ -121,7 +121,7 @@ class MultiHeadAttention(nn.Module):
         self.out = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, query: Tensor, context: Optional[Tensor] = None) -> Tensor:
+    def forward(self, query: Tensor, context: Optional[Tensor] = None, attn_mask: Optional[Tensor] = None) -> Tensor:
         if context is None:
             context = query
         batch_size, query_len, dim = query.shape
@@ -130,10 +130,26 @@ class MultiHeadAttention(nn.Module):
         q = self.q(query).view(batch_size, query_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k(context).view(batch_size, context_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v(context).view(batch_size, context_len, self.num_heads, self.head_dim).transpose(1, 2)
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(device=query.device)
+            if attn_mask.dtype == torch.bool:
+                additive_mask = torch.zeros(attn_mask.shape, device=query.device, dtype=q.dtype)
+                additive_mask = additive_mask.masked_fill(~attn_mask, -torch.finfo(q.dtype).max)
+            else:
+                additive_mask = attn_mask.to(dtype=q.dtype)
+            if additive_mask.ndim == 2:
+                additive_mask = additive_mask.unsqueeze(0).unsqueeze(0)
+            elif additive_mask.ndim == 3:
+                additive_mask = additive_mask.unsqueeze(1)
+            elif additive_mask.ndim != 4:
+                raise ValueError(f"`attn_mask` must have 2, 3, or 4 dims, got {additive_mask.ndim}.")
+        else:
+            additive_mask = None
         attended = F.scaled_dot_product_attention(
             q,
             k,
             v,
+            attn_mask=additive_mask,
             dropout_p=self.dropout.p if self.training else 0.0,
         )
         attended = attended.transpose(1, 2).reshape(batch_size, query_len, dim)
@@ -206,7 +222,7 @@ class DecodedHOIState:
 
 
 class HOIStateCodec(nn.Module):
-    """Explicit HOI tokenization used by the RGB->HOI stream."""
+    """Explicit HOI tokenization used by the HOI-primary denoising stream."""
 
     def __init__(
         self,
@@ -646,17 +662,45 @@ class FrozenWanTI2VImageStream(nn.Module):
 
 
 class CoInteractHOIBlock(nn.Module):
+    """HOI-primary dual-stream block.
+
+    The HOI stream is the denoising stream that produces the final state. RGB tokens
+    stay auxiliary: they get a lightweight DiT-style update and guide HOI through
+    zero-init cross adapters, while the optional reverse adapter is off by default.
+    """
+
     def __init__(self, *, hidden_dim: int, num_heads: int, mlp_ratio: float, dropout: float) -> None:
         super().__init__()
-        self.state_block = TransformerBlock(hidden_dim, num_heads, mlp_ratio, dropout)
-        self.from_rgb = ZeroInitCrossAdapter(hidden_dim, num_heads, dropout)
-        self.from_image = ZeroInitCrossAdapter(hidden_dim, num_heads, dropout)
-        self.gate = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.Sigmoid())
+        self.hoi_block = TransformerBlock(hidden_dim, num_heads, mlp_ratio, dropout)
+        self.rgb_block = TransformerBlock(hidden_dim, num_heads, mlp_ratio, dropout)
+        self.rgb_to_hoi = ZeroInitCrossAdapter(hidden_dim, num_heads, dropout)
+        self.image_to_hoi = ZeroInitCrossAdapter(hidden_dim, num_heads, dropout)
+        self.hoi_to_rgb = ZeroInitCrossAdapter(hidden_dim, num_heads, dropout)
+        self.hoi_gate = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.Sigmoid())
+        self.rgb_gate = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.Sigmoid())
 
-    def forward(self, state_tokens: Tensor, *, rgb_tokens: Tensor, image_tokens: Tensor, rgb_scale: float) -> Tensor:
-        state_tokens = self.state_block(state_tokens)
-        state_tokens = state_tokens + float(rgb_scale) * self.gate(state_tokens) * self.from_rgb(state_tokens, rgb_tokens)
-        return state_tokens + self.from_image(state_tokens, image_tokens)
+    def forward(
+        self,
+        hoi_tokens: Tensor,
+        *,
+        rgb_tokens: Tensor,
+        image_tokens: Tensor,
+        rgb_to_hoi_scale: float,
+        hoi_to_rgb_scale: float,
+    ) -> Tuple[Tensor, Tensor]:
+        hoi_tokens = self.hoi_block(hoi_tokens)
+        rgb_tokens = self.rgb_block(rgb_tokens)
+        hoi_tokens = hoi_tokens + float(rgb_to_hoi_scale) * self.hoi_gate(hoi_tokens) * self.rgb_to_hoi(
+            hoi_tokens,
+            rgb_tokens,
+        )
+        hoi_tokens = hoi_tokens + self.image_to_hoi(hoi_tokens, image_tokens)
+        if float(hoi_to_rgb_scale) != 0.0:
+            rgb_tokens = rgb_tokens + float(hoi_to_rgb_scale) * self.rgb_gate(rgb_tokens) * self.hoi_to_rgb(
+                rgb_tokens,
+                hoi_tokens,
+            )
+        return hoi_tokens, rgb_tokens
 
 
 @dataclass
@@ -665,11 +709,12 @@ class CoInteractHOI4DOutput:
     state_velocity: Tensor
     decoded_state: DecodedHOIState
     rgb_hidden_tokens: Tensor
+    rgb_context_tokens: Tensor
 
 
 class CoInteractHOI4DModel(nn.Module):
     video_backend = "wan2.2-ti2v-5b"
-    input_mode = "image_only"
+    input_mode = "rgb_video_guided_hoi"
 
     def __init__(
         self,
@@ -695,12 +740,16 @@ class CoInteractHOI4DModel(nn.Module):
         wan_prompt_max_sequence_length: int = 512,
         wan_local_files_only: bool = True,
         freeze_wan: bool = True,
+        detach_rgb_context: bool = True,
+        enable_hoi_to_rgb: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.num_frames = int(num_frames)
         self.image_height = int(image_height)
         self.image_width = int(image_width)
+        self.detach_rgb_context = bool(detach_rgb_context)
+        self.enable_hoi_to_rgb = bool(enable_hoi_to_rgb)
         self.state_codec = HOIStateCodec(
             hidden_dim=hidden_dim,
             num_human_gaussians=num_human_gaussians,
@@ -749,6 +798,10 @@ class CoInteractHOI4DModel(nn.Module):
                 for _ in range(depth)
             ]
         )
+        if not self.enable_hoi_to_rgb:
+            for block in self.blocks:
+                block.hoi_to_rgb.requires_grad_(False)
+                block.rgb_gate.requires_grad_(False)
         self.state_norm = nn.LayerNorm(hidden_dim)
         self.state_velocity_head = nn.Linear(hidden_dim, hidden_dim)
         nn.init.zeros_(self.state_velocity_head.weight)
@@ -793,21 +846,25 @@ class CoInteractHOI4DModel(nn.Module):
         timesteps: Tensor,
         first_frame: Tensor,
         rgb_to_hoi_scale: float = 1.0,
+        hoi_to_rgb_scale: float = 0.0,
     ) -> CoInteractHOI4DOutput:
         if state_xt.ndim != 3 or state_xt.shape[-1] != self.hidden_dim:
             raise ValueError(f"`state_xt` must have shape [B, L, {self.hidden_dim}], got {tuple(state_xt.shape)}.")
         rgb_output = self.rgb_stream(video_xt=video_xt, timesteps=timesteps)
-        rgb_tokens = self.rgb_token_adapter(rgb_output.hidden_tokens.to(dtype=state_xt.dtype))
+        rgb_hidden_tokens = rgb_output.hidden_tokens.detach() if self.detach_rgb_context else rgb_output.hidden_tokens
+        rgb_tokens = self.rgb_token_adapter(rgb_hidden_tokens.to(dtype=state_xt.dtype))
         image_tokens = self.first_frame_encoder(first_frame.to(dtype=state_xt.dtype))
         time_cond = self.time_embed(timestep_embedding(timesteps, self.hidden_dim)).unsqueeze(1).to(dtype=state_xt.dtype)
         state_tokens = state_xt + time_cond
+        rgb_tokens = rgb_tokens + time_cond
         image_tokens = image_tokens + time_cond
         for block in self.blocks:
-            state_tokens = block(
+            state_tokens, rgb_tokens = block(
                 state_tokens,
                 rgb_tokens=rgb_tokens,
                 image_tokens=image_tokens,
-                rgb_scale=rgb_to_hoi_scale,
+                rgb_to_hoi_scale=rgb_to_hoi_scale,
+                hoi_to_rgb_scale=hoi_to_rgb_scale if self.enable_hoi_to_rgb else 0.0,
             )
         state_velocity = self.state_velocity_head(self.state_norm(state_tokens))
         t_view = timesteps.to(device=state_xt.device, dtype=state_xt.dtype).view(state_xt.shape[0], 1, 1)
@@ -817,6 +874,7 @@ class CoInteractHOI4DModel(nn.Module):
             state_velocity=state_velocity,
             decoded_state=self.decode_state_tokens(predicted_clean_state),
             rgb_hidden_tokens=rgb_output.hidden_tokens,
+            rgb_context_tokens=rgb_tokens,
         )
 
 
