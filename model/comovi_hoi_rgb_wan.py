@@ -120,6 +120,7 @@ class CoMoViDualBranchBlock(nn.Module):
         rgb_prior_tokens: Tensor,
         rgb_to_hoi_scale: float,
         hoi_to_rgb_scale: float,
+        run_hoi_to_rgb: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         hoi_tokens = self.hoi_block(hoi_tokens)
         rgb_prior_tokens = self.rgb_prior_block(rgb_prior_tokens)
@@ -128,7 +129,7 @@ class CoMoViDualBranchBlock(nn.Module):
             hoi_tokens,
             rgb_prior_tokens,
         )
-        if float(hoi_to_rgb_scale) != 0.0:
+        if run_hoi_to_rgb or float(hoi_to_rgb_scale) != 0.0:
             rgb_prior_tokens = rgb_prior_tokens + float(hoi_to_rgb_scale) * self.hoi_to_rgb_gate(
                 rgb_prior_tokens
             ) * self.hoi_to_rgb(rgb_prior_tokens, hoi_tokens)
@@ -372,6 +373,7 @@ class CoMoViHOIRGBModel(nn.Module):
                 rgb_prior_tokens=rgb_prior_tokens,
                 rgb_to_hoi_scale=rgb_to_hoi_scale,
                 hoi_to_rgb_scale=hoi_to_rgb_scale if self.enable_hoi_to_rgb else 0.0,
+                run_hoi_to_rgb=self.enable_hoi_to_rgb,
             )
         hoi_tokens = hoi_tokens + float(cross_3d2d_scale) * self.cross_3d2d_refiner(
             hoi_tokens=hoi_tokens,
@@ -379,6 +381,7 @@ class CoMoViHOIRGBModel(nn.Module):
         )
 
         state_velocity = self.state_velocity_head(self.state_norm(hoi_tokens))
+        state_velocity = state_velocity + hoi_tokens.float().sum().to(dtype=state_velocity.dtype) * 0.0
         t_view = timesteps.to(device=state_xt.device, dtype=state_xt.dtype).view(state_xt.shape[0], 1, 1)
         predicted_clean_state = state_xt + (1.0 - t_view) * state_velocity.to(dtype=state_xt.dtype)
         return CoMoViHOIRGBOutput(

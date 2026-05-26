@@ -35,6 +35,7 @@ Dual-stream controls:
 
 - `--rgb_to_hoi_scale`: strength of RGB auxiliary tokens guiding the HOI main stream.
 - `--hoi_to_rgb_scale`: optional reverse adapter for symmetric experimentation; default `0.0` keeps the CoInteract-style asymmetric direction but with HOI as the retained main stream.
+- `train.sh` defaults to a CoInteract-inspired two-stage schedule: `STAGE1_FULL_ATTENTION_STEPS=5000` with `STAGE1_HOI_TO_RGB_SCALE=1.0`, then asymmetric Stage 2 with `HOI_TO_RGB_SCALE=0.0` until `MAX_STEPS=7000`. It also sets `SAVE_EVERY=100` and `TRAIN_VISUAL_EVERY=100`.
 - `--no-detach_rgb_context`: allow HOI loss to update the Wan RGB branch when `--no-freeze_wan` is also used. The default keeps the RGB video prior as a fixed collaborator.
 
 For single-image sample data, choose `MAX_STEPS` by effective passes rather than paper-scale step counts:

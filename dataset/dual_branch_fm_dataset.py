@@ -27,6 +27,7 @@ import os
 import pickle
 import re
 import threading
+import zipfile
 from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -75,6 +76,42 @@ def _sorted_image_paths(frame_dir: Path) -> List[Path]:
     if not paths:
         raise FileNotFoundError(f"No RGB frames found under {frame_dir}")
     return paths
+
+
+def _npz_has_array(path: Path, key: str) -> bool:
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            return f"{key}.npy" in archive.namelist()
+    except Exception:
+        try:
+            with np.load(path) as payload:
+                return key in payload
+        except Exception:
+            return False
+
+
+def _npz_array_shape(path: Path, key: str) -> Tuple[int, ...]:
+    member = f"{key}.npy"
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            if member not in archive.namelist():
+                raise KeyError(f"Missing `{key}` in {path}")
+            with archive.open(member, "r") as handle:
+                version = np.lib.format.read_magic(handle)
+                shape, _, _ = np.lib.format._read_array_header(handle, version)
+                return tuple(int(dim) for dim in shape)
+    except Exception:
+        with np.load(path) as payload:
+            if key not in payload:
+                raise KeyError(f"Missing `{key}` in {path}")
+            return tuple(int(dim) for dim in payload[key].shape)
+
+
+def _npz_array_first_dim(path: Path, key: str) -> int:
+    shape = _npz_array_shape(path, key)
+    if not shape:
+        return 1
+    return int(shape[0])
 
 
 def _normalize_pose_dim(body_pose: np.ndarray, target_dim: int = DEFAULT_HUMAN_POSE_DIM) -> np.ndarray:
@@ -1443,42 +1480,39 @@ def inspect_sequence_num_frames(
     rgb_paths = _sorted_image_paths(cropped_dir / "rgb")
     num_frames = len(rgb_paths)
 
-    with np.load(cropped_dir / "masks_raw.npz") as masks_npz:
-        num_frames = min(
-            num_frames,
-            int(masks_npz["human"].shape[0]),
-            int(masks_npz["object"].shape[0]),
-        )
-    with np.load(cropped_dir / "region_masks.npz") as region_npz:
-        num_frames = min(
-            num_frames,
-            int(region_npz["M_p"].shape[0]),
-            int(region_npz["M_s"].shape[0]),
-            int(region_npz["M_object"].shape[0]),
-        )
-    with np.load(cropped_dir / "depth_aligned.npz") as depth_npz:
-        num_frames = min(num_frames, int(depth_npz["depth"].shape[0]))
-    with np.load(cropped_dir / "meta.npz") as meta_npz:
-        num_frames = min(
-            num_frames,
-            int(meta_npz["fx"].shape[0]),
-            int(meta_npz["fy"].shape[0]),
-            int(meta_npz["cx"].shape[0]),
-            int(meta_npz["cy"].shape[0]),
-        )
+    masks_path = cropped_dir / "masks_raw.npz"
+    num_frames = min(
+        num_frames,
+        _npz_array_first_dim(masks_path, "human"),
+        _npz_array_first_dim(masks_path, "object"),
+    )
+    region_path = cropped_dir / "region_masks.npz"
+    num_frames = min(
+        num_frames,
+        _npz_array_first_dim(region_path, "M_p"),
+        _npz_array_first_dim(region_path, "M_s"),
+        _npz_array_first_dim(region_path, "M_object"),
+    )
+    num_frames = min(num_frames, _npz_array_first_dim(cropped_dir / "depth_aligned.npz", "depth"))
+    meta_path = cropped_dir / "meta.npz"
+    num_frames = min(
+        num_frames,
+        _npz_array_first_dim(meta_path, "fx"),
+        _npz_array_first_dim(meta_path, "fy"),
+        _npz_array_first_dim(meta_path, "cx"),
+        _npz_array_first_dim(meta_path, "cy"),
+    )
 
     keypoints_path = cropped_dir / "keypoints_2d.npz"
     if not keypoints_path.is_file():
         raise FileNotFoundError(f"Missing required keypoints file: {keypoints_path}")
-    with np.load(keypoints_path) as keypoints_npz:
-        num_frames = min(num_frames, int(keypoints_npz["keypoints"].shape[0]))
+    num_frames = min(num_frames, _npz_array_first_dim(keypoints_path, "keypoints"))
 
     object_pose_path = sequence_path / processed_subdir / "object_poses.npz"
     if object_pose_path.is_file():
-        with np.load(object_pose_path) as object_pose_npz:
-            if "object_poses" not in object_pose_npz:
-                raise KeyError(f"Missing `object_poses` in {object_pose_path}")
-            num_frames = min(num_frames, int(object_pose_npz["object_poses"].shape[0]))
+        if not _npz_has_array(object_pose_path, "object_poses"):
+            raise KeyError(f"Missing `object_poses` in {object_pose_path}")
+        num_frames = min(num_frames, _npz_array_first_dim(object_pose_path, "object_poses"))
     else:
         timestep_dirs = _discover_timestep_dirs(sequence_path)
         if len(timestep_dirs) < num_frames:
@@ -1500,26 +1534,26 @@ def inspect_sequence_num_frames(
             "Expected `G_o.pt` or `gs_init_combined.pt` with key `G_o`."
         )
 
-    with np.load(processed_dir / "smpl_params.npz") as smpl_params:
-        if human_gaussian_source == "teacher":
-            if _maybe_load_gaussians(sequence_path, gs_subdir, "G_h.pt") is None:
-                raise FileNotFoundError(
-                    f"Missing human Gaussian teacher under {sequence_path / gs_subdir}. "
-                    "Expected `G_h.pt` or `gs_init_combined.pt` with key `G_h`."
-                )
-        else:
-            if "vertices" not in smpl_params or "faces" not in smpl_params:
-                raise FileNotFoundError(
-                    f"Missing SMPL mesh geometry under {processed_dir / 'smpl_params.npz'}. "
-                    "Expected `vertices` and `faces` for `human_gaussian_source=smpl_mesh`."
-                )
-        num_frames = min(num_frames, int(smpl_params["body_pose"].shape[0]))
-        if "cam_t" in smpl_params:
-            num_frames = min(num_frames, int(smpl_params["cam_t"].shape[0]))
-        if "joints_3d" in smpl_params:
-            num_frames = min(num_frames, int(smpl_params["joints_3d"].shape[0]))
-        elif "keypoints_3d" in smpl_params:
-            num_frames = min(num_frames, int(smpl_params["keypoints_3d"].shape[0]))
+    smpl_params_path = processed_dir / "smpl_params.npz"
+    if human_gaussian_source == "teacher":
+        if _maybe_load_gaussians(sequence_path, gs_subdir, "G_h.pt") is None:
+            raise FileNotFoundError(
+                f"Missing human Gaussian teacher under {sequence_path / gs_subdir}. "
+                "Expected `G_h.pt` or `gs_init_combined.pt` with key `G_h`."
+            )
+    else:
+        if not _npz_has_array(smpl_params_path, "vertices") or not _npz_has_array(smpl_params_path, "faces"):
+            raise FileNotFoundError(
+                f"Missing SMPL mesh geometry under {smpl_params_path}. "
+                "Expected `vertices` and `faces` for `human_gaussian_source=smpl_mesh`."
+            )
+    num_frames = min(num_frames, _npz_array_first_dim(smpl_params_path, "body_pose"))
+    if _npz_has_array(smpl_params_path, "cam_t"):
+        num_frames = min(num_frames, _npz_array_first_dim(smpl_params_path, "cam_t"))
+    if _npz_has_array(smpl_params_path, "joints_3d"):
+        num_frames = min(num_frames, _npz_array_first_dim(smpl_params_path, "joints_3d"))
+    elif _npz_has_array(smpl_params_path, "keypoints_3d"):
+        num_frames = min(num_frames, _npz_array_first_dim(smpl_params_path, "keypoints_3d"))
 
     return int(num_frames)
 

@@ -78,6 +78,46 @@ def build_scheduler(
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
+def stage1_full_attention_steps(args: argparse.Namespace) -> int:
+    return max(int(getattr(args, "stage1_full_attention_steps", 0)), 0)
+
+
+def stage1_hoi_to_rgb_scale(args: argparse.Namespace) -> float:
+    return float(getattr(args, "stage1_hoi_to_rgb_scale", 1.0))
+
+
+def hoi_to_rgb_scale_for_step(args: argparse.Namespace, step: int) -> float:
+    if int(step) < stage1_full_attention_steps(args):
+        return stage1_hoi_to_rgb_scale(args)
+    return float(getattr(args, "hoi_to_rgb_scale", 0.0))
+
+
+def coattention_stage_for_step(args: argparse.Namespace, step: int) -> int:
+    return 1 if int(step) < stage1_full_attention_steps(args) else 2
+
+
+def should_enable_hoi_to_rgb(args: argparse.Namespace) -> bool:
+    if abs(float(getattr(args, "hoi_to_rgb_scale", 0.0))) > 0.0:
+        return True
+    return stage1_full_attention_steps(args) > 0 and abs(stage1_hoi_to_rgb_scale(args)) > 0.0
+
+
+def zero_loss_anchor_from_output(output) -> Tensor:
+    anchor = output.state_velocity.new_zeros(())
+    for attr_name in (
+        "rgb_velocity",
+        "rgb_hidden_tokens",
+        "rgb_context_tokens",
+        "rgb_prior_tokens",
+        "hoi_tokens",
+        "predicted_clean_state",
+    ):
+        tensor = getattr(output, attr_name, None)
+        if isinstance(tensor, Tensor) and tensor.requires_grad:
+            anchor = anchor + tensor.float().sum() * 0.0
+    return anchor
+
+
 def flow_match_sample(target: Tensor, noise: Tensor, timesteps: Tensor) -> Tuple[Tensor, Tensor]:
     t_view = timesteps.to(device=target.device, dtype=target.dtype).view(target.shape[0], *([1] * (target.ndim - 1)))
     xt = t_view * target + (1.0 - t_view) * noise
@@ -146,7 +186,7 @@ def build_model(args: argparse.Namespace) -> CoInteractHOI4DModel:
         "wan_local_files_only": args.wan_local_files_only,
         "freeze_wan": args.freeze_wan,
         "detach_rgb_context": args.detach_rgb_context,
-        "enable_hoi_to_rgb": abs(args.hoi_to_rgb_scale) > 0.0,
+        "enable_hoi_to_rgb": should_enable_hoi_to_rgb(args),
     }
     if args.model_variant == "comovi":
         return CoMoViHOIRGBModel(
@@ -722,6 +762,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--serial_wan_load", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rgb_to_hoi_scale", type=float, default=1.0)
     parser.add_argument("--hoi_to_rgb_scale", type=float, default=0.0)
+    parser.add_argument("--stage1_full_attention_steps", type=int, default=0)
+    parser.add_argument("--stage1_hoi_to_rgb_scale", type=float, default=1.0)
     parser.add_argument("--cross_3d2d_scale", type=float, default=1.0)
     parser.add_argument("--visual_prior_num_global_tokens", type=int, default=8)
     parser.add_argument("--visual_resampler_depth", type=int, default=2)
@@ -757,12 +799,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.stage1_full_attention_steps < 0:
+        raise ValueError("--stage1_full_attention_steps must be non-negative.")
     if args.clip_length != 1:
         raise ValueError(f"This entrypoint is single-image only; set --clip_length 1, got {args.clip_length}.")
     if (args.clip_length - 1) % 4 != 0:
         raise ValueError(f"Wan2.2-TI2V requires clip_length = 4k + 1, got {args.clip_length}.")
 
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    ddp_find_unused_parameters = False
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=ddp_find_unused_parameters)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -789,7 +834,11 @@ def main() -> None:
             f"| per_gpu_batch={args.batch_size} "
             f"| global_batch={args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps} "
             f"| model={args.model_variant} | wan={args.wan_model_id} "
-            f"| input=single_image | coordinate_mode={args.coordinate_mode}",
+            f"| input=single_image | coordinate_mode={args.coordinate_mode} "
+            f"| coattention_stage1_steps={stage1_full_attention_steps(args)} "
+            f"| stage1_hoi_to_rgb={stage1_hoi_to_rgb_scale(args):.3g} "
+            f"| stage2_hoi_to_rgb={float(args.hoi_to_rgb_scale):.3g} "
+            f"| ddp_find_unused_parameters={ddp_find_unused_parameters}",
             flush=True,
         )
 
@@ -925,13 +974,15 @@ def main() -> None:
                     )
                     state_xt, state_velocity_target = flow_match_sample(state_target, state_noise, timesteps)
 
+                current_hoi_to_rgb_scale = hoi_to_rgb_scale_for_step(args, global_step)
+                current_coattention_stage = coattention_stage_for_step(args, global_step)
                 forward_kwargs = {
                     "video_xt": video_xt,
                     "state_xt": state_xt,
                     "timesteps": timesteps,
                     "first_frame": rgb[:, 0],
                     "rgb_to_hoi_scale": args.rgb_to_hoi_scale,
-                    "hoi_to_rgb_scale": args.hoi_to_rgb_scale,
+                    "hoi_to_rgb_scale": current_hoi_to_rgb_scale,
                 }
                 if args.model_variant == "comovi":
                     forward_kwargs["cross_3d2d_scale"] = args.cross_3d2d_scale
@@ -945,6 +996,7 @@ def main() -> None:
                 if args.lambda_rgb_fm > 0.0:
                     rgb_fm = F.mse_loss(output.rgb_velocity[:, :, 1:].float(), video_velocity_target[:, :, 1:].float())
                     loss = loss + args.lambda_rgb_fm * rgb_fm
+                loss = loss + zero_loss_anchor_from_output(output)
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -965,7 +1017,8 @@ def main() -> None:
                         "loss_physics": float(physics_losses["physics"].detach().item()),
                         "cross_3d2d_scale": float(args.cross_3d2d_scale),
                         "rgb_to_hoi_scale": float(args.rgb_to_hoi_scale),
-                        "hoi_to_rgb_scale": float(args.hoi_to_rgb_scale),
+                        "hoi_to_rgb_scale": float(current_hoi_to_rgb_scale),
+                        "coattention_stage": float(current_coattention_stage),
                         "lr": float(scheduler.get_last_lr()[0]),
                     }
                     for key, value in state_losses.items():
@@ -977,6 +1030,7 @@ def main() -> None:
                     progress.set_postfix(
                         loss=f"{metrics['loss']:.5f}",
                         lr=f"{metrics['lr']:.2e}",
+                        stage=f"s{current_coattention_stage}",
                         refresh=True,
                     )
                     if args.log_with != "none":

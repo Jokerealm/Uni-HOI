@@ -687,6 +687,7 @@ class CoInteractHOIBlock(nn.Module):
         image_tokens: Tensor,
         rgb_to_hoi_scale: float,
         hoi_to_rgb_scale: float,
+        run_hoi_to_rgb: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         hoi_tokens = self.hoi_block(hoi_tokens)
         rgb_tokens = self.rgb_block(rgb_tokens)
@@ -695,7 +696,7 @@ class CoInteractHOIBlock(nn.Module):
             rgb_tokens,
         )
         hoi_tokens = hoi_tokens + self.image_to_hoi(hoi_tokens, image_tokens)
-        if float(hoi_to_rgb_scale) != 0.0:
+        if run_hoi_to_rgb or float(hoi_to_rgb_scale) != 0.0:
             rgb_tokens = rgb_tokens + float(hoi_to_rgb_scale) * self.rgb_gate(rgb_tokens) * self.hoi_to_rgb(
                 rgb_tokens,
                 hoi_tokens,
@@ -865,8 +866,10 @@ class CoInteractHOI4DModel(nn.Module):
                 image_tokens=image_tokens,
                 rgb_to_hoi_scale=rgb_to_hoi_scale,
                 hoi_to_rgb_scale=hoi_to_rgb_scale if self.enable_hoi_to_rgb else 0.0,
+                run_hoi_to_rgb=self.enable_hoi_to_rgb,
             )
         state_velocity = self.state_velocity_head(self.state_norm(state_tokens))
+        state_velocity = state_velocity + state_tokens.float().sum().to(dtype=state_velocity.dtype) * 0.0
         t_view = timesteps.to(device=state_xt.device, dtype=state_xt.dtype).view(state_xt.shape[0], 1, 1)
         predicted_clean_state = state_xt + (1.0 - t_view) * state_velocity.to(dtype=state_xt.dtype)
         return CoInteractHOI4DOutput(
