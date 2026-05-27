@@ -12,7 +12,7 @@ from .cointeract_hoi_wan import (
     FrozenWanTI2VImageStream,
     HOIStateCodec,
     MultiHeadAttention,
-    TransformerBlock,
+    SharedStreamTransformerBlock,
     ZeroInitCrossAdapter,
     timestep_embedding,
 )
@@ -102,12 +102,11 @@ class CoMoViVisualPriorResampler(nn.Module):
 
 
 class CoMoViDualBranchBlock(nn.Module):
-    """Dual branch block with zero-init mutual feature interaction."""
+    """Shared dual-branch block with zero-init mutual feature interaction."""
 
     def __init__(self, *, hidden_dim: int, num_heads: int, mlp_ratio: float, dropout: float) -> None:
         super().__init__()
-        self.hoi_block = TransformerBlock(hidden_dim, num_heads, mlp_ratio, dropout)
-        self.rgb_prior_block = TransformerBlock(hidden_dim, num_heads, mlp_ratio, dropout)
+        self.shared_block = SharedStreamTransformerBlock(hidden_dim, num_heads, mlp_ratio, dropout)
         self.rgb_to_hoi = ZeroInitCrossAdapter(hidden_dim, num_heads, dropout)
         self.hoi_to_rgb = ZeroInitCrossAdapter(hidden_dim, num_heads, dropout)
         self.rgb_to_hoi_gate = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.Sigmoid())
@@ -118,12 +117,13 @@ class CoMoViDualBranchBlock(nn.Module):
         *,
         hoi_tokens: Tensor,
         rgb_prior_tokens: Tensor,
+        time_cond: Tensor,
         rgb_to_hoi_scale: float,
         hoi_to_rgb_scale: float,
         run_hoi_to_rgb: bool = False,
     ) -> Tuple[Tensor, Tensor]:
-        hoi_tokens = self.hoi_block(hoi_tokens)
-        rgb_prior_tokens = self.rgb_prior_block(rgb_prior_tokens)
+        hoi_tokens = self.shared_block(hoi_tokens, time_cond=time_cond, stream="hoi")
+        rgb_prior_tokens = self.shared_block(rgb_prior_tokens, time_cond=time_cond, stream="rgb")
 
         hoi_tokens = hoi_tokens + float(rgb_to_hoi_scale) * self.rgb_to_hoi_gate(hoi_tokens) * self.rgb_to_hoi(
             hoi_tokens,
@@ -371,6 +371,7 @@ class CoMoViHOIRGBModel(nn.Module):
             hoi_tokens, rgb_prior_tokens = block(
                 hoi_tokens=hoi_tokens,
                 rgb_prior_tokens=rgb_prior_tokens,
+                time_cond=time_cond,
                 rgb_to_hoi_scale=rgb_to_hoi_scale,
                 hoi_to_rgb_scale=hoi_to_rgb_scale if self.enable_hoi_to_rgb else 0.0,
                 run_hoi_to_rgb=self.enable_hoi_to_rgb,

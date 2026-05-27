@@ -176,6 +176,73 @@ class TransformerBlock(nn.Module):
         return x + self.mlp(self.norm2(x))
 
 
+class StreamAdaptiveModulation(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.to_scale_shift = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, dim * 4),
+        )
+        nn.init.zeros_(self.to_scale_shift[-1].weight)
+        nn.init.zeros_(self.to_scale_shift[-1].bias)
+
+    def forward(self, time_cond: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        if time_cond.ndim == 3:
+            if time_cond.shape[1] != 1:
+                time_cond = time_cond.mean(dim=1, keepdim=True)
+            cond = time_cond.squeeze(1)
+        elif time_cond.ndim == 2:
+            cond = time_cond
+        else:
+            raise ValueError(f"`time_cond` must have shape [B, D] or [B, 1, D], got {tuple(time_cond.shape)}.")
+        shift_attn, scale_attn, shift_mlp, scale_mlp = self.to_scale_shift(cond).chunk(4, dim=-1)
+        return (
+            shift_attn.unsqueeze(1),
+            scale_attn.unsqueeze(1),
+            shift_mlp.unsqueeze(1),
+            scale_mlp.unsqueeze(1),
+        )
+
+
+class SharedStreamTransformerBlock(nn.Module):
+    """Shared DiT block with stream-specific AdaLN scale/shift modulation."""
+
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float = 0.0) -> None:
+        super().__init__()
+        hidden = int(round(dim * mlp_ratio))
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.attn = MultiHeadAttention(dim, num_heads, dropout)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, dim),
+            nn.Dropout(dropout),
+        )
+        self.hoi_modulation = StreamAdaptiveModulation(dim)
+        self.rgb_modulation = StreamAdaptiveModulation(dim)
+
+    def _modulation_for_stream(self, stream: str) -> StreamAdaptiveModulation:
+        if stream == "hoi":
+            return self.hoi_modulation
+        if stream == "rgb":
+            return self.rgb_modulation
+        raise ValueError(f"Unknown stream {stream!r}; expected 'hoi' or 'rgb'.")
+
+    def forward(self, x: Tensor, *, time_cond: Tensor, stream: str) -> Tensor:
+        shift_attn, scale_attn, shift_mlp, scale_mlp = self._modulation_for_stream(stream)(time_cond)
+        shift_attn = shift_attn.to(device=x.device, dtype=x.dtype)
+        scale_attn = scale_attn.to(device=x.device, dtype=x.dtype)
+        shift_mlp = shift_mlp.to(device=x.device, dtype=x.dtype)
+        scale_mlp = scale_mlp.to(device=x.device, dtype=x.dtype)
+
+        attn_input = self.norm1(x) * (1.0 + scale_attn) + shift_attn
+        x = x + self.attn(attn_input)
+        mlp_input = self.norm2(x) * (1.0 + scale_mlp) + shift_mlp
+        return x + self.mlp(mlp_input)
+
+
 class ZeroInitCrossAdapter(nn.Module):
     def __init__(self, dim: int, num_heads: int, dropout: float = 0.0) -> None:
         super().__init__()
@@ -662,17 +729,16 @@ class FrozenWanTI2VImageStream(nn.Module):
 
 
 class CoInteractHOIBlock(nn.Module):
-    """HOI-primary dual-stream block.
+    """HOI-primary shared-stream block.
 
-    The HOI stream is the denoising stream that produces the final state. RGB tokens
-    stay auxiliary: they get a lightweight DiT-style update and guide HOI through
-    zero-init cross adapters, while the optional reverse adapter is off by default.
+    The DiT attention/MLP weights are shared across HOI and RGB tokens. Modality
+    identity lives in the input patch/projection layers and the stream-specific
+    AdaLN scale/shift modulation. The retained prediction head remains HOI-only.
     """
 
     def __init__(self, *, hidden_dim: int, num_heads: int, mlp_ratio: float, dropout: float) -> None:
         super().__init__()
-        self.hoi_block = TransformerBlock(hidden_dim, num_heads, mlp_ratio, dropout)
-        self.rgb_block = TransformerBlock(hidden_dim, num_heads, mlp_ratio, dropout)
+        self.shared_block = SharedStreamTransformerBlock(hidden_dim, num_heads, mlp_ratio, dropout)
         self.rgb_to_hoi = ZeroInitCrossAdapter(hidden_dim, num_heads, dropout)
         self.image_to_hoi = ZeroInitCrossAdapter(hidden_dim, num_heads, dropout)
         self.hoi_to_rgb = ZeroInitCrossAdapter(hidden_dim, num_heads, dropout)
@@ -685,12 +751,13 @@ class CoInteractHOIBlock(nn.Module):
         *,
         rgb_tokens: Tensor,
         image_tokens: Tensor,
+        time_cond: Tensor,
         rgb_to_hoi_scale: float,
         hoi_to_rgb_scale: float,
         run_hoi_to_rgb: bool = False,
     ) -> Tuple[Tensor, Tensor]:
-        hoi_tokens = self.hoi_block(hoi_tokens)
-        rgb_tokens = self.rgb_block(rgb_tokens)
+        hoi_tokens = self.shared_block(hoi_tokens, time_cond=time_cond, stream="hoi")
+        rgb_tokens = self.shared_block(rgb_tokens, time_cond=time_cond, stream="rgb")
         hoi_tokens = hoi_tokens + float(rgb_to_hoi_scale) * self.hoi_gate(hoi_tokens) * self.rgb_to_hoi(
             hoi_tokens,
             rgb_tokens,
@@ -864,6 +931,7 @@ class CoInteractHOI4DModel(nn.Module):
                 state_tokens,
                 rgb_tokens=rgb_tokens,
                 image_tokens=image_tokens,
+                time_cond=time_cond,
                 rgb_to_hoi_scale=rgb_to_hoi_scale,
                 hoi_to_rgb_scale=hoi_to_rgb_scale if self.enable_hoi_to_rgb else 0.0,
                 run_hoi_to_rgb=self.enable_hoi_to_rgb,
@@ -887,5 +955,6 @@ __all__ = [
     "DecodedHOIState",
     "FrozenWanTI2VImageStream",
     "HOIStateCodec",
+    "SharedStreamTransformerBlock",
     "timestep_embedding",
 ]

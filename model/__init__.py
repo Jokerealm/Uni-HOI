@@ -4,6 +4,7 @@ from .cointeract_hoi_wan import (
     DecodedHOIState,
     FrozenWanTI2VImageStream,
     HOIStateCodec,
+    SharedStreamTransformerBlock,
 )
 from .comovi_hoi_rgb_wan import CoMoViHOIRGBModel, CoMoViHOIRGBOutput
 from .UniModel import FrozenWanVAEEncoder, UniModel, UniModelOutput
@@ -17,6 +18,7 @@ __all__ = [
     "FrozenWanTI2VImageStream",
     "FrozenWanVAEEncoder",
     "HOIStateCodec",
+    "SharedStreamTransformerBlock",
     "UniModel",
     "UniModelOutput",
 ]

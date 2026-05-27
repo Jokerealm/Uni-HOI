@@ -6,6 +6,7 @@ Metric note: `CD-mean = (CD-h + CD-o + CD-c) / 3`. Lower is better for Chamfer m
 
 | Date | Model / Change | Run | Eval Split | Eval Type | Best Step | Selection Metric | Loss | CD-h | CD-o | CD-c | CD-mean | Notes |
 | --- | --- | --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-05-27 | Shared CoInteract DiT + stream-specific AdaLN modulation | `outputs/cointeract_shared_hoi_wan_wai_train_test` | BEHAVE heldout/test | Full sampled ODE12, 720 test samples, batch 4 | 15000 | Final checkpoint, test-only full eval | 0.666188 | 0.535666 | 0.827476 | 0.468738 | 0.610627 | WAI train run resumed from step 4000 to 15000. Stage 1 uses full RGB/HOI coupling to step 10000; stage 2 keeps RGB->HOI and disables HOI->RGB so the final objective stays HOI reconstruction focused. |
 | 2026-05-21 | Single-stream DiT baseline | `outputs/unimodel_wai_real_smoke` | BEHAVE heldout | Periodic, 1 heldout batch/checkpoint | 3000 | Lowest balanced Chamfer `CD-mean` | 0.469080 | 0.999356 | 1.023499 | 0.788353 | 0.937069 | 35k-step run; periodic curve suggests overfitting after about 3000-4000 steps. Final full heldout eval at step 35000: loss 0.468048, CD-h 0.877061, CD-o 0.891454, CD-c 0.670546. |
 | 2026-05-22 | Dual-stream DiT + dense contact | `outputs/HOI_contact` | BEHAVE heldout | Periodic, 1 heldout batch/checkpoint | 400 | Lowest balanced Chamfer `CD-mean` | 0.536751 | 0.968247 | 0.883364 | 0.758166 | 0.869926 | 35k-step run with `lambda_dense_contact=0.01`; periodic best improves CD-mean by 0.067143 (-7.17%) vs single-stream best, mainly from lower object Chamfer. Final full heldout eval at step 35000: loss 0.466278, CD-h 0.821474, CD-o 0.878777, CD-c 0.655671, CD-mean 0.785307 (-3.41% vs single-stream final full CD-mean 0.813020). Periodic final checkpoint CD-mean is 1.204004, so checkpoint selection still favors the early window. |
 | 2026-05-25 | HOI/RGB dual-branch dual-stream DiT | `outputs/cointeract_hoi_wan_ti2v` | BEHAVE heldout | Sampled ODE12, 5 heldout batches/checkpoint | 25000 | Lowest balanced Chamfer `CD-mean` in full 5-batch scan | 1.175909 | 0.752070 | 1.075914 | 0.586708 | 0.804897 | 35k-step run; output dir and config still say `cointeract`, but this checkpoint uses HOI/RGB dual-stream blocks with separate `hoi_block` and `rgb_block`. 1-batch scan best was step 21000 with CD-mean 0.354031, but the more stable 5-batch scan selected step 25000. Final sampled eval at step 35000: loss 1.190640, CD-h 0.840388, CD-o 1.208056, CD-c 0.687815, CD-mean 0.912086. |
@@ -19,14 +20,15 @@ Lower is better for all Chamfer metrics. On the same BEHAVE heldout protocol, th
 | Periodic best checkpoint | 0.937069 | 0.869926 | -0.067143 | -7.17% |
 | Final full heldout at 35000 | 0.813020 | 0.785307 | -0.027713 | -3.41% |
 
-## Current Three-Method Snapshot
+## Current Method Snapshot
 
-The newest HOI/RGB run uses sampled ODE12 evaluation, while the two earlier rows used the `main.py` periodic test loop, so treat this as a directional checkpoint-selection comparison rather than a fully identical protocol.
+The newest HOI/RGB rows use sampled ODE12 evaluation, while the two earlier rows used the `main.py` periodic test loop, so treat this as a directional checkpoint-selection comparison rather than a fully identical protocol.
 
 | Method | Run | Eval Used | Best Step | CD-mean | Step Takeaway |
 | --- | --- | --- | ---: | ---: | --- |
 | Single-stream DiT baseline | `outputs/unimodel_wai_real_smoke` | Periodic, 1 heldout batch/checkpoint | 3000 | 0.937069 | Strong overfitting after roughly 3000-4000 steps. |
 | Previous dual-stream/dense-contact run | `outputs/HOI_contact` | Periodic, 1 heldout batch/checkpoint | 400 | 0.869926 | Best very early; final checkpoint is worse under periodic eval. |
 | HOI/RGB dual-branch dual-stream DiT | `outputs/cointeract_hoi_wan_ti2v` | Sampled ODE12, 5 heldout batches/checkpoint | 25000 | 0.804897 | Best broad window is roughly 24000-33000; 35000 has started to degrade. |
+| Shared CoInteract DiT + stream-specific AdaLN modulation | `outputs/cointeract_shared_hoi_wan_wai_train_test` | Full sampled ODE12, 720 heldout/test samples | 15000 | 0.610627 | Best recorded test-only result so far; stage 2 keeps the model HOI-reconstruction focused after shared RGB/HOI representation learning. |
 
-Under the recorded best-checkpoint numbers, the HOI/RGB dual-branch dual-stream DiT improves CD-mean by 0.132172 (-14.10%) vs the single-stream baseline and by 0.065029 (-7.48%) vs the previous recorded dual-stream/dense-contact run.
+Under the recorded best-checkpoint numbers, the shared CoInteract DiT run improves CD-mean by 0.326442 (-34.84%) vs the single-stream baseline, by 0.259299 (-29.81%) vs the previous dual-stream/dense-contact run, and by 0.194270 (-24.14%) vs the independent HOI/RGB dual-branch DiT run.
