@@ -230,17 +230,50 @@ class SharedStreamTransformerBlock(nn.Module):
             return self.rgb_modulation
         raise ValueError(f"Unknown stream {stream!r}; expected 'hoi' or 'rgb'.")
 
-    def forward(self, x: Tensor, *, time_cond: Tensor, stream: str) -> Tensor:
+    def _modulate(self, x: Tensor, *, time_cond: Tensor, stream: str, mlp: bool = False) -> Tensor:
         shift_attn, scale_attn, shift_mlp, scale_mlp = self._modulation_for_stream(stream)(time_cond)
-        shift_attn = shift_attn.to(device=x.device, dtype=x.dtype)
-        scale_attn = scale_attn.to(device=x.device, dtype=x.dtype)
-        shift_mlp = shift_mlp.to(device=x.device, dtype=x.dtype)
-        scale_mlp = scale_mlp.to(device=x.device, dtype=x.dtype)
+        if mlp:
+            shift = shift_mlp
+            scale = scale_mlp
+            normed = self.norm2(x)
+        else:
+            shift = shift_attn
+            scale = scale_attn
+            normed = self.norm1(x)
+        shift = shift.to(device=x.device, dtype=x.dtype)
+        scale = scale.to(device=x.device, dtype=x.dtype)
+        return normed * (1.0 + scale) + shift
 
-        attn_input = self.norm1(x) * (1.0 + scale_attn) + shift_attn
+    def forward(self, x: Tensor, *, time_cond: Tensor, stream: str) -> Tensor:
+        attn_input = self._modulate(x, time_cond=time_cond, stream=stream, mlp=False)
         x = x + self.attn(attn_input)
-        mlp_input = self.norm2(x) * (1.0 + scale_mlp) + shift_mlp
+        mlp_input = self._modulate(x, time_cond=time_cond, stream=stream, mlp=True)
         return x + self.mlp(mlp_input)
+
+    def forward_full_pair(self, hoi_tokens: Tensor, rgb_tokens: Tensor, *, time_cond: Tensor) -> Tuple[Tensor, Tensor]:
+        """Stage-1 full attention over concatenated HOI/RGB tokens with shared weights."""
+
+        hoi_len = int(hoi_tokens.shape[1])
+        attn_input = torch.cat(
+            [
+                self._modulate(hoi_tokens, time_cond=time_cond, stream="hoi", mlp=False),
+                self._modulate(rgb_tokens, time_cond=time_cond, stream="rgb", mlp=False),
+            ],
+            dim=1,
+        )
+        attended = self.attn(attn_input)
+        hoi_tokens = hoi_tokens + attended[:, :hoi_len]
+        rgb_tokens = rgb_tokens + attended[:, hoi_len:]
+
+        mlp_input = torch.cat(
+            [
+                self._modulate(hoi_tokens, time_cond=time_cond, stream="hoi", mlp=True),
+                self._modulate(rgb_tokens, time_cond=time_cond, stream="rgb", mlp=True),
+            ],
+            dim=1,
+        )
+        mlp_out = self.mlp(mlp_input)
+        return hoi_tokens + mlp_out[:, :hoi_len], rgb_tokens + mlp_out[:, hoi_len:]
 
 
 class ZeroInitCrossAdapter(nn.Module):
@@ -745,39 +778,77 @@ class CoInteractHOIBlock(nn.Module):
         self.hoi_gate = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.Sigmoid())
         self.rgb_gate = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.Sigmoid())
 
+    def _zero_reverse_anchor(self, reference: Tensor) -> Tensor:
+        anchor = reference.new_zeros(())
+        for module in (self.hoi_to_rgb, self.rgb_gate):
+            for param in module.parameters():
+                if param.requires_grad:
+                    anchor = anchor + param.float().sum() * 0.0
+        return anchor.to(device=reference.device, dtype=reference.dtype)
+
+    def _zero_asymmetric_anchor(self, reference: Tensor) -> Tensor:
+        anchor = reference.new_zeros(())
+        for module in (self.rgb_to_hoi, self.hoi_gate):
+            for param in module.parameters():
+                if param.requires_grad:
+                    anchor = anchor + param.float().sum() * 0.0
+        return anchor.to(device=reference.device, dtype=reference.dtype)
+
     def forward(
         self,
         hoi_tokens: Tensor,
         *,
-        rgb_tokens: Tensor,
-        image_tokens: Tensor,
+        rgb_tokens: Optional[Tensor],
+        image_tokens: Optional[Tensor],
         time_cond: Tensor,
         rgb_to_hoi_scale: float,
         hoi_to_rgb_scale: float,
+        interaction_mode: str = "asymmetric",
         run_hoi_to_rgb: bool = False,
-    ) -> Tuple[Tensor, Tensor]:
-        hoi_tokens = self.shared_block(hoi_tokens, time_cond=time_cond, stream="hoi")
-        rgb_tokens = self.shared_block(rgb_tokens, time_cond=time_cond, stream="rgb")
-        hoi_tokens = hoi_tokens + float(rgb_to_hoi_scale) * self.hoi_gate(hoi_tokens) * self.rgb_to_hoi(
-            hoi_tokens,
-            rgb_tokens,
-        )
-        hoi_tokens = hoi_tokens + self.image_to_hoi(hoi_tokens, image_tokens)
-        if run_hoi_to_rgb or float(hoi_to_rgb_scale) != 0.0:
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        if interaction_mode not in {"full", "asymmetric"}:
+            raise ValueError(f"Unknown interaction_mode={interaction_mode!r}; expected 'full' or 'asymmetric'.")
+
+        has_rgb = rgb_tokens is not None and float(rgb_to_hoi_scale) != 0.0
+        if interaction_mode == "full" and has_rgb:
+            hoi_tokens, rgb_tokens = self.shared_block.forward_full_pair(
+                hoi_tokens,
+                rgb_tokens,
+                time_cond=time_cond,
+            )
+        else:
+            hoi_tokens = self.shared_block(hoi_tokens, time_cond=time_cond, stream="hoi")
+            if rgb_tokens is not None:
+                rgb_tokens = self.shared_block(rgb_tokens, time_cond=time_cond, stream="rgb")
+
+        if has_rgb and interaction_mode == "asymmetric":
+            hoi_tokens = hoi_tokens + float(rgb_to_hoi_scale) * self.hoi_gate(hoi_tokens) * self.rgb_to_hoi(
+                hoi_tokens,
+                rgb_tokens,
+            )
+        elif has_rgb:
+            hoi_tokens = hoi_tokens + self._zero_asymmetric_anchor(hoi_tokens)
+        if image_tokens is not None and float(rgb_to_hoi_scale) != 0.0:
+            hoi_tokens = hoi_tokens + float(rgb_to_hoi_scale) * self.image_to_hoi(hoi_tokens, image_tokens)
+
+        run_reverse = rgb_tokens is not None and run_hoi_to_rgb and float(hoi_to_rgb_scale) != 0.0
+        if run_reverse:
             rgb_tokens = rgb_tokens + float(hoi_to_rgb_scale) * self.rgb_gate(rgb_tokens) * self.hoi_to_rgb(
                 rgb_tokens,
                 hoi_tokens,
             )
+        elif run_hoi_to_rgb:
+            hoi_tokens = hoi_tokens + self._zero_reverse_anchor(hoi_tokens)
         return hoi_tokens, rgb_tokens
 
 
 @dataclass
 class CoInteractHOI4DOutput:
-    rgb_velocity: Tensor
+    rgb_velocity: Optional[Tensor]
     state_velocity: Tensor
     decoded_state: DecodedHOIState
-    rgb_hidden_tokens: Tensor
-    rgb_context_tokens: Tensor
+    rgb_hidden_tokens: Optional[Tensor]
+    rgb_context_tokens: Optional[Tensor]
 
 
 class CoInteractHOI4DModel(nn.Module):
@@ -909,23 +980,41 @@ class CoInteractHOI4DModel(nn.Module):
     def forward(
         self,
         *,
-        video_xt: Tensor,
+        video_xt: Optional[Tensor],
         state_xt: Tensor,
         timesteps: Tensor,
-        first_frame: Tensor,
+        first_frame: Optional[Tensor],
         rgb_to_hoi_scale: float = 1.0,
         hoi_to_rgb_scale: float = 0.0,
+        interaction_mode: str = "asymmetric",
+        use_rgb_prior: bool = True,
     ) -> CoInteractHOI4DOutput:
         if state_xt.ndim != 3 or state_xt.shape[-1] != self.hidden_dim:
             raise ValueError(f"`state_xt` must have shape [B, L, {self.hidden_dim}], got {tuple(state_xt.shape)}.")
-        rgb_output = self.rgb_stream(video_xt=video_xt, timesteps=timesteps)
-        rgb_hidden_tokens = rgb_output.hidden_tokens.detach() if self.detach_rgb_context else rgb_output.hidden_tokens
-        rgb_tokens = self.rgb_token_adapter(rgb_hidden_tokens.to(dtype=state_xt.dtype))
-        image_tokens = self.first_frame_encoder(first_frame.to(dtype=state_xt.dtype))
+        if interaction_mode not in {"full", "asymmetric"}:
+            raise ValueError(f"Unknown interaction_mode={interaction_mode!r}; expected 'full' or 'asymmetric'.")
+
+        rgb_output: Optional[WanRGBStreamOutput] = None
+        rgb_hidden_tokens: Optional[Tensor] = None
+        rgb_tokens: Optional[Tensor] = None
+        image_tokens: Optional[Tensor] = None
+        use_rgb = bool(use_rgb_prior) and float(rgb_to_hoi_scale) != 0.0
+        if use_rgb:
+            if video_xt is None:
+                raise ValueError("`video_xt` is required when use_rgb_prior=True.")
+            if first_frame is None:
+                raise ValueError("`first_frame` is required when use_rgb_prior=True.")
+            rgb_output = self.rgb_stream(video_xt=video_xt, timesteps=timesteps)
+            rgb_hidden_tokens = rgb_output.hidden_tokens.detach() if self.detach_rgb_context else rgb_output.hidden_tokens
+            rgb_tokens = self.rgb_token_adapter(rgb_hidden_tokens.to(dtype=state_xt.dtype))
+            image_tokens = self.first_frame_encoder(first_frame.to(dtype=state_xt.dtype))
+
         time_cond = self.time_embed(timestep_embedding(timesteps, self.hidden_dim)).unsqueeze(1).to(dtype=state_xt.dtype)
         state_tokens = state_xt + time_cond
-        rgb_tokens = rgb_tokens + time_cond
-        image_tokens = image_tokens + time_cond
+        if rgb_tokens is not None:
+            rgb_tokens = rgb_tokens + time_cond
+        if image_tokens is not None:
+            image_tokens = image_tokens + time_cond
         for block in self.blocks:
             state_tokens, rgb_tokens = block(
                 state_tokens,
@@ -934,6 +1023,7 @@ class CoInteractHOI4DModel(nn.Module):
                 time_cond=time_cond,
                 rgb_to_hoi_scale=rgb_to_hoi_scale,
                 hoi_to_rgb_scale=hoi_to_rgb_scale if self.enable_hoi_to_rgb else 0.0,
+                interaction_mode=interaction_mode,
                 run_hoi_to_rgb=self.enable_hoi_to_rgb,
             )
         state_velocity = self.state_velocity_head(self.state_norm(state_tokens))
@@ -941,11 +1031,23 @@ class CoInteractHOI4DModel(nn.Module):
         t_view = timesteps.to(device=state_xt.device, dtype=state_xt.dtype).view(state_xt.shape[0], 1, 1)
         predicted_clean_state = state_xt + (1.0 - t_view) * state_velocity.to(dtype=state_xt.dtype)
         return CoInteractHOI4DOutput(
-            rgb_velocity=rgb_output.velocity,
+            rgb_velocity=rgb_output.velocity if rgb_output is not None else None,
             state_velocity=state_velocity,
             decoded_state=self.decode_state_tokens(predicted_clean_state),
-            rgb_hidden_tokens=rgb_output.hidden_tokens,
+            rgb_hidden_tokens=rgb_output.hidden_tokens if rgb_output is not None else None,
             rgb_context_tokens=rgb_tokens,
+        )
+
+    def forward_hoi_only(self, *, state_xt: Tensor, timesteps: Tensor) -> CoInteractHOI4DOutput:
+        return self.forward(
+            video_xt=None,
+            state_xt=state_xt,
+            timesteps=timesteps,
+            first_frame=None,
+            rgb_to_hoi_scale=0.0,
+            hoi_to_rgb_scale=0.0,
+            interaction_mode="asymmetric",
+            use_rgb_prior=False,
         )
 
 

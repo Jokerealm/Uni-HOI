@@ -121,17 +121,27 @@ def _sample_state(
     rgb_to_hoi_scale: float,
     hoi_to_rgb_scale: float,
     cross_3d2d_scale: float,
+    interaction_mode: str,
+    drop_rgb_branch: bool,
 ) -> object:
     rgb = batch["rgb"]
     batch_size = int(rgb.shape[0])
-    first_frame = rgb[:, 0]
-    first_frame_latents = model.encode_first_frame(first_frame)
-    video_xt = first_frame_latents
+    first_frame = None
+    video_xt = None
+    if not drop_rgb_branch:
+        first_frame = rgb[:, 0]
+        first_frame_latents = model.encode_first_frame(first_frame)
+        video_xt = first_frame_latents
+        state_dtype = first_frame_latents.dtype
+    else:
+        if model.__class__.__name__ == "CoMoViHOIRGBModel":
+            raise ValueError("--drop_rgb_branch is only implemented for CoInteractHOI4DModel.")
+        state_dtype = next(model.parameters()).dtype
     state_xt = _state_noise(
         model,
         batch_size=batch_size,
         device=rgb.device,
-        dtype=first_frame_latents.dtype,
+        dtype=state_dtype,
         generator=generator,
     )
     steps = max(int(num_ode_steps), 1)
@@ -145,11 +155,14 @@ def _sample_state(
             "state_xt": state_xt,
             "timesteps": timesteps,
             "first_frame": first_frame,
-            "rgb_to_hoi_scale": float(rgb_to_hoi_scale),
+            "rgb_to_hoi_scale": 0.0 if drop_rgb_branch else float(rgb_to_hoi_scale),
             "hoi_to_rgb_scale": float(hoi_to_rgb_scale),
         }
         if model.__class__.__name__ == "CoMoViHOIRGBModel":
             forward_kwargs["cross_3d2d_scale"] = float(cross_3d2d_scale)
+        else:
+            forward_kwargs["interaction_mode"] = str(interaction_mode)
+            forward_kwargs["use_rgb_prior"] = not drop_rgb_branch
         output = model(**forward_kwargs)
         state_xt = state_xt + dt * output.state_velocity.to(dtype=state_xt.dtype)
 
@@ -229,6 +242,8 @@ def _evaluate_checkpoint(
                     rgb_to_hoi_scale=float(train_args.rgb_to_hoi_scale),
                     hoi_to_rgb_scale=float(train_args.hoi_to_rgb_scale),
                     cross_3d2d_scale=float(getattr(train_args, "cross_3d2d_scale", 1.0)),
+                    interaction_mode=str(eval_args.interaction_mode),
+                    drop_rgb_branch=bool(eval_args.drop_rgb_branch),
                 )
                 state_losses = train_hoi.compute_state_losses(output.decoded_state, batch, weights=weights)
                 eval_metrics = unimain.compute_test_eval_metrics(output, batch, metric_args)
@@ -272,6 +287,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--dataset_cache_sequences", type=int, default=2)
     parser.add_argument("--num_ode_steps", type=int, default=12)
+    parser.add_argument("--interaction_mode", type=str, default="asymmetric", choices=("asymmetric", "full"))
+    parser.add_argument("--drop_rgb_branch", action="store_true")
     parser.add_argument("--test_eval_max_points", type=int, default=4096)
     parser.add_argument("--test_eval_chamfer_chunk_size", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=1234)
@@ -292,7 +309,8 @@ def main() -> None:
     dataset = _build_dataset(train_args, eval_args)
     dataloader = _build_eval_loader(dataset, eval_args)
     model = train_hoi.build_model(train_args).to(device)
-    model.ensure_wan_loaded(device)
+    if not bool(eval_args.drop_rgb_branch):
+        model.ensure_wan_loaded(device)
 
     results = []
     for checkpoint in checkpoints:

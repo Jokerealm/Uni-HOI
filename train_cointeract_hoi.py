@@ -83,12 +83,10 @@ def stage1_full_attention_steps(args: argparse.Namespace) -> int:
 
 
 def stage1_hoi_to_rgb_scale(args: argparse.Namespace) -> float:
-    return float(getattr(args, "stage1_hoi_to_rgb_scale", 1.0))
+    return float(getattr(args, "stage1_hoi_to_rgb_scale", 0.0))
 
 
 def hoi_to_rgb_scale_for_step(args: argparse.Namespace, step: int) -> float:
-    if int(step) < stage1_full_attention_steps(args):
-        return stage1_hoi_to_rgb_scale(args)
     return float(getattr(args, "hoi_to_rgb_scale", 0.0))
 
 
@@ -96,10 +94,12 @@ def coattention_stage_for_step(args: argparse.Namespace, step: int) -> int:
     return 1 if int(step) < stage1_full_attention_steps(args) else 2
 
 
+def interaction_mode_for_step(args: argparse.Namespace, step: int) -> str:
+    return "full" if int(step) < stage1_full_attention_steps(args) else "asymmetric"
+
+
 def should_enable_hoi_to_rgb(args: argparse.Namespace) -> bool:
-    if abs(float(getattr(args, "hoi_to_rgb_scale", 0.0))) > 0.0:
-        return True
-    return stage1_full_attention_steps(args) > 0 and abs(stage1_hoi_to_rgb_scale(args)) > 0.0
+    return abs(float(getattr(args, "hoi_to_rgb_scale", 0.0))) > 0.0
 
 
 def zero_loss_anchor_from_output(output) -> Tensor:
@@ -763,7 +763,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rgb_to_hoi_scale", type=float, default=1.0)
     parser.add_argument("--hoi_to_rgb_scale", type=float, default=0.0)
     parser.add_argument("--stage1_full_attention_steps", type=int, default=0)
-    parser.add_argument("--stage1_hoi_to_rgb_scale", type=float, default=1.0)
+    parser.add_argument("--stage1_hoi_to_rgb_scale", type=float, default=0.0)
     parser.add_argument("--cross_3d2d_scale", type=float, default=1.0)
     parser.add_argument("--visual_prior_num_global_tokens", type=int, default=8)
     parser.add_argument("--visual_resampler_depth", type=int, default=2)
@@ -836,7 +836,7 @@ def main() -> None:
             f"| model={args.model_variant} | wan={args.wan_model_id} "
             f"| input=single_image | coordinate_mode={args.coordinate_mode} "
             f"| coattention_stage1_steps={stage1_full_attention_steps(args)} "
-            f"| stage1_hoi_to_rgb={stage1_hoi_to_rgb_scale(args):.3g} "
+            f"| stage1_interaction=full "
             f"| stage2_hoi_to_rgb={float(args.hoi_to_rgb_scale):.3g} "
             f"| ddp_find_unused_parameters={ddp_find_unused_parameters}",
             flush=True,
@@ -976,6 +976,7 @@ def main() -> None:
 
                 current_hoi_to_rgb_scale = hoi_to_rgb_scale_for_step(args, global_step)
                 current_coattention_stage = coattention_stage_for_step(args, global_step)
+                current_interaction_mode = interaction_mode_for_step(args, global_step)
                 forward_kwargs = {
                     "video_xt": video_xt,
                     "state_xt": state_xt,
@@ -986,6 +987,9 @@ def main() -> None:
                 }
                 if args.model_variant == "comovi":
                     forward_kwargs["cross_3d2d_scale"] = args.cross_3d2d_scale
+                else:
+                    forward_kwargs["interaction_mode"] = current_interaction_mode
+                    forward_kwargs["use_rgb_prior"] = True
                 output = model(**forward_kwargs)
                 state_fm = F.mse_loss(output.state_velocity.float(), state_velocity_target.float())
                 state_losses = compute_state_losses(output.decoded_state, batch, weights=supervised_weights)
@@ -1019,6 +1023,7 @@ def main() -> None:
                         "rgb_to_hoi_scale": float(args.rgb_to_hoi_scale),
                         "hoi_to_rgb_scale": float(current_hoi_to_rgb_scale),
                         "coattention_stage": float(current_coattention_stage),
+                        "interaction_mode": current_interaction_mode,
                         "lr": float(scheduler.get_last_lr()[0]),
                     }
                     for key, value in state_losses.items():

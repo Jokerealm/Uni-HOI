@@ -40,8 +40,9 @@ scripts/run_wai_shared_train_test_once.sh
 Dual-stream controls:
 
 - `--rgb_to_hoi_scale`: strength of RGB auxiliary tokens guiding the HOI main stream.
-- `--hoi_to_rgb_scale`: optional reverse adapter for symmetric experimentation; default `0.0` keeps the CoInteract-style asymmetric direction but with HOI as the retained main stream.
-- `train.sh` defaults to a CoInteract-inspired two-stage schedule: `STAGE1_FULL_ATTENTION_STEPS=10000` with `STAGE1_HOI_TO_RGB_SCALE=1.0`, then asymmetric Stage 2 with `HOI_TO_RGB_SCALE=0.0` until `MAX_STEPS=15000`. It writes to `outputs/cointeract_shared_hoi_wan_two_stage`, uses offline W&B by default, and sets `SAVE_EVERY=500` and `TRAIN_VISUAL_EVERY=500`.
+- `--hoi_to_rgb_scale`: optional reverse adapter for symmetric ablations; default `0.0` keeps the retained graph HOI-primary.
+- `train.sh` defaults to a CoInteract-inspired two-stage schedule: `STAGE1_FULL_ATTENTION_STEPS=10000` uses shared full RGB/HOI attention, then Stage 2 switches to asymmetric RGB->HOI co-attention until `MAX_STEPS=15000`. It writes to `outputs/cointeract_shared_hoi_wan_two_stage`, uses offline W&B by default, and sets `SAVE_EVERY=500` and `TRAIN_VISUAL_EVERY=500`.
+- Inference can set `use_rgb_prior=False` in `CoInteractHOI4DModel.forward` or `--drop_rgb_branch` in the checkpoint eval script to delete the RGB/Wan branch and run the HOI stream alone.
 - `--no-detach_rgb_context`: allow HOI loss to update the Wan RGB branch when `--no-freeze_wan` is also used. The default keeps the RGB video prior as a fixed collaborator.
 
 For single-image sample data, choose `MAX_STEPS` by effective passes rather than paper-scale step counts:
