@@ -39,11 +39,24 @@ scripts/run_wai_shared_train_test_once.sh
 
 Dual-stream controls:
 
-- `--rgb_to_hoi_scale`: strength of RGB auxiliary tokens guiding the HOI main stream.
-- `--hoi_to_rgb_scale`: optional reverse adapter for symmetric ablations; default `0.0` keeps the retained graph HOI-primary.
-- `train.sh` defaults to a CoInteract-inspired two-stage schedule: `STAGE1_FULL_ATTENTION_STEPS=10000` uses shared full RGB/HOI attention, then Stage 2 switches to asymmetric RGB->HOI co-attention until `MAX_STEPS=15000`. It writes to `outputs/cointeract_shared_hoi_wan_two_stage`, uses offline W&B by default, and sets `SAVE_EVERY=500` and `TRAIN_VISUAL_EVERY=500`.
+- CoInteract uses full RGB/HOI shared attention throughout training: RGB/main tokens and HOI-depth tokens are concatenated into one shared DiT sequence with full visibility.
+- DiT blocks use stream-specific AdaLN scale/shift plus learned residual gates to modulate interaction strength by block depth.
+- The HOI-token-aware MoE is enabled in the HOI FFN path. The shared/base expert reuses the original DiT FFN; lightweight residual experts specialize for human pose/joints, object motion/object Gaussians, contact, and human surface Gaussians. Router supervision uses stop-gradient hidden states before the router.
+- `MODEL_VARIANT=wan_backbone` switches to an experimental CoInteract-style model that concatenates HOI state tokens directly into the Wan2.2-TI2V DiT token sequence and reuses the pretrained Wan transformer blocks instead of the local 8-layer 512-dim DiT. The HOI token dimension is `wan_hidden_dim` (3072 by default), and the number of Wan blocks is read from the loaded pretrained transformer.
+- `train.sh` writes to `outputs/cointeract_shared_hoi_wan_full` by default.
 - Inference can set `use_rgb_prior=False` in `CoInteractHOI4DModel.forward` or `--drop_rgb_branch` in the checkpoint eval script to delete the RGB/Wan branch and run the HOI stream alone.
 - `--no-detach_rgb_context`: allow HOI loss to update the Wan RGB branch when `--no-freeze_wan` is also used. The default keeps the RGB video prior as a fixed collaborator.
+
+Wan-backbone smoke command:
+
+```bash
+MODEL_VARIANT=wan_backbone \
+OUTPUT_DIR=outputs/cointeract_wan_backbone_ti2v5b \
+BATCH_SIZE=1 \
+MAX_STEPS=1000 \
+LR=1e-5 \
+scripts/train_cointeract.sh
+```
 
 For single-image sample data, choose `MAX_STEPS` by effective passes rather than paper-scale step counts:
 
@@ -60,6 +73,7 @@ The previous task dataloader is preserved in `dataset/dual_branch_fm_dataset.py`
 The active model and training entrypoint are:
 
 - `model/cointeract_hoi_wan.py`
+- `model/cointeract_wan_backbone_hoi.py`
 - `train_cointeract_hoi.py`
 - `scripts/train_cointeract.sh`
 - `train.sh`

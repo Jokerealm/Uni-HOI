@@ -19,8 +19,23 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dataset.dual_branch_fm_dataset import DualBranchHOIDataset
-from model.cointeract_hoi_wan import CoInteractHOI4DModel, DecodedHOIState
+from model.cointeract_hoi_wan import CoInteractHOI4DModel
+from model.cointeract_wan_backbone_hoi import WanBackboneHOI4DModel
 from model.comovi_hoi_rgb_wan import CoMoViHOIRGBModel
+from model.hoi_state_codec import DecodedHOIState
+
+HOITrainingModel = CoInteractHOI4DModel | CoMoViHOIRGBModel | WanBackboneHOI4DModel
+
+STATE_FM_GROUPS: Tuple[str, ...] = (
+    "shape",
+    "pose",
+    "translation",
+    "object_motion",
+    "contact",
+    "human_gaussians",
+    "object_gaussians",
+    "joints",
+)
 
 
 def resize_video_batch(video: Tensor, size: Tuple[int, int], mode: str = "bilinear") -> Tensor:
@@ -78,28 +93,8 @@ def build_scheduler(
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
-def stage1_full_attention_steps(args: argparse.Namespace) -> int:
-    return max(int(getattr(args, "stage1_full_attention_steps", 0)), 0)
-
-
-def stage1_hoi_to_rgb_scale(args: argparse.Namespace) -> float:
-    return float(getattr(args, "stage1_hoi_to_rgb_scale", 0.0))
-
-
-def hoi_to_rgb_scale_for_step(args: argparse.Namespace, step: int) -> float:
-    return float(getattr(args, "hoi_to_rgb_scale", 0.0))
-
-
-def coattention_stage_for_step(args: argparse.Namespace, step: int) -> int:
-    return 1 if int(step) < stage1_full_attention_steps(args) else 2
-
-
-def interaction_mode_for_step(args: argparse.Namespace, step: int) -> str:
-    return "full" if int(step) < stage1_full_attention_steps(args) else "asymmetric"
-
-
 def should_enable_hoi_to_rgb(args: argparse.Namespace) -> bool:
-    return abs(float(getattr(args, "hoi_to_rgb_scale", 0.0))) > 0.0
+    return abs(float(args.hoi_to_rgb_scale)) > 0.0
 
 
 def zero_loss_anchor_from_output(output) -> Tensor:
@@ -110,7 +105,6 @@ def zero_loss_anchor_from_output(output) -> Tensor:
         "rgb_context_tokens",
         "rgb_prior_tokens",
         "hoi_tokens",
-        "predicted_clean_state",
     ):
         tensor = getattr(output, attr_name, None)
         if isinstance(tensor, Tensor) and tensor.requires_grad:
@@ -128,6 +122,100 @@ def flow_match_sample(target: Tensor, noise: Tensor, timesteps: Tensor) -> Tuple
 def reconstruct_x1(xt: Tensor, velocity: Tensor, timesteps: Tensor) -> Tensor:
     t_view = timesteps.to(device=xt.device, dtype=xt.dtype).view(xt.shape[0], *([1] * (xt.ndim - 1)))
     return xt + (1.0 - t_view) * velocity
+
+
+def default_state_fm_group_weights() -> Dict[str, float]:
+    return {name: 1.0 for name in STATE_FM_GROUPS}
+
+
+def parse_state_fm_group_weights(value: str) -> Dict[str, float]:
+    weights = default_state_fm_group_weights()
+    text = value.strip()
+    if not text:
+        return weights
+    aliases = {
+        "object_pose": "object_motion",
+        "human_gaussian": "human_gaussians",
+        "object_gaussian": "object_gaussians",
+        "gaussian_h": "human_gaussians",
+        "gaussian_o": "object_gaussians",
+    }
+    valid = set(STATE_FM_GROUPS)
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Invalid --state_fm_group_weights item {item!r}; expected name=value.")
+        name, raw_weight = item.split("=", 1)
+        name = aliases.get(name.strip(), name.strip())
+        if name not in valid:
+            raise ValueError(
+                f"Unknown state FM group {name!r}; expected one of {', '.join(STATE_FM_GROUPS)}."
+            )
+        weight = float(raw_weight)
+        if weight < 0.0:
+            raise ValueError(f"State FM group weight must be non-negative, got {name}={weight}.")
+        weights[name] = weight
+    return weights
+
+
+def state_token_slices(model: HOITrainingModel) -> Dict[str, slice]:
+    return model.state_codec._slices()
+
+
+def compute_state_fm_group_losses(
+    predicted_velocity: Tensor,
+    target_velocity: Tensor,
+    token_slices: Dict[str, slice],
+) -> Dict[str, Tensor]:
+    losses: Dict[str, Tensor] = {}
+    for name in STATE_FM_GROUPS:
+        token_slice = token_slices[name]
+        losses[name] = F.mse_loss(
+            predicted_velocity[:, token_slice].float(),
+            target_velocity[:, token_slice].float(),
+        )
+    return losses
+
+
+def compute_state_fm_loss(
+    predicted_velocity: Tensor,
+    target_velocity: Tensor,
+    *,
+    token_slices: Dict[str, slice],
+    mode: str,
+    group_weights: Dict[str, float],
+) -> Tuple[Tensor, Dict[str, Tensor], Dict[str, Tensor]]:
+    group_losses = compute_state_fm_group_losses(predicted_velocity, target_velocity, token_slices)
+    if mode == "uniform":
+        total = F.mse_loss(predicted_velocity.float(), target_velocity.float())
+        contributions = {
+            name: total.new_tensor(
+                predicted_velocity[:, token_slices[name]].numel() / float(max(predicted_velocity.numel(), 1))
+            )
+            * group_losses[name].detach()
+            for name in STATE_FM_GROUPS
+        }
+        return total, group_losses, contributions
+    if mode != "group_balanced":
+        raise ValueError(f"Unsupported state FM loss mode: {mode}.")
+
+    weighted_terms = []
+    normalizer = 0.0
+    contributions = {}
+    for name in STATE_FM_GROUPS:
+        weight = float(group_weights.get(name, 0.0))
+        if weight <= 0.0:
+            contributions[name] = group_losses[name].detach().new_zeros(())
+            continue
+        term = weight * group_losses[name]
+        weighted_terms.append(term)
+        normalizer += weight
+        contributions[name] = term.detach()
+    if not weighted_terms:
+        raise ValueError("At least one state FM group weight must be positive for group_balanced mode.")
+    return torch.stack(weighted_terms).sum() / normalizer, group_losses, contributions
 
 
 def prepare_batch(batch: Dict[str, object], *, device: torch.device, image_height: int, image_width: int) -> Dict[str, object]:
@@ -162,7 +250,7 @@ def prepare_batch(batch: Dict[str, object], *, device: torch.device, image_heigh
     return tensor_batch
 
 
-def build_model(args: argparse.Namespace) -> CoInteractHOI4DModel:
+def build_model(args: argparse.Namespace) -> HOITrainingModel:
     common_kwargs = {
         "hidden_dim": args.hidden_dim,
         "num_heads": args.num_heads,
@@ -172,7 +260,6 @@ def build_model(args: argparse.Namespace) -> CoInteractHOI4DModel:
         "num_frames": args.clip_length,
         "image_height": args.image_height,
         "image_width": args.image_width,
-        "image_patch_size": args.image_patch_size,
         "num_human_gaussians": args.num_human_gaussians,
         "num_object_gaussians": args.num_object_gaussians,
         "num_joints": args.num_joints,
@@ -186,19 +273,30 @@ def build_model(args: argparse.Namespace) -> CoInteractHOI4DModel:
         "wan_local_files_only": args.wan_local_files_only,
         "freeze_wan": args.freeze_wan,
         "detach_rgb_context": args.detach_rgb_context,
-        "enable_hoi_to_rgb": should_enable_hoi_to_rgb(args),
     }
     if args.model_variant == "comovi":
         return CoMoViHOIRGBModel(
             **common_kwargs,
+            image_patch_size=args.image_patch_size,
+            enable_hoi_to_rgb=should_enable_hoi_to_rgb(args),
             visual_prior_num_global_tokens=args.visual_prior_num_global_tokens,
             visual_resampler_depth=args.visual_resampler_depth,
             cross_3d2d_depth=args.cross_3d2d_depth,
         )
-    return CoInteractHOI4DModel(**common_kwargs)
+    if args.model_variant == "wan_backbone":
+        backbone_kwargs = dict(common_kwargs)
+        backbone_kwargs["hidden_dim"] = int(args.wan_hidden_dim)
+        return WanBackboneHOI4DModel(**backbone_kwargs)
+    return CoInteractHOI4DModel(
+        **common_kwargs,
+        enable_hoi_token_moe=bool(getattr(args, "enable_hoi_token_moe", False)),
+        hoi_token_moe_expert_dim=int(getattr(args, "hoi_token_moe_expert_dim", 256)),
+        hoi_token_moe_router_hidden_dim=int(getattr(args, "hoi_token_moe_router_hidden_dim", 0)),
+        hoi_token_moe_residual_scale=float(getattr(args, "hoi_token_moe_residual_scale", 1.0)),
+    )
 
 
-def encode_state_target(model: CoInteractHOI4DModel, batch: Dict[str, object]) -> Tensor:
+def encode_state_target(model: HOITrainingModel, batch: Dict[str, object]) -> Tensor:
     return model.encode_state_target(
         human_shape=batch["human_shape"],
         human_pose=batch["body_pose"],
@@ -507,7 +605,7 @@ def _gaussian_comparison_table(
 
 def _wan_video_comparison_table(
     *,
-    model: CoInteractHOI4DModel,
+    model: HOITrainingModel,
     batch: Dict[str, object],
     video_xt: Tensor,
     rgb_velocity: Tensor,
@@ -536,7 +634,7 @@ def _wan_video_comparison_table(
 
 def log_wandb_visuals(
     *,
-    model: CoInteractHOI4DModel,
+    model: HOITrainingModel,
     batch: Dict[str, object],
     decoded: DecodedHOIState,
     video_xt: Tensor,
@@ -610,7 +708,7 @@ def print_wandb_run_url(args: argparse.Namespace, accelerator: Accelerator) -> N
         print(f"wandb url: {url}", flush=True)
 
 
-def ensure_wan_loaded_rank_by_rank(raw_model: CoInteractHOI4DModel, accelerator: Accelerator) -> None:
+def ensure_wan_loaded_rank_by_rank(raw_model: HOITrainingModel, accelerator: Accelerator) -> None:
     for process_index in range(accelerator.num_processes):
         if accelerator.process_index == process_index:
             print(
@@ -622,7 +720,7 @@ def ensure_wan_loaded_rank_by_rank(raw_model: CoInteractHOI4DModel, accelerator:
         accelerator.wait_for_everyone()
 
 
-def checkpoint_state_dict(model: CoInteractHOI4DModel) -> Dict[str, Tensor]:
+def checkpoint_state_dict(model: HOITrainingModel) -> Dict[str, Tensor]:
     return {
         key: value.detach().cpu()
         for key, value in model.state_dict().items()
@@ -633,7 +731,7 @@ def checkpoint_state_dict(model: CoInteractHOI4DModel) -> Dict[str, Tensor]:
 def save_checkpoint(
     *,
     path: Path,
-    model: CoInteractHOI4DModel,
+    model: HOITrainingModel,
     optimizer: AdamW,
     scheduler: LambdaLR,
     step: int,
@@ -652,7 +750,7 @@ def save_checkpoint(
     os.replace(tmp_path, path)
 
 
-def load_model_checkpoint(model: CoInteractHOI4DModel, checkpoint_path: str) -> int:
+def load_model_checkpoint(model: HOITrainingModel, checkpoint_path: str) -> int:
     if not checkpoint_path:
         return 0
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -670,7 +768,7 @@ def load_model_checkpoint(model: CoInteractHOI4DModel, checkpoint_path: str) -> 
 
 def load_training_checkpoint(
     *,
-    model: CoInteractHOI4DModel,
+    model: HOITrainingModel,
     optimizer,
     scheduler,
     checkpoint_path: str,
@@ -687,16 +785,24 @@ def load_training_checkpoint(
             f"| missing={len(missing)} | unexpected={len(incompatible.unexpected_keys)}",
             flush=True,
         )
+    optimizer_loaded = False
     if isinstance(checkpoint, dict) and "optimizer" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer"])
-    if isinstance(checkpoint, dict) and "scheduler" in checkpoint:
-        scheduler.load_state_dict(checkpoint["scheduler"])
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            optimizer_loaded = True
+        except ValueError as exc:
+            print(f"optimizer state skipped during resume: {exc}", flush=True)
+    if optimizer_loaded and isinstance(checkpoint, dict) and "scheduler" in checkpoint:
+        try:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        except ValueError as exc:
+            print(f"scheduler state skipped during resume: {exc}", flush=True)
     return int(checkpoint.get("step", 0)) if isinstance(checkpoint, dict) else 0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train HOI-primary CoInteract-style RGB-guided dual-stream Wan model.")
-    parser.add_argument("--model_variant", type=str, default="cointeract", choices=("cointeract", "comovi"))
+    parser.add_argument("--model_variant", type=str, default="cointeract", choices=("cointeract", "comovi", "wan_backbone"))
     parser.add_argument("--data_root", type=str, default="sample_data/behave_1pct/sequences")
     parser.add_argument("--processed_subdir", type=str, default="processed")
     parser.add_argument("--gs_subdir", type=str, default="gs_init")
@@ -751,6 +857,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--mlp_ratio", type=float, default=3.0)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--enable_hoi_token_moe", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--hoi_token_moe_expert_dim", type=int, default=256)
+    parser.add_argument("--hoi_token_moe_router_hidden_dim", type=int, default=0)
+    parser.add_argument("--hoi_token_moe_residual_scale", type=float, default=1.0)
 
     parser.add_argument("--wan_model_id", type=str, default="Wan-AI/Wan2.2-TI2V-5B-Diffusers")
     parser.add_argument("--wan_dtype", type=str, default="bf16", choices=("bf16", "fp16", "fp32"))
@@ -762,8 +872,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--serial_wan_load", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rgb_to_hoi_scale", type=float, default=1.0)
     parser.add_argument("--hoi_to_rgb_scale", type=float, default=0.0)
-    parser.add_argument("--stage1_full_attention_steps", type=int, default=0)
-    parser.add_argument("--stage1_hoi_to_rgb_scale", type=float, default=0.0)
     parser.add_argument("--cross_3d2d_scale", type=float, default=1.0)
     parser.add_argument("--visual_prior_num_global_tokens", type=int, default=8)
     parser.add_argument("--visual_resampler_depth", type=int, default=2)
@@ -778,6 +886,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--human_pose_dim", type=int, default=72)
 
     parser.add_argument("--lambda_state_fm", type=float, default=1.0)
+    parser.add_argument("--state_fm_loss_mode", type=str, default="uniform", choices=("uniform", "group_balanced"))
+    parser.add_argument(
+        "--state_fm_group_weights",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated group weights for --state_fm_loss_mode=group_balanced, "
+            "e.g. pose=2,contact=2,human_gaussians=0.5,object_gaussians=0.5."
+        ),
+    )
     parser.add_argument("--lambda_rgb_fm", type=float, default=0.0)
     parser.add_argument("--lambda_shape", type=float, default=0.1)
     parser.add_argument("--lambda_pose", type=float, default=0.5)
@@ -792,6 +910,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_gaussian_attr_l1", type=float, default=0.1)
     parser.add_argument("--lambda_phys_contact", type=float, default=0.01)
     parser.add_argument("--lambda_phys_penetration", type=float, default=0.01)
+    parser.add_argument("--lambda_hoi_token_router", type=float, default=1.0)
     parser.add_argument("--phys_loss_max_frames", type=int, default=1)
     parser.add_argument("--phys_loss_max_object_points", type=int, default=512)
     return parser.parse_args()
@@ -799,8 +918,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.stage1_full_attention_steps < 0:
-        raise ValueError("--stage1_full_attention_steps must be non-negative.")
     if args.clip_length != 1:
         raise ValueError(f"This entrypoint is single-image only; set --clip_length 1, got {args.clip_length}.")
     if (args.clip_length - 1) % 4 != 0:
@@ -835,9 +952,9 @@ def main() -> None:
             f"| global_batch={args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps} "
             f"| model={args.model_variant} | wan={args.wan_model_id} "
             f"| input=single_image | coordinate_mode={args.coordinate_mode} "
-            f"| coattention_stage1_steps={stage1_full_attention_steps(args)} "
-            f"| stage1_interaction=full "
-            f"| stage2_hoi_to_rgb={float(args.hoi_to_rgb_scale):.3g} "
+            f"| interaction=full_attention "
+            f"| hoi_token_moe={int(bool(args.enable_hoi_token_moe))} "
+            f"| hoi_token_router_lambda={float(args.lambda_hoi_token_router):.3g} "
             f"| ddp_find_unused_parameters={ddp_find_unused_parameters}",
             flush=True,
         )
@@ -905,7 +1022,7 @@ def main() -> None:
     )
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
-    raw_model: CoInteractHOI4DModel = accelerator.unwrap_model(model)
+    raw_model: HOITrainingModel = accelerator.unwrap_model(model)
     global_step = 0
     if args.resume_checkpoint:
         global_step = load_training_checkpoint(
@@ -930,6 +1047,13 @@ def main() -> None:
         "object_gaussian_xyz": args.lambda_object_gaussian * args.lambda_gaussian_xyz_l1,
         "human_gaussian_attr": args.lambda_human_gaussian * args.lambda_gaussian_attr_l1,
         "object_gaussian_attr": args.lambda_object_gaussian * args.lambda_gaussian_attr_l1,
+    }
+    state_fm_group_weights = parse_state_fm_group_weights(args.state_fm_group_weights)
+    state_fm_token_slices = state_token_slices(raw_model)
+    state_fm_token_shares = {
+        name: float(state_fm_token_slices[name].stop - state_fm_token_slices[name].start)
+        / float(max(raw_model.state_codec.total_tokens, 1))
+        for name in STATE_FM_GROUPS
     }
 
     model.train()
@@ -974,27 +1098,32 @@ def main() -> None:
                     )
                     state_xt, state_velocity_target = flow_match_sample(state_target, state_noise, timesteps)
 
-                current_hoi_to_rgb_scale = hoi_to_rgb_scale_for_step(args, global_step)
-                current_coattention_stage = coattention_stage_for_step(args, global_step)
-                current_interaction_mode = interaction_mode_for_step(args, global_step)
+                current_hoi_to_rgb_scale = float(args.hoi_to_rgb_scale)
                 forward_kwargs = {
                     "video_xt": video_xt,
                     "state_xt": state_xt,
                     "timesteps": timesteps,
-                    "first_frame": rgb[:, 0],
-                    "rgb_to_hoi_scale": args.rgb_to_hoi_scale,
-                    "hoi_to_rgb_scale": current_hoi_to_rgb_scale,
                 }
                 if args.model_variant == "comovi":
+                    forward_kwargs["first_frame"] = rgb[:, 0]
+                    forward_kwargs["rgb_to_hoi_scale"] = args.rgb_to_hoi_scale
+                    forward_kwargs["hoi_to_rgb_scale"] = current_hoi_to_rgb_scale
                     forward_kwargs["cross_3d2d_scale"] = args.cross_3d2d_scale
                 else:
-                    forward_kwargs["interaction_mode"] = current_interaction_mode
                     forward_kwargs["use_rgb_prior"] = True
                 output = model(**forward_kwargs)
-                state_fm = F.mse_loss(output.state_velocity.float(), state_velocity_target.float())
+                state_fm, state_fm_group_losses, state_fm_group_contributions = compute_state_fm_loss(
+                    output.state_velocity,
+                    state_velocity_target,
+                    token_slices=state_fm_token_slices,
+                    mode=args.state_fm_loss_mode,
+                    group_weights=state_fm_group_weights,
+                )
                 state_losses = compute_state_losses(output.decoded_state, batch, weights=supervised_weights)
                 physics_losses = compute_physics_losses(output.decoded_state, batch, args=args)
+                hoi_router_loss = output.hoi_router_loss
                 loss = args.lambda_state_fm * state_fm + state_losses["supervised"] + physics_losses["physics"]
+                loss = loss + float(args.lambda_hoi_token_router) * hoi_router_loss
 
                 rgb_fm = video_xt.new_zeros(())
                 if args.lambda_rgb_fm > 0.0:
@@ -1016,26 +1145,38 @@ def main() -> None:
                     metrics = {
                         "loss": float(loss.detach().item()),
                         "loss_state_fm": float(state_fm.detach().item()),
+                        "state_fm_loss_mode_id": 1.0 if args.state_fm_loss_mode == "group_balanced" else 0.0,
                         "loss_rgb_fm": float(rgb_fm.detach().item()),
                         "loss_supervised": float(state_losses["supervised"].detach().item()),
                         "loss_physics": float(physics_losses["physics"].detach().item()),
-                        "cross_3d2d_scale": float(args.cross_3d2d_scale),
-                        "rgb_to_hoi_scale": float(args.rgb_to_hoi_scale),
-                        "hoi_to_rgb_scale": float(current_hoi_to_rgb_scale),
-                        "coattention_stage": float(current_coattention_stage),
-                        "interaction_mode": current_interaction_mode,
+                        "loss_hoi_token_router": float(hoi_router_loss.detach().item()),
+                        "lambda_hoi_token_router": float(args.lambda_hoi_token_router),
+                        "interaction_mode": "full",
                         "lr": float(scheduler.get_last_lr()[0]),
                     }
+                    if args.model_variant == "comovi":
+                        metrics["cross_3d2d_scale"] = float(args.cross_3d2d_scale)
+                        metrics["rgb_to_hoi_scale"] = float(args.rgb_to_hoi_scale)
+                        metrics["hoi_to_rgb_scale"] = float(current_hoi_to_rgb_scale)
                     for key, value in state_losses.items():
                         if key != "supervised":
                             metrics[f"loss_{key}"] = float(value.detach().item())
                     for key, value in physics_losses.items():
                         if key != "physics":
                             metrics[f"loss_{key}"] = float(value.detach().item())
+                    contribution_sum = sum(
+                        (value.detach().float() for value in state_fm_group_contributions.values()),
+                        state_fm.detach().new_zeros(()).float(),
+                    ).clamp_min(1e-12)
+                    for key in STATE_FM_GROUPS:
+                        contribution = state_fm_group_contributions[key].detach().float()
+                        metrics[f"loss_state_fm_{key}"] = float(state_fm_group_losses[key].detach().item())
+                        metrics[f"state_fm_contribution_{key}"] = float(contribution.item())
+                        metrics[f"state_fm_contribution_share_{key}"] = float((contribution / contribution_sum).item())
+                        metrics[f"state_fm_token_share_{key}"] = float(state_fm_token_shares[key])
                     progress.set_postfix(
                         loss=f"{metrics['loss']:.5f}",
                         lr=f"{metrics['lr']:.2e}",
-                        stage=f"s{current_coattention_stage}",
                         refresh=True,
                     )
                     if args.log_with != "none":

@@ -6,20 +6,19 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor, nn
 
-from .cointeract_hoi_wan import (
-    DecodedHOIState,
+from .hoi_state_codec import DecodedHOIState, HOIStateCodec
+from .hoi_transformer_blocks import (
     FirstFramePatchEncoder,
-    FrozenWanTI2VImageStream,
-    HOIStateCodec,
     MultiHeadAttention,
     SharedStreamTransformerBlock,
     ZeroInitCrossAdapter,
     timestep_embedding,
 )
+from .wan_rgb_stream import FrozenWanTI2VImageStream
 
 
 class CoMoViCrossAttentionLayer(nn.Module):
-    """Self-attention + cross-attention + FFN layer used for 3D-2D alignment."""
+    """用于 3D-2D 对齐的 self-attention + cross-attention + FFN 层。"""
 
     def __init__(self, *, hidden_dim: int, num_heads: int, mlp_ratio: float, dropout: float) -> None:
         super().__init__()
@@ -39,6 +38,7 @@ class CoMoViCrossAttentionLayer(nn.Module):
         )
 
     def forward(self, query_tokens: Tensor, context_tokens: Tensor) -> Tensor:
+        # 先在 query 内部建模，再跨注意力读取 context，最后用 FFN 更新。
         query_tokens = query_tokens + self.self_attn(self.self_norm(query_tokens))
         query_tokens = query_tokens + self.cross_attn(
             self.cross_norm(query_tokens),
@@ -48,7 +48,7 @@ class CoMoViCrossAttentionLayer(nn.Module):
 
 
 class CoMoViVisualPriorResampler(nn.Module):
-    """Compress dense Wan/image tokens into a compact RGB prior branch."""
+    """把密集 Wan/image token 压缩成紧凑的 RGB prior 分支。"""
 
     def __init__(
         self,
@@ -87,6 +87,7 @@ class CoMoViVisualPriorResampler(nn.Module):
 
     def forward(self, *, rgb_tokens: Tensor, image_tokens: Tensor, time_cond: Tensor) -> Tensor:
         batch_size = rgb_tokens.shape[0]
+        # frame query 捕获逐帧视觉先验，global query 捕获跨帧全局上下文。
         queries = torch.cat(
             [
                 self.frame_queries.expand(batch_size, -1, -1),
@@ -95,6 +96,7 @@ class CoMoViVisualPriorResampler(nn.Module):
             dim=1,
         )
         queries = queries.to(device=rgb_tokens.device, dtype=rgb_tokens.dtype) + time_cond
+        # context 同时包含 Wan 动态 token 和首帧 patch token。
         context = torch.cat([rgb_tokens, image_tokens], dim=1)
         for layer in self.layers:
             queries = layer(queries, context)
@@ -102,7 +104,7 @@ class CoMoViVisualPriorResampler(nn.Module):
 
 
 class CoMoViDualBranchBlock(nn.Module):
-    """Shared dual-branch block with zero-init mutual feature interaction."""
+    """双分支共享 block，带零初始化的双向特征交互。"""
 
     def __init__(self, *, hidden_dim: int, num_heads: int, mlp_ratio: float, dropout: float) -> None:
         super().__init__()
@@ -122,14 +124,17 @@ class CoMoViDualBranchBlock(nn.Module):
         hoi_to_rgb_scale: float,
         run_hoi_to_rgb: bool = False,
     ) -> Tuple[Tensor, Tensor]:
-        hoi_tokens = self.shared_block(hoi_tokens, time_cond=time_cond, stream="hoi")
-        rgb_prior_tokens = self.shared_block(rgb_prior_tokens, time_cond=time_cond, stream="rgb")
+        # 两条分支先分别经过共享 Transformer block；stream 参数决定使用哪套 AdaLN 调制。
+        hoi_tokens, _ = self.shared_block(hoi_tokens, time_cond=time_cond, stream="hoi")
+        rgb_prior_tokens, _ = self.shared_block(rgb_prior_tokens, time_cond=time_cond, stream="rgb")
 
+        # RGB->HOI 默认开启，用紧凑视觉先验修正显式状态 token。
         hoi_tokens = hoi_tokens + float(rgb_to_hoi_scale) * self.rgb_to_hoi_gate(hoi_tokens) * self.rgb_to_hoi(
             hoi_tokens,
             rgb_prior_tokens,
         )
         if run_hoi_to_rgb or float(hoi_to_rgb_scale) != 0.0:
+            # HOI->RGB 是可选路径，主要用于实验双向耦合。
             rgb_prior_tokens = rgb_prior_tokens + float(hoi_to_rgb_scale) * self.hoi_to_rgb_gate(
                 rgb_prior_tokens
             ) * self.hoi_to_rgb(rgb_prior_tokens, hoi_tokens)
@@ -137,7 +142,7 @@ class CoMoViDualBranchBlock(nn.Module):
 
 
 class CoMoVi3D2DRefiner(nn.Module):
-    """HOI-query refiner that attends to RGB prior tokens after branch coupling."""
+    """3D-2D 细化器：让 HOI query 在双分支耦合后再次读取 RGB prior token。"""
 
     def __init__(
         self,
@@ -166,6 +171,7 @@ class CoMoVi3D2DRefiner(nn.Module):
         nn.init.zeros_(self.out.bias)
 
     def forward(self, *, hoi_tokens: Tensor, rgb_prior_tokens: Tensor) -> Tensor:
+        # 输出层零初始化，因此训练开始时 refiner 不会破坏已有 HOI 表示。
         refined = hoi_tokens
         for layer in self.layers:
             refined = layer(refined, rgb_prior_tokens)
@@ -174,9 +180,12 @@ class CoMoVi3D2DRefiner(nn.Module):
 
 @dataclass
 class CoMoViHOIRGBOutput:
+    """CoMoVi HOI/RGB 模型的训练输出与可视化中间量。"""
+
     rgb_velocity: Tensor
     state_velocity: Tensor
     decoded_state: DecodedHOIState
+    hoi_router_loss: Tensor
     rgb_hidden_tokens: Tensor
     rgb_prior_tokens: Tensor
     hoi_tokens: Tensor
@@ -184,12 +193,10 @@ class CoMoViHOIRGBOutput:
 
 
 class CoMoViHOIRGBModel(nn.Module):
-    """CoMoVi-like HOI-primary RGB-guided dual-branch model.
+    """CoMoVi 风格的 HOI-primary RGB 引导双分支模型。
 
-    RGB/Wan stays as the visual-prior branch. HOI tokens are the primary denoising
-    branch and final supervised output. The CoMoVi-style parts are the full dual
-    branch update, zero-init mutual feature interaction, and the 3D-2D
-    cross-attention refiner that lets HOI query compact RGB prior tokens.
+    RGB/Wan 保持为视觉先验分支；HOI token 是主要去噪分支和最终监督输出。
+    CoMoVi 风格部分包括双分支更新、零初始化互相注入，以及 HOI 查询紧凑 RGB prior 的 3D-2D refiner。
     """
 
     video_backend = "wan2.2-ti2v-5b"
@@ -233,6 +240,7 @@ class CoMoViHOIRGBModel(nn.Module):
         self.detach_rgb_context = bool(detach_rgb_context)
         self.enable_hoi_to_rgb = bool(enable_hoi_to_rgb)
 
+        # 显式 HOI 状态的 token 布局和解码逻辑。
         self.state_codec = HOIStateCodec(
             hidden_dim=hidden_dim,
             num_human_gaussians=num_human_gaussians,
@@ -253,6 +261,7 @@ class CoMoViHOIRGBModel(nn.Module):
             local_files_only=wan_local_files_only,
             freeze=freeze_wan,
         )
+        # Wan hidden token 维度通常较大，先投影到 HOI 主干的 hidden_dim。
         self.rgb_token_adapter = nn.Sequential(
             nn.LayerNorm(int(wan_hidden_dim)),
             nn.Linear(int(wan_hidden_dim), hidden_dim),
@@ -265,6 +274,7 @@ class CoMoViHOIRGBModel(nn.Module):
             image_height=image_height,
             image_width=image_width,
         )
+        # 首帧 patch token 补充静态外观/物体形状先验。
         self.time_embed = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.SiLU(),
@@ -279,6 +289,7 @@ class CoMoViHOIRGBModel(nn.Module):
             mlp_ratio=mlp_ratio,
             dropout=dropout,
         )
+        # 主体双分支层：HOI 分支预测状态，RGB prior 分支提供紧凑视觉上下文。
         self.blocks = nn.ModuleList(
             [
                 CoMoViDualBranchBlock(
@@ -298,6 +309,7 @@ class CoMoViHOIRGBModel(nn.Module):
             dropout=dropout,
         )
         if not self.enable_hoi_to_rgb:
+            # 默认关闭 HOI->RGB 反向注入，减少不必要参数参与训练。
             for block in self.blocks:
                 block.hoi_to_rgb.requires_grad_(False)
                 block.hoi_to_rgb_gate.requires_grad_(False)
@@ -349,10 +361,12 @@ class CoMoViHOIRGBModel(nn.Module):
         hoi_to_rgb_scale: float = 0.0,
         cross_3d2d_scale: float = 1.0,
     ) -> CoMoViHOIRGBOutput:
+        """用 noisy RGB latent、首帧图像和 noisy HOI state 共同预测 clean HOI state。"""
         if state_xt.ndim != 3 or state_xt.shape[-1] != self.hidden_dim:
             raise ValueError(f"`state_xt` must have shape [B, L, {self.hidden_dim}], got {tuple(state_xt.shape)}.")
 
         rgb_output = self.rgb_stream(video_xt=video_xt, timesteps=timesteps)
+        # 可选择是否让 HOI 监督梯度回传到 Wan RGB hidden token。
         rgb_hidden_tokens = rgb_output.hidden_tokens.detach() if self.detach_rgb_context else rgb_output.hidden_tokens
         rgb_tokens = self.rgb_token_adapter(rgb_hidden_tokens.to(dtype=state_xt.dtype))
         image_tokens = self.first_frame_encoder(first_frame.to(dtype=state_xt.dtype))
@@ -368,6 +382,7 @@ class CoMoViHOIRGBModel(nn.Module):
         )
 
         for block in self.blocks:
+            # rgb_to_hoi_scale/hoi_to_rgb_scale 让实验脚本可以控制跨分支注入强度。
             hoi_tokens, rgb_prior_tokens = block(
                 hoi_tokens=hoi_tokens,
                 rgb_prior_tokens=rgb_prior_tokens,
@@ -382,13 +397,16 @@ class CoMoViHOIRGBModel(nn.Module):
         )
 
         state_velocity = self.state_velocity_head(self.state_norm(hoi_tokens))
+        # 保持计算图连通，避免部分训练配置误判未使用参数。
         state_velocity = state_velocity + hoi_tokens.float().sum().to(dtype=state_velocity.dtype) * 0.0
         t_view = timesteps.to(device=state_xt.device, dtype=state_xt.dtype).view(state_xt.shape[0], 1, 1)
+        # 由 velocity 从当前 noisy state 估计 clean state，再解码为显式 HOI 输出。
         predicted_clean_state = state_xt + (1.0 - t_view) * state_velocity.to(dtype=state_xt.dtype)
         return CoMoViHOIRGBOutput(
             rgb_velocity=rgb_output.velocity,
             state_velocity=state_velocity,
             decoded_state=self.decode_state_tokens(predicted_clean_state),
+            hoi_router_loss=state_velocity.new_zeros(()),
             rgb_hidden_tokens=rgb_output.hidden_tokens,
             rgb_prior_tokens=rgb_prior_tokens,
             hoi_tokens=hoi_tokens,

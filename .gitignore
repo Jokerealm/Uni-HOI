@@ -183,6 +183,7 @@ unidepth/ops/*/*.egg-info/
 
 outputs/
 results/
+.tmp/
 docs/
 logs/
 preprocessed/

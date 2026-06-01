@@ -6,6 +6,7 @@ import json
 import math
 import re
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional
@@ -121,7 +122,6 @@ def _sample_state(
     rgb_to_hoi_scale: float,
     hoi_to_rgb_scale: float,
     cross_3d2d_scale: float,
-    interaction_mode: str,
     drop_rgb_branch: bool,
 ) -> object:
     rgb = batch["rgb"]
@@ -154,14 +154,13 @@ def _sample_state(
             "video_xt": video_xt,
             "state_xt": state_xt,
             "timesteps": timesteps,
-            "first_frame": first_frame,
-            "rgb_to_hoi_scale": 0.0 if drop_rgb_branch else float(rgb_to_hoi_scale),
-            "hoi_to_rgb_scale": float(hoi_to_rgb_scale),
         }
         if model.__class__.__name__ == "CoMoViHOIRGBModel":
+            forward_kwargs["first_frame"] = first_frame
+            forward_kwargs["rgb_to_hoi_scale"] = 0.0 if drop_rgb_branch else float(rgb_to_hoi_scale)
+            forward_kwargs["hoi_to_rgb_scale"] = float(hoi_to_rgb_scale)
             forward_kwargs["cross_3d2d_scale"] = float(cross_3d2d_scale)
         else:
-            forward_kwargs["interaction_mode"] = str(interaction_mode)
             forward_kwargs["use_rgb_prior"] = not drop_rgb_branch
         output = model(**forward_kwargs)
         state_xt = state_xt + dt * output.state_velocity.to(dtype=state_xt.dtype)
@@ -217,6 +216,7 @@ def _evaluate_checkpoint(
     generator.manual_seed(int(eval_args.seed) + int(step))
     totals: Dict[str, float] = {}
     count = 0
+    inference_seconds = 0.0
 
     max_batches = int(eval_args.max_batches)
     autocast_dtype = torch.bfloat16 if str(train_args.mixed_precision) == "bf16" else torch.float16
@@ -234,6 +234,9 @@ def _evaluate_checkpoint(
             )
             context = torch.autocast(device_type="cuda", dtype=autocast_dtype) if use_autocast else torch.no_grad()
             with context:
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                start_time = time.perf_counter()
                 output = _sample_state(
                     model=model,
                     batch=batch,
@@ -242,9 +245,11 @@ def _evaluate_checkpoint(
                     rgb_to_hoi_scale=float(train_args.rgb_to_hoi_scale),
                     hoi_to_rgb_scale=float(train_args.hoi_to_rgb_scale),
                     cross_3d2d_scale=float(getattr(train_args, "cross_3d2d_scale", 1.0)),
-                    interaction_mode=str(eval_args.interaction_mode),
                     drop_rgb_branch=bool(eval_args.drop_rgb_branch),
                 )
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                inference_seconds += time.perf_counter() - start_time
                 state_losses = train_hoi.compute_state_losses(output.decoded_state, batch, weights=weights)
                 eval_metrics = unimain.compute_test_eval_metrics(output, batch, metric_args)
             metrics = _to_float_dict(state_losses)
@@ -261,6 +266,10 @@ def _evaluate_checkpoint(
         "checkpoint": str(checkpoint),
         "step": int(step if step > 0 else _checkpoint_step(checkpoint)),
         "num_samples": int(count),
+        "timing": {
+            "inference_seconds": float(inference_seconds),
+            "seconds_per_sample": float(inference_seconds / float(max(count, 1))),
+        },
         "metrics": averages,
     }
 
@@ -287,7 +296,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--dataset_cache_sequences", type=int, default=2)
     parser.add_argument("--num_ode_steps", type=int, default=12)
-    parser.add_argument("--interaction_mode", type=str, default="asymmetric", choices=("asymmetric", "full"))
     parser.add_argument("--drop_rgb_branch", action="store_true")
     parser.add_argument("--test_eval_max_points", type=int, default=4096)
     parser.add_argument("--test_eval_chamfer_chunk_size", type=int, default=2048)
@@ -331,7 +339,8 @@ def main() -> None:
             f"CD-h={metrics['CD-h']:.6f} "
             f"CD-o={metrics['CD-o']:.6f} "
             f"CD-c={metrics['CD-c']:.6f} "
-            f"CD-mean={metrics['CD-mean']:.6f}",
+            f"CD-mean={metrics['CD-mean']:.6f} "
+            f"time/sample={result['timing']['seconds_per_sample']:.4f}s",
             flush=True,
         )
 
@@ -344,6 +353,8 @@ def main() -> None:
             "num_ode_steps": int(eval_args.num_ode_steps),
             "batch_size": int(eval_args.batch_size),
             "num_checkpoints": len(results),
+            "interaction_mode": "full",
+            "drop_rgb_branch": bool(eval_args.drop_rgb_branch),
         },
         "summary": _summarize(results),
         "results": results,

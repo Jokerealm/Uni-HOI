@@ -6,10 +6,12 @@ from typing import Optional, Sequence, Tuple
 import torch
 from torch import Tensor, nn
 
-from .cointeract_hoi_wan import DecodedHOIState, HOIStateCodec, timestep_embedding
+from .hoi_state_codec import DecodedHOIState, HOIStateCodec
+from .hoi_transformer_blocks import timestep_embedding
 
 
 def _resolve_torch_dtype(name: str) -> torch.dtype:
+    """把配置字符串解析为 torch dtype。"""
     text = str(name).strip().lower()
     if text in {"bf16", "bfloat16"}:
         return torch.bfloat16
@@ -21,6 +23,7 @@ def _resolve_torch_dtype(name: str) -> torch.dtype:
 
 
 def _retrieve_latents(encoder_output, sample_mode: str = "argmax") -> Tensor:
+    """从 Wan VAE encode 的多种返回对象中取出 latent。"""
     if hasattr(encoder_output, "latent_dist"):
         if sample_mode == "sample":
             return encoder_output.latent_dist.sample()
@@ -33,6 +36,7 @@ def _retrieve_latents(encoder_output, sample_mode: str = "argmax") -> Tensor:
 
 
 def _as_3tuple(value: int | Sequence[int]) -> Tuple[int, int, int]:
+    """把 patch_size 统一成时间/高/宽三元组。"""
     if isinstance(value, int):
         return (value, value, value)
     result = tuple(int(v) for v in value)
@@ -42,11 +46,12 @@ def _as_3tuple(value: int | Sequence[int]) -> Tuple[int, int, int]:
 
 
 def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
+    """AdaLN 中的 scale/shift 调制。"""
     return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
 class FrozenWanVAEEncoder(nn.Module):
-    """Frozen Wan2.2 VAE encoder used as the visual feature front-end."""
+    """冻结的 Wan2.2 VAE 编码器，用作 RGB 视觉特征前端。"""
 
     def __init__(
         self,
@@ -73,6 +78,7 @@ class FrozenWanVAEEncoder(nn.Module):
         return bool(self._loaded)
 
     def _load(self, device: torch.device) -> None:
+        """延迟加载 VAE，方便在真正前向时按设备初始化。"""
         if self._loaded:
             self.to(device=device)
             return
@@ -95,6 +101,7 @@ class FrozenWanVAEEncoder(nn.Module):
         self.vae = vae.requires_grad_(False).eval()
         self.latent_channels = int(getattr(self.vae.config, "z_dim", getattr(self.vae.config, "latent_channels", 16)))
 
+        # Wan VAE 的 latent 需要按配置中的均值/方差做标准化。
         latents_mean = getattr(self.vae.config, "latents_mean", None)
         latents_std = getattr(self.vae.config, "latents_std", None)
         if latents_mean is None:
@@ -124,12 +131,14 @@ class FrozenWanVAEEncoder(nn.Module):
         self._load(device)
 
     def _normalize_latents(self, latents: Tensor) -> Tensor:
+        """标准化 VAE latent，输出给后续 Transformer 使用。"""
         mean = self.latents_mean.to(device=latents.device, dtype=latents.dtype)
         std_inv = self.latents_std_inv.to(device=latents.device, dtype=latents.dtype)
         return (latents - mean) * std_inv
 
     @torch.no_grad()
     def forward(self, video: Tensor) -> Tensor:
+        """把 [B, 3, H, W] 或 [B, T, 3, H, W] RGB 输入编码成 VAE latent。"""
         self.ensure_loaded(video.device)
         if video.ndim == 4:
             video = video.unsqueeze(1)
@@ -143,6 +152,8 @@ class FrozenWanVAEEncoder(nn.Module):
 
 
 class WanVAELatentPatchEmbed(nn.Module):
+    """把 Wan VAE latent 网格切成 Transformer token，并叠加可学习位置编码。"""
+
     def __init__(
         self,
         *,
@@ -165,6 +176,7 @@ class WanVAELatentPatchEmbed(nn.Module):
         self.vae_scale_factor_spatial = int(vae_scale_factor_spatial)
         self.patch_size = _as_3tuple(patch_size)
 
+        # Wan VAE 时间维是 (T-1)/scale + 1，空间维按 scale_factor 下采样。
         self.latent_frames = (self.num_frames - 1) // self.vae_scale_factor_temporal + 1
         self.latent_height = self.image_height // self.vae_scale_factor_spatial
         self.latent_width = self.image_width // self.vae_scale_factor_spatial
@@ -182,6 +194,7 @@ class WanVAELatentPatchEmbed(nn.Module):
             kernel_size=self.patch_size,
             stride=self.patch_size,
         )
+        # Conv3d 的 kernel/stride 等于 patch_size，因此输出网格中的每个点就是一个视觉 token。
         num_tokens = (
             self.latent_frames // self.patch_size[0]
             * self.latent_height // self.patch_size[1]
@@ -195,6 +208,7 @@ class WanVAELatentPatchEmbed(nn.Module):
         return int(self.pos_embed.shape[1])
 
     def forward(self, latents: Tensor) -> Tensor:
+        """输入 [B, C, T, H, W] latent，输出 [B, L, D] token。"""
         if latents.ndim != 5:
             raise ValueError(f"Wan VAE latents must have shape [B, C, T, H, W], got {tuple(latents.shape)}.")
         expected = (self.latent_channels, self.latent_frames, self.latent_height, self.latent_width)
@@ -205,6 +219,8 @@ class WanVAELatentPatchEmbed(nn.Module):
 
 
 class MLP(nn.Module):
+    """DiT block 内部使用的前馈网络。"""
+
     def __init__(self, dim: int, mlp_ratio: float, dropout: float) -> None:
         super().__init__()
         hidden = int(round(dim * mlp_ratio))
@@ -221,7 +237,7 @@ class MLP(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    """A minimal AdaLN-Zero DiT block over visual and HOI tokens."""
+    """作用在视觉 token 与 HOI token 上的最小 AdaLN-Zero DiT block。"""
 
     def __init__(self, *, hidden_dim: int, num_heads: int, mlp_ratio: float, dropout: float) -> None:
         super().__init__()
@@ -236,6 +252,7 @@ class DiTBlock(nn.Module):
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
     def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+        # cond 由 timestep embedding 得到，分别调制注意力和 MLP 两个残差分支。
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(cond).chunk(6, dim=-1)
         attn_in = _modulate(self.norm1(x), shift_msa, scale_msa)
         attn_out = self.attn(attn_in, attn_in, attn_in, need_weights=False)[0]
@@ -246,6 +263,8 @@ class DiTBlock(nn.Module):
 
 @dataclass
 class UniModelOutput:
+    """UniModel 前向输出，包含显式解码结果和中间 token。"""
+
     decoded_state: DecodedHOIState
     hoi_tokens: Tensor
     visual_tokens: Tensor
@@ -256,7 +275,7 @@ class UniModelOutput:
 
 
 class UniModel(nn.Module):
-    """Single-stream Wan-VAE + DiT baseline for single-image RGB-to-HOI reconstruction."""
+    """单流 Wan-VAE + DiT 基线模型，用单张/视频 RGB 预测 HOI 状态。"""
 
     video_backend = "wan2.2-vae"
     input_mode = "single_image"
@@ -294,6 +313,7 @@ class UniModel(nn.Module):
         self.image_height = int(image_height)
         self.image_width = int(image_width)
 
+        # RGB 先经过冻结 Wan VAE，得到低维 latent，再切成视觉 token。
         self.vae_encoder = FrozenWanVAEEncoder(
             model_id=wan_vae_model_id,
             subfolder=wan_vae_subfolder,
@@ -322,6 +342,7 @@ class UniModel(nn.Module):
             human_pose_dim=human_pose_dim,
         )
 
+        # HOI query token 是模型要预测的状态槽位；视觉/HOI type embedding 用于区分 token 来源。
         self.visual_type_embed = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         self.hoi_type_embed = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         self.hoi_query_tokens = nn.Parameter(torch.zeros(1, self.state_codec.total_tokens, hidden_dim))
@@ -334,6 +355,7 @@ class UniModel(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
+        # DiT 主干在视觉 token 与 HOI token 的拼接序列上做联合建模。
         self.blocks = nn.ModuleList(
             [
                 DiTBlock(
@@ -364,6 +386,7 @@ class UniModel(nn.Module):
         return self.vae_encoder(rgb)
 
     def encode_visual_tokens_from_latents(self, vae_latents: Tensor) -> Tensor:
+        """把 VAE latent 转成视觉 token，并加入视觉类型嵌入。"""
         return self.visual_embed(vae_latents) + self.visual_type_embed.to(
             device=vae_latents.device,
             dtype=vae_latents.dtype,
@@ -379,6 +402,7 @@ class UniModel(nn.Module):
         timesteps: Optional[Tensor] = None,
         state_xt: Optional[Tensor] = None,
     ) -> UniModelOutput:
+        """从预编码的 VAE latent 开始前向，便于训练时复用缓存 latent。"""
         visual_tokens = self.encode_visual_tokens_from_latents(vae_latents)
         batch_size = visual_tokens.shape[0]
         if timesteps is None:
@@ -387,8 +411,10 @@ class UniModel(nn.Module):
             raise ValueError(f"`timesteps` must have shape [B], got {tuple(timesteps.shape)}.")
 
         if state_xt is None:
+            # 推理/重建时没有 noisy state，就使用可学习 HOI query 作为状态槽。
             hoi_tokens = self.hoi_query_tokens.expand(batch_size, -1, -1)
         else:
+            # denoising 训练时 state_xt 是加噪后的 HOI token。
             expected = (batch_size, self.state_codec.total_tokens, self.hidden_dim)
             if tuple(state_xt.shape) != expected:
                 raise ValueError(f"`state_xt` must have shape {expected}, got {tuple(state_xt.shape)}.")
@@ -412,6 +438,7 @@ class UniModel(nn.Module):
         predicted_clean: Optional[Tensor] = None
         decode_tokens = hoi_tokens_out
         if state_xt is not None:
+            # flow-matching 形式：预测 velocity，并由当前 state_xt 推回 clean state token。
             state_velocity = self.state_velocity_head(hoi_tokens_out)
             t_view = timesteps.to(device=state_xt.device, dtype=state_xt.dtype).view(batch_size, 1, 1)
             predicted_clean = state_xt + (1.0 - t_view) * state_velocity.to(dtype=state_xt.dtype)

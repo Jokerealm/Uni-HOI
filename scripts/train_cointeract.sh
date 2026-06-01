@@ -22,8 +22,9 @@ TRAIN_ARGS=(
   --data_root "${DATA_ROOT}" \
   --output_dir "${OUTPUT_DIR}" \
   --wan_model_id "${WAN_MODEL_ID}" \
-  --rgb_to_hoi_scale "${RGB_TO_HOI_SCALE:-1.0}" \
-  --hoi_to_rgb_scale "${HOI_TO_RGB_SCALE:-0.0}" \
+  --hoi_token_moe_expert_dim "${HOI_TOKEN_MOE_EXPERT_DIM:-256}" \
+  --hoi_token_moe_router_hidden_dim "${HOI_TOKEN_MOE_ROUTER_HIDDEN_DIM:-0}" \
+  --hoi_token_moe_residual_scale "${HOI_TOKEN_MOE_RESIDUAL_SCALE:-1.0}" \
   --cross_3d2d_scale "${CROSS_3D2D_SCALE:-1.0}" \
   --visual_prior_num_global_tokens "${VISUAL_PRIOR_NUM_GLOBAL_TOKENS:-8}" \
   --visual_resampler_depth "${VISUAL_RESAMPLER_DEPTH:-2}" \
@@ -50,6 +51,9 @@ TRAIN_ARGS=(
   --lambda_gaussian_attr_l1 "${LAMBDA_GAUSSIAN_ATTR_L1:-0.1}" \
   --lambda_phys_contact "${LAMBDA_PHYS_CONTACT:-0.01}" \
   --lambda_phys_penetration "${LAMBDA_PHYS_PENETRATION:-0.01}" \
+  --lambda_hoi_token_router "${LAMBDA_HOI_TOKEN_ROUTER:-1.0}" \
+  --state_fm_loss_mode "${STATE_FM_LOSS_MODE:-uniform}" \
+  --state_fm_group_weights "${STATE_FM_GROUP_WEIGHTS:-}" \
   --phys_loss_max_frames "${PHYS_LOSS_MAX_FRAMES:-1}" \
   --phys_loss_max_object_points "${PHYS_LOSS_MAX_OBJECT_POINTS:-512}" \
   --num_workers "${NUM_WORKERS:-8}" \
